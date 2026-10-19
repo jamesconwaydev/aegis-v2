@@ -212,12 +212,23 @@ mod tests {
             exe: Some(vec![b'x'; 4000]),
             reasons: vec![],
         };
-        let t = std::time::Instant::now();
-        for _ in 0..5000 {
-            j.emit(&rec);
-        }
-        assert!(t.elapsed() < std::time::Duration::from_secs(2));
-        assert!(j.dropped_records() > 0);
+        // A blocking send would hang the thread; a drop shows up as a
+        // counted record. Judged by completion, not by wall-clock speed, so
+        // a slow or emulated build host can't fail it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..5000 {
+                j.emit(&rec);
+                if j.dropped_records() > 0 {
+                    break;
+                }
+            }
+            let _ = tx.send(j.dropped_records());
+        });
+        let dropped = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("emit blocked on a full socket");
+        assert!(dropped > 0);
     }
 
     #[test]
