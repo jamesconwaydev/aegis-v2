@@ -129,6 +129,11 @@ fn kv(k: &str, v: String) -> Value {
     json!({"key": k, "value": {"stringValue": v}})
 }
 
+fn kv_list(k: &str, v: &[String]) -> Value {
+    let values: Vec<Value> = v.iter().map(|s| json!({"stringValue": s})).collect();
+    json!({"key": k, "value": {"arrayValue": {"values": values}}})
+}
+
 fn resource() -> Value {
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|h| h.trim().to_string())
@@ -153,22 +158,28 @@ pub fn log_record(rec: &TelemetryRecord) -> Value {
         Tier::Throttle => (13, "WARN"),
         Tier::Quarantine => (17, "ERROR"),
     };
+    let mut attrs = vec![
+        kv("aegis.incident", rec.incident.clone()),
+        kv("aegis.verdict", rec.verdict.into()),
+        kv("aegis.tier", rec.tier_str().into()),
+        kv("aegis.score", format!("{:.1}", rec.score)),
+        kv("aegis.mode", rec.mode_str().into()),
+        kv("aegis.tgid", rec.tgid.to_string()),
+        kv("aegis.comm", rec.comm.clone()),
+        kv("aegis.path", rec.exe_lossy()),
+        kv("aegis.path_b64", rec.exe_b64()),
+        kv_list("aegis.reasons", &rec.reasons),
+    ];
+    if let (Some(t), Some(t64)) = (rec.target_lossy(), rec.target_b64()) {
+        attrs.push(kv("aegis.target", t));
+        attrs.push(kv("aegis.target_b64", t64));
+    }
     json!({
         "timeUnixNano": rec.ts_unix_ns.to_string(),
         "severityNumber": num,
         "severityText": text,
         "body": {"stringValue": rec.message()},
-        "attributes": [
-            kv("aegis.incident", rec.incident.clone()),
-            kv("aegis.verdict", rec.verdict.into()),
-            kv("aegis.tier", rec.tier_str().into()),
-            kv("aegis.score", format!("{:.1}", rec.score)),
-            kv("aegis.mode", rec.mode_str().into()),
-            kv("aegis.tgid", rec.tgid.to_string()),
-            kv("aegis.comm", rec.comm.clone()),
-            kv("aegis.path", rec.exe_lossy()),
-            kv("aegis.path_b64", rec.exe_b64()),
-        ],
+        "attributes": attrs,
     })
 }
 
@@ -192,6 +203,7 @@ mod tests {
             tgid: 1,
             comm: "c".into(),
             exe: None,
+            target: None,
             reasons: vec![],
         }
     }
@@ -202,6 +214,33 @@ mod tests {
             headers: BTreeMap::from([("Authorization".into(), "Bearer tok".into())]),
             timeout_secs: 2,
         }
+    }
+
+    #[test]
+    fn log_record_carries_reasons_and_target() {
+        let mut r = rec();
+        r.target = Some(b"/tmp/p".to_vec());
+        r.reasons = vec!["exec from a temp directory (/tmp/p)".into()];
+        let v = log_record(&r);
+        let attr = |k: &str| {
+            v["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["key"] == k)
+                .map(|a| a["value"].clone())
+                .unwrap_or_else(|| panic!("{k} missing: {v}"))
+        };
+        assert_eq!(attr("aegis.target")["stringValue"], "/tmp/p");
+        assert_eq!(attr("aegis.target_b64")["stringValue"], "L3RtcC9w");
+        assert_eq!(
+            attr("aegis.reasons")["arrayValue"]["values"][0]["stringValue"],
+            "exec from a temp directory (/tmp/p)"
+        );
+        assert!(v["body"]["stringValue"]
+            .as_str()
+            .unwrap()
+            .ends_with(" target /tmp/p"));
     }
 
     #[test]

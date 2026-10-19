@@ -22,6 +22,9 @@ pub struct TelemetryRecord {
     pub comm: String,
     /// Exact path bytes. Emitted as lossy `path` plus exact `path_b64`.
     pub exe: Option<Vec<u8>>,
+    /// For an exec, the file it started, exact bytes like `exe`.
+    pub target: Option<Vec<u8>>,
+    /// The process's evidence reasons, oldest first.
     pub reasons: Vec<String>,
 }
 
@@ -37,16 +40,32 @@ impl TelemetryRecord {
         self.exe.as_deref().map(b64).unwrap_or_default()
     }
 
+    pub fn target_lossy(&self) -> Option<String> {
+        self.target
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    }
+
+    pub fn target_b64(&self) -> Option<String> {
+        self.target.as_deref().map(b64)
+    }
+
+    /// One line, whatever the process called itself: comm, exe and the
+    /// target are escaped (the exact bytes are in the `*_B64` fields).
     pub fn message(&self) -> String {
-        format!(
+        let mut m = format!(
             "aegis {} incident {} score {:.1} tgid {} comm {} exe {}",
             self.verdict,
             self.incident,
             self.score,
             self.tgid,
-            self.comm,
-            self.exe_lossy()
-        )
+            aegis_proto::clean(&self.comm),
+            aegis_proto::clean(&self.exe_lossy())
+        );
+        if let Some(t) = self.target_lossy() {
+            m += &format!(" target {}", aegis_proto::clean(&t));
+        }
+        m
     }
 
     pub fn tier_str(&self) -> &'static str {

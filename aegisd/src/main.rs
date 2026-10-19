@@ -175,25 +175,12 @@ impl Verifying {
     }
 
     /// Verifies every allowlisted path in the background so its verdict
-    /// is a warm cache hit by the time a process execs it. Without this,
-    /// the first container start after boot (or after a package update)
-    /// races its own verdict and scores its memfd as unverified.
+    /// is a warm cache hit by the time a process execs it. Runs at start
+    /// and on SIGHUP only. Without it, the first container start after
+    /// either races its own verdict, and its memfd signals wait in the
+    /// defer queue for it.
     fn warm(&self, cfg: &Config) {
-        let a = &cfg.allowlist;
-        let mut paths: Vec<PathBuf> = [
-            &a.excluded_parent_processes,
-            &a.memfd_callers,
-            &a.ptrace_tracers,
-            &a.scan_binaries,
-        ]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .chain(a.pinned.iter().map(|(p, _)| p.clone()))
-        .collect();
-        paths.sort();
-        paths.dedup();
-        for p in paths {
+        for p in cfg.allowlist.verify_paths() {
             self.spawn_host(p);
         }
     }
@@ -273,11 +260,14 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
 
     let mut ticker = tokio::time::interval(TICK);
     let mut ticks: u64 = 0;
+    // Ok on SIGTERM or SIGINT. Anything else that ends the loop is a
+    // failure, so systemd restarts us.
+    let mut outcome = Ok(());
     loop {
         tokio::select! {
             ev = events.recv() => {
                 let Some(ev) = ev else {
-                    eprintln!("aegisd: probe event stream ended");
+                    outcome = Err(anyhow::anyhow!("probe event stream ended"));
                     break;
                 };
                 pipe.handle(&ev);
@@ -351,7 +341,7 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     drop(pipe);
     let _ = writer.join();
     let _ = std::fs::remove_file(&cli.socket);
-    Ok(())
+    outcome
 }
 
 fn answer(
@@ -374,6 +364,7 @@ fn answer(
             incident_dropped: pipe.incident_dropped,
             verify_skipped: pipe.verify_skipped,
             deferred_overflow: pipe.deferred_overflow,
+            incident_suppressed: pipe.incident_suppressed,
             telemetry_dropped: pipe.sinks.dropped(),
         },
         Request::IncidentsList => Response::Incidents(pipe.store().list()),

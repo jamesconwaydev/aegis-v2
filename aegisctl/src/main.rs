@@ -147,6 +147,13 @@ fn run(cli: &Cli) -> Result<(String, u8), String> {
         }
         Cmd::Status => Request::Status,
         Cmd::Incidents(Inc::List) => Request::IncidentsList,
+        Cmd::Incidents(Inc::Show { id: i } | Inc::Timeline { id: i })
+            if !aegis_proto::is_incident_id(i) =>
+        {
+            return Err(format!(
+                "{i} is not an incident id (AEG-YYYYMMDD-HHMMSS- and 16 hex digits)"
+            ));
+        }
         Cmd::Incidents(Inc::Show { id }) => Request::IncidentShow { id: id.clone() },
         Cmd::Incidents(Inc::Timeline { id: i }) => {
             id = i.clone();

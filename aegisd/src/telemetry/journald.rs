@@ -121,9 +121,19 @@ pub fn encode(rec: &TelemetryRecord) -> Vec<u8> {
     );
     field(&mut b, "AEGIS_TIER", rec.tier_str().as_bytes());
     field(&mut b, "AEGIS_VERDICT", rec.verdict.as_bytes());
+    field(&mut b, "AEGIS_MODE", rec.mode_str().as_bytes());
+    field(&mut b, "AEGIS_TGID", rec.tgid.to_string().as_bytes());
     field(&mut b, "AEGIS_COMM", rec.comm.as_bytes());
     field(&mut b, "AEGIS_EXE", rec.exe_lossy().as_bytes());
     field(&mut b, "AEGIS_EXE_B64", rec.exe_b64().as_bytes());
+    if let (Some(t), Some(t64)) = (rec.target_lossy(), rec.target_b64()) {
+        field(&mut b, "AEGIS_TARGET", t.as_bytes());
+        field(&mut b, "AEGIS_TARGET_B64", t64.as_bytes());
+    }
+    // journald keeps every value of a repeated field.
+    for r in &rec.reasons {
+        field(&mut b, "AEGIS_REASON", r.as_bytes());
+    }
     b
 }
 
@@ -179,7 +189,8 @@ mod tests {
             tgid: 7,
             comm: "x\ny".into(),
             exe: Some(b"/tmp/a\nb".to_vec()),
-            reasons: vec![],
+            target: Some("/tmp/p\nx\u{2028}".as_bytes().to_vec()),
+            reasons: vec!["exec from a temp directory".into(), "egress scan".into()],
         };
         let out = encode(&rec);
         let s = String::from_utf8_lossy(&out);
@@ -188,9 +199,24 @@ mod tests {
         assert!(s.contains("AEGIS_SCORE=12.0\n"));
         assert!(s.contains("AEGIS_TIER=quarantine\n"));
         assert!(s.contains("AEGIS_EXE_B64=L3RtcC9hCmI=\n"));
-        assert!(out.windows(8).any(|w| w == b"MESSAGE\n"));
         assert!(s.contains("AEGIS_COMM"));
         assert!(out.windows(9).any(|w| w == b"AEGIS_EXE"));
+        assert!(s.contains("AEGIS_TGID=7\n"));
+        assert!(s.contains("AEGIS_MODE=audit\n"));
+        assert!(s.contains("AEGIS_TARGET_B64=L3RtcC9wCnjigKg=\n"));
+        assert!(s.contains("AEGIS_REASON=exec from a temp directory\n"));
+        assert!(s.contains("AEGIS_REASON=egress scan\n"));
+        // MESSAGE stays one plain line: the hostile bytes are escaped, so
+        // it never needs the binary form and can't forge a second line.
+        let msg = s
+            .lines()
+            .find_map(|l| l.strip_prefix("MESSAGE="))
+            .expect("MESSAGE in plain form");
+        assert_eq!(
+            msg,
+            "aegis would_quarantine incident AEG-1 score 12.0 tgid 7 \
+             comm x\\x0ay exe /tmp/a\\x0ab target /tmp/p\\x0ax\\u{2028}"
+        );
         let j = Journald::with_socket(None);
         j.emit(&rec);
         assert_eq!(j.dropped_records(), 0);
@@ -210,6 +236,7 @@ mod tests {
             tgid: 7,
             comm: "c".into(),
             exe: Some(vec![b'x'; 4000]),
+            target: None,
             reasons: vec![],
         };
         // A blocking send would hang the thread; a drop shows up as a
@@ -249,6 +276,7 @@ mod tests {
             tgid: 7,
             comm: "c".into(),
             exe: None,
+            target: None,
             reasons: vec![],
         };
         j.emit(&rec());

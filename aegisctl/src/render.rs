@@ -20,24 +20,7 @@ fn paint(s: &str, code: &str, on: bool) -> String {
     }
 }
 
-/// Make daemon- and attacker-supplied text safe to print: control
-/// characters (C0, DEL, C1) and bidi/zero-width marks become visible
-/// escapes like `\x1b` or `\u{202e}`.
-pub fn clean(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        let bad = c.is_control()
-            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}');
-        if !bad {
-            o.push(c);
-        } else if (c as u32) < 0x100 {
-            o += &format!("\\x{:02x}", c as u32);
-        } else {
-            o += &format!("\\u{{{:x}}}", c as u32);
-        }
-    }
-    o
-}
+pub use aegis_proto::clean;
 
 /// Rows of cells as left-aligned columns, two spaces apart. The last
 /// column is not padded.
@@ -98,6 +81,7 @@ pub fn status(r: &Response) -> Option<String> {
         incident_dropped,
         verify_skipped,
         deferred_overflow,
+        incident_suppressed,
         telemetry_dropped: t,
     } = r
     else {
@@ -115,6 +99,10 @@ pub fn status(r: &Response) -> Option<String> {
         kv("incidents dropped", incident_dropped.to_string()),
         kv("verifications skipped", verify_skipped.to_string()),
         kv("defer queue overflows", deferred_overflow.to_string()),
+        kv(
+            "incident repeats not recorded",
+            incident_suppressed.to_string(),
+        ),
         kv("telemetry dropped: journald", t.journald.to_string()),
         kv(
             "telemetry dropped: otlp queue full",
@@ -325,6 +313,9 @@ pub fn timeline(lines: &[Value], incident: Option<&Value>) -> String {
     let rows: Vec<_> = lines
         .iter()
         .map(|l| {
+            if l["truncated"] == true {
+                return vec![s(l, "ts").to_string(), s(l, "note").to_string()];
+            }
             let sig: Vec<&str> = l["evidence"]
                 .as_array()
                 .map(|a| a.iter().map(|e| s(e, "signal")).collect())
@@ -447,6 +438,7 @@ mod tests {
             incident_dropped: 5,
             verify_skipped: 6,
             deferred_overflow: 7,
+            incident_suppressed: 12,
             telemetry_dropped: aegis_proto::TelemetryDropped {
                 journald: 8,
                 otlp_queue_full: 9,
@@ -463,6 +455,7 @@ mod tests {
             ("incidents dropped", "5"),
             ("verifications skipped", "6"),
             ("defer queue overflows", "7"),
+            ("incident repeats not recorded", "12"),
             ("journald", "8"),
             ("otlp queue full", "9"),
             ("otlp export failed", "10"),
@@ -474,6 +467,24 @@ mod tests {
                 "{k}: {o}"
             );
         }
+    }
+
+    #[test]
+    fn timeline_shows_the_truncation_marker() {
+        let t = timeline(
+            &[
+                json!({"ts":"t1","tgid":7,"tier":"throttle","score":60.0,"evidence":[{"signal":"TmpExec"}]}),
+                json!({"ts":"t2","truncated":true,"note":"timeline truncated at 10000 lines"}),
+            ],
+            None,
+        );
+        assert!(
+            t.lines()
+                .nth(1)
+                .unwrap()
+                .contains("timeline truncated at 10000 lines"),
+            "{t}"
+        );
     }
 
     #[test]

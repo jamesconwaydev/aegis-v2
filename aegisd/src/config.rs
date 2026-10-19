@@ -216,6 +216,25 @@ pub struct Allowlist {
     pub pinned: Vec<(PathBuf, [u8; 32])>,
 }
 
+impl Allowlist {
+    /// Every executable an allowlist entry or a pin names: the only
+    /// files worth verifying, since a verdict changes nothing for any
+    /// other.
+    pub fn verify_paths(&self) -> std::collections::BTreeSet<PathBuf> {
+        [
+            &self.excluded_parent_processes,
+            &self.memfd_callers,
+            &self.ptrace_tracers,
+            &self.scan_binaries,
+        ]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .chain(self.pinned.iter().map(|(p, _)| p.clone()))
+        .collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuarantineConfig {

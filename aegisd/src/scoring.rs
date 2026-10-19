@@ -27,7 +27,7 @@ pub enum Signal {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     Log,
     Throttle,
@@ -125,8 +125,8 @@ const MAX_EVIDENCE: usize = 32;
 /// A signal counts by kind, not by instance: ten memfd_creates from one
 /// process are one kind. Repeats keep the kind topped up, they don't
 /// stack (ruling: per-(process, kind) contribution = max(decayed, base)).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum SignalKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SignalKind {
     TmpExec = 0,
     MemfdCreate,
     MemfdExec,
@@ -138,7 +138,7 @@ enum SignalKind {
 pub const KINDS: usize = 5;
 
 impl SignalKind {
-    fn of(s: &Signal) -> Self {
+    pub fn of(s: &Signal) -> Self {
         match s {
             Signal::TmpExec => Self::TmpExec,
             Signal::MemfdCreate => Self::MemfdCreate,
@@ -262,11 +262,32 @@ impl Scorer {
     }
 
     /// (base, modifier, reason).
+    ///
+    /// A process that may be running foreign code (a loader variable at
+    /// exec, an unreadable environment, a ptrace attach) gets no
+    /// modifier at all; its verification is still shown as it is, and
+    /// the reason says what was withheld and why.
     fn weigh(&self, p: &ProcInfo, ancestors: &[&ProcInfo], sig: &Signal) -> (f64, f64, String) {
         let w = &self.weights;
         let a = &self.allow;
+        let withheld = std::cell::Cell::new(None);
+        // `q` would earn the modifier; is it clean enough to get it?
+        let clean = |q: &ProcInfo, earned: bool| -> bool {
+            if !earned {
+                return false;
+            }
+            match q.taint() {
+                None => true,
+                Some(t) => {
+                    if withheld.get().is_none() {
+                        withheld.set(Some(t));
+                    }
+                    false
+                }
+            }
+        };
         let selinux = || {
-            self.selinux_excluded(p).then(|| {
+            clean(p, self.selinux_excluded(p)).then(|| {
                 format!(
                     "domain {} is allowlisted",
                     p.selinux_domain.as_deref().unwrap()
@@ -277,7 +298,7 @@ impl Scorer {
             Signal::TmpExec => {
                 let parent = ancestors
                     .first()
-                    .filter(|q| trusted(q, &a.excluded_parent_processes))
+                    .filter(|q| clean(q, trusted(q, &a.excluded_parent_processes)))
                     .map(|q| {
                         format!(
                             "parent {} is allowlisted",
@@ -291,7 +312,8 @@ impl Scorer {
                 )
             }
             Signal::MemfdCreate => {
-                let caller = trusted(p, &a.memfd_callers).then(|| "caller is allowlisted".into());
+                let caller =
+                    clean(p, trusted(p, &a.memfd_callers)).then(|| "caller is allowlisted".into());
                 (w.memfd_create, "memfd_create", caller.or_else(selinux))
             }
             // `p` is the process as it was before the exec: the binary that
@@ -299,24 +321,26 @@ impl Scorer {
             Signal::MemfdExec => (
                 w.memfd_exec,
                 "exec of a memfd",
-                trusted(p, &a.memfd_callers).then(|| "executing binary is allowlisted".into()),
+                clean(p, trusted(p, &a.memfd_callers))
+                    .then(|| "executing binary is allowlisted".into()),
             ),
             Signal::PtraceSystemDaemon { .. } => (
                 w.ptrace_system_daemon,
                 "ptrace attach to a system daemon",
-                trusted(p, &a.ptrace_tracers).then(|| "tracer is allowlisted".into()),
+                clean(p, trusted(p, &a.ptrace_tracers)).then(|| "tracer is allowlisted".into()),
             ),
             Signal::EgressScan { .. } => (
                 w.egress_scan,
                 "egress scan",
-                (trusted(p, &a.scan_binaries) && p.uid == 0 && p.has_tty)
+                clean(p, trusted(p, &a.scan_binaries) && p.uid == 0 && p.has_tty)
                     .then(|| "allowlisted scanner run by root from a terminal".into()),
             ),
         };
-        match why {
+        match (why, withheld.get()) {
             // An allowlisted event is forgiven in full, whatever its weight.
-            Some(why) => (base, -base, format!("{what}; {why}")),
-            None => (base, 0.0, what.into()),
+            (Some(why), _) => (base, -base, format!("{what}; {why}")),
+            (None, Some(t)) => (base, 0.0, format!("{what}; allowlist withheld: {t}")),
+            (None, None) => (base, 0.0, what.into()),
         }
     }
 
@@ -519,6 +543,8 @@ mod tests {
             selinux_domain: None,
             verification: v,
             cgroup_id: 0,
+            env_taint: None,
+            ptraced: false,
         }
     }
 
@@ -833,6 +859,63 @@ mod tests {
         let fake = proc(61, "/usr/bin/runc", "runc", Verification::Modified);
         let d = Scorer::new(&c).observe(&fake, &[&bash()], Signal::MemfdExec, None, S);
         assert_eq!(d.score, 65.0);
+    }
+
+    #[test]
+    fn a_preloaded_runc_loses_its_memfd_allowlist() {
+        let mut c = cfg();
+        c.allowlist.memfd_callers = vec!["/usr/bin/runc".into()];
+        let mut s = Scorer::new(&c);
+        let mut runc = proc(60, "/usr/bin/runc", "runc", rpm("runc"));
+        runc.env_taint = Some("LD_PRELOAD is set");
+        s.observe(&runc, &[&bash()], Signal::MemfdCreate, None, S);
+        let d = s.observe(&runc, &[&bash()], Signal::MemfdExec, None, S);
+        assert_eq!((d.score, d.tier), (85.0, Tier::Quarantine));
+        assert_eq!(
+            d.evidence[1].reason,
+            "exec of a memfd; allowlist withheld: LD_PRELOAD is set"
+        );
+        assert_eq!(d.evidence[1].modifier, 0.0);
+        // Verification itself is left as it was.
+        assert_eq!(runc.verification, rpm("runc"));
+    }
+
+    #[test]
+    fn every_modifier_is_withheld_from_a_tainted_process() {
+        let mut c = cfg();
+        c.allowlist.excluded_selinux_domains = vec!["rpm_t".into()];
+        let s = Scorer::new(&c);
+        let traced = |mut p: ProcInfo| {
+            p.ptraced = true;
+            p
+        };
+        let why = "allowlist withheld: it was the target of a ptrace attach";
+        // Parent allowlist for a tmp exec: the parent's taint counts.
+        let dnf = traced(proc(50, "/usr/bin/dnf", "dnf", rpm("dnf")));
+        let d = Scorer::new(&c).observe(&evil(), &[&dnf], Signal::TmpExec, None, S);
+        assert_eq!(d.score, 25.0);
+        assert!(
+            d.evidence[0].reason.ends_with(why),
+            "{}",
+            d.evidence[0].reason
+        );
+        let gdb = traced(proc(80, "/usr/bin/gdb", "gdb", rpm("gdb")));
+        let d = Scorer::new(&c).observe(&gdb, &[&bash()], ptrace_daemon(), None, S);
+        assert_eq!(d.score, 45.0);
+        let mut nm = nmap(true);
+        nm.env_taint = Some("its environment could not be read");
+        let d = Scorer::new(&c).observe(&nm, &[&bash()], scan(), None, S);
+        assert_eq!(d.score, 40.0);
+        assert!(d.evidence[0].reason.contains("could not be read"));
+        let mut p = traced(evil());
+        p.selinux_domain = Some("system_u:system_r:rpm_t:s0".into());
+        let mut s = s;
+        let d = s.observe(&p, &[&bash()], Signal::MemfdCreate, None, S);
+        assert_eq!(d.score, 20.0);
+        // A clean process gets them, as before.
+        let gdb = proc(80, "/usr/bin/gdb", "gdb", rpm("gdb"));
+        let d = Scorer::new(&c).observe(&gdb, &[&bash()], ptrace_daemon(), None, S);
+        assert_eq!(d.score, 0.0);
     }
 
     #[test]

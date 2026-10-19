@@ -41,9 +41,13 @@ pub enum Response {
         incident_dropped: u64,
         /// Execs left unverified because the verification backlog was full.
         verify_skipped: u64,
-        /// Signals scored as unverified because a process's defer queue
-        /// overflowed.
+        /// Signals scored as unverified because a defer queue (one
+        /// process's, or the global one) overflowed.
         deferred_overflow: u64,
+        /// Decisions inside an open incident that were not recorded or
+        /// sent to telemetry because they added nothing new.
+        #[serde(default)]
+        incident_suppressed: u64,
         telemetry_dropped: TelemetryDropped,
     },
     Incidents(Vec<IncidentSummary>),
@@ -81,6 +85,51 @@ pub struct IncidentSummary {
     pub root_tgid: u32,
 }
 
+/// Whether `id` has the shape of an incident id,
+/// `AEG-<YYYYMMDD>-<HHMMSS>-<16 lowercase hex>`. Ids name directories,
+/// so nothing else is ever looked up.
+pub fn is_incident_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    b.len() == 36
+        && b.starts_with(b"AEG-")
+        && digits(4..12)
+        && b[12] == b'-'
+        && digits(13..19)
+        && b[19] == b'-'
+        && b[20..]
+            .iter()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+}
+
+/// Makes daemon- and attacker-supplied text safe to print or log on one
+/// line: control characters (C0, DEL, C1), line and paragraph
+/// separators, and bidi, zero-width and invisible marks become visible
+/// escapes like `\x1b` or `\u{202e}`.
+pub fn clean(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        let bad = c.is_control()
+            || matches!(
+                c,
+                '\u{061c}'
+                    | '\u{180e}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{2028}'..='\u{202e}'
+                    | '\u{2060}'..='\u{2069}'
+                    | '\u{feff}'
+            );
+        if !bad {
+            o.push(c);
+        } else if (c as u32) < 0x100 {
+            o += &format!("\\x{:02x}", c as u32);
+        } else {
+            o += &format!("\\u{{{:x}}}", c as u32);
+        }
+    }
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +146,38 @@ mod tests {
             serde_json::to_string(&Response::Error("permission denied".into())).unwrap(),
             r#"{"error":"permission denied"}"#
         );
+    }
+
+    #[test]
+    fn incident_ids() {
+        assert!(is_incident_id("AEG-20261018-093000-0123456789abcdef"));
+        for bad in [
+            "AEG-20261018-093000-a1b2",
+            "AEG-20261018-093000-0123456789ABCDEF",
+            "AEG-2026101x-093000-0123456789abcdef",
+            "AEG-20261018_093000-0123456789abcdef",
+            "../20261018-093000-0123456789abcdef",
+            "AEG-20261018-093000-0123456789abcdef0",
+            "",
+        ] {
+            assert!(!is_incident_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn clean_escapes_controls_separators_and_invisibles() {
+        assert_eq!(clean("a\nb\x1b[2J"), "a\\x0ab\\x1b[2J");
+        for (c, esc) in [
+            ('\u{061c}', "\\u{61c}"),
+            ('\u{180e}', "\\u{180e}"),
+            ('\u{2028}', "\\u{2028}"),
+            ('\u{2029}', "\\u{2029}"),
+            ('\u{202e}', "\\u{202e}"),
+            ('\u{200b}', "\\u{200b}"),
+            ('\u{0085}', "\\x85"),
+        ] {
+            assert_eq!(clean(&format!("x{c}y")), format!("x{esc}y"));
+        }
+        assert_eq!(clean("plain /usr/bin/ünï"), "plain /usr/bin/ünï");
     }
 }

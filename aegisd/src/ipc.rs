@@ -217,6 +217,7 @@ mod tests {
             incident_dropped: 0,
             verify_skipped: 0,
             deferred_overflow: 0,
+            incident_suppressed: 0,
             telemetry_dropped: TelemetryDropped::default(),
         }
     }

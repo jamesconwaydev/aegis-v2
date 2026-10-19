@@ -41,6 +41,8 @@ pub fn line(rec: &TelemetryRecord) -> String {
         "comm": rec.comm,
         "path": rec.exe_lossy(),
         "path_b64": rec.exe_b64(),
+        "target": rec.target_lossy(),
+        "target_b64": rec.target_b64(),
         "reasons": rec.reasons,
     })
     .to_string()

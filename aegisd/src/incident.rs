@@ -2,8 +2,8 @@
 //! Incident store: one directory per incident under the incident dir.
 //!
 //! ```text
-//! <dir>/AEG-20261018-093000-a1b2/incident.json   rewritten atomically
-//! <dir>/AEG-20261018-093000-a1b2/timeline.jsonl  one line per decision
+//! <dir>/AEG-20261018-093000-0123456789abcdef/incident.json   rewritten atomically
+//! <dir>/AEG-20261018-093000-0123456789abcdef/timeline.jsonl  one line per decision
 //! ```
 //!
 //! Grouping rule: a decision joins the incident of its nearest ancestor
@@ -33,6 +33,9 @@ use crate::telemetry::{b64, civil, mode_str, now_ns, rfc3339};
 use crate::verify::Verification;
 
 const MAX_EVIDENCE: usize = 256;
+/// Timeline lines per incident; one "truncated" marker follows, then
+/// nothing more.
+pub const MAX_TIMELINE: u64 = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct IncidentId(pub String);
@@ -127,6 +130,9 @@ pub struct Incident {
     /// Set once the evidence cap dropped something.
     #[serde(default)]
     pub evidence_truncated: bool,
+    /// Lines in `timeline.jsonl`, the truncation marker included.
+    #[serde(default)]
+    pub timeline_lines: u64,
 }
 
 pub fn verdict(t: Tier) -> Option<&'static str> {
@@ -194,14 +200,22 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     fsync_dir(path.parent().context("no parent")?)
 }
 
-/// Create a fresh incident dir under `root`, retrying on an id clash.
-/// A fresh id: `AEG-<UTC date>-<time>-<16 random bits>`.
+/// A fresh id: `AEG-<UTC date>-<time>-<64 random bits as 16 hex>`.
 pub fn new_incident_id() -> String {
     let (y, mo, d, h, mi, s) = civil(now_ns() / 1_000_000_000);
-    let r = std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish() as u16;
-    format!("AEG-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}-{r:04x}")
+    let mut r = [0u8; 8];
+    // SAFETY: getrandom writes at most r.len() bytes into r.
+    let n = unsafe { libc::getrandom(r.as_mut_ptr().cast(), r.len(), 0) };
+    if n != r.len() as isize {
+        // Only before the kernel's pool is ready, which a daemon started
+        // after boot never sees. RandomState is seeded from it anyway.
+        r = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+            .to_ne_bytes();
+    }
+    let r = u64::from_ne_bytes(r);
+    format!("AEG-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}-{r:016x}")
 }
 
 /// Create a fresh incident dir under `root`: `want` first when given,
@@ -241,7 +255,7 @@ pub fn current_boot_id() -> Option<String> {
 const KEEP_SECS: u64 = 30 * 86400;
 
 fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    aegis_proto::is_incident_id(id)
 }
 
 impl IncidentStore {
@@ -376,6 +390,7 @@ impl IncidentStore {
                     process_tree: vec![root],
                     evidence: vec![],
                     evidence_truncated: false,
+                    timeline_lines: 0,
                 }
             }
         };
@@ -407,20 +422,37 @@ impl IncidentStore {
             }
         }
 
+        // Past the cap, one marker and then silence: incident.json still
+        // tracks the score, the timeline stops growing.
+        let line = match inc.timeline_lines {
+            n if n < MAX_TIMELINE => Some(json!({
+                "ts": ts,
+                "tgid": d.key.tgid,
+                "start_time_ns": d.key.start_time_ns,
+                "tier": format!("{:?}", d.tier).to_lowercase(),
+                "verdict": verdict,
+                "score": d.score,
+                // Only the evidence this decision added; the earlier
+                // entries are on earlier lines.
+                "evidence": d.evidence.last().map(EvidenceRecord::new).into_iter().collect::<Vec<_>>(),
+            })),
+            MAX_TIMELINE => Some(json!({
+                "ts": ts,
+                "truncated": true,
+                "note": format!("timeline truncated at {MAX_TIMELINE} lines"),
+            })),
+            _ => None,
+        };
+        if line.is_some() {
+            inc.timeline_lines += 1;
+        }
         write_atomic(
             &dir.join("incident.json"),
             &serde_json::to_vec_pretty(&inc)?,
         )?;
-        let line = json!({
-            "ts": ts,
-            "tgid": d.key.tgid,
-            "start_time_ns": d.key.start_time_ns,
-            "tier": format!("{:?}", d.tier).to_lowercase(),
-            "verdict": verdict,
-            "score": d.score,
-            "evidence": d.evidence.iter().map(EvidenceRecord::new).collect::<Vec<_>>(),
-        });
-        writeln!(private_append(&dir.join("timeline.jsonl"))?, "{line}")?;
+        if let Some(line) = line {
+            writeln!(private_append(&dir.join("timeline.jsonl"))?, "{line}")?;
+        }
 
         let id = inc.id.clone();
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -529,6 +561,8 @@ mod tests {
             selinux_domain: Some("unconfined_t".into()),
             verification: Verification::Unverified,
             cgroup_id: 0,
+            env_taint: None,
+            ptraced: false,
         }
     }
 
@@ -564,7 +598,11 @@ mod tests {
                 Mode::Audit,
             )
             .unwrap();
-        assert!(id.0.starts_with("AEG-") && id.0.len() == "AEG-20261018-093000-a1b2".len());
+        assert!(
+            id.0.starts_with("AEG-") && id.0.len() == "AEG-20261018-093000-0123456789abcdef".len(),
+            "{id}"
+        );
+        assert!(valid_id(&id.0));
         let v: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join(&id.0).join("incident.json")).unwrap())
                 .unwrap();
@@ -690,10 +728,12 @@ mod tests {
             tgid: 10,
             comm: "c".into(),
             exe: Some(raw.to_vec()),
+            target: Some(raw.to_vec()),
             reasons: vec![],
         };
         let l: serde_json::Value = serde_json::from_str(&jsonl::line(&rec)).unwrap();
         assert_eq!(unb64(l["path_b64"].as_str().unwrap()), raw);
+        assert_eq!(unb64(l["target_b64"].as_str().unwrap()), raw);
     }
 
     #[test]
@@ -769,6 +809,40 @@ mod tests {
         assert!(st.list().is_empty());
         assert!(st.get(&id).is_some());
         assert!(st.get(&IncidentId("../x".into())).is_none());
+    }
+
+    #[test]
+    fn timeline_stops_at_the_cap_with_one_marker() {
+        let dir = tmp("tlcap");
+        let st = IncidentStore::open(&dir).unwrap();
+        let tree = [proc(10, None, b"/tmp/x")];
+        let id = st
+            .record(&dec(10, Tier::Throttle, 60.0), &tree, Mode::Audit)
+            .unwrap();
+        // Skip ahead to one line short of the cap.
+        st.inner
+            .lock()
+            .unwrap()
+            .incidents
+            .get_mut(&id.0)
+            .unwrap()
+            .timeline_lines = MAX_TIMELINE - 1;
+        for _ in 0..3 {
+            st.record(&dec(10, Tier::Quarantine, 90.0), &tree, Mode::Audit)
+                .unwrap();
+        }
+        let tl = st.timeline(&id).unwrap();
+        assert_eq!(tl.len(), 3, "{tl:?}");
+        assert_eq!(tl[1]["tier"], "quarantine");
+        assert_eq!(tl[2]["truncated"], true);
+        assert_eq!(tl[2]["note"], "timeline truncated at 10000 lines");
+        // incident.json keeps up all the same.
+        let inc = st.get(&id).unwrap();
+        assert_eq!(
+            (inc.max_score, inc.timeline_lines),
+            (90.0, MAX_TIMELINE + 1)
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
