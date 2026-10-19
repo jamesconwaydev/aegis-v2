@@ -1,23 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Exec, from `lsm/bprm_committed_creds`. This hook runs inside
-//! `begin_new_exec` after the creds are committed: past the point of no
-//! return, so a failed exec never reaches it, and after `de_thread` and
-//! `__set_task_comm`, so `comm` is the new program's name. A hook on
-//! `bprm_check_security` fires earlier but also fires for execs that then
-//! fail, which a watcher could use to spray misleading events.
+//! Exec. Two hooks cooperate so we report the file the user ran, not the
+//! interpreter, and only for execs that actually commit.
 //!
-//! `bprm_committed_creds` is a void LSM hook, so its return is ignored by
-//! the kernel; this program observes only. `bpf_d_path` is permitted here
-//! on 6.12, which gives the file's real path rather than argv[0]. Scripts
-//! hit the hook once for the interpreter (the script itself fails the
-//! binfmt check and never commits).
+//! `bprm_check_security` fires once per binfmt rewrite: first for the
+//! script (`bprm->file` = /tmp/evil.sh), then again for its interpreter
+//! (`bprm->file` = /bin/sh). The first call for an exec wins, so we
+//! record the original file's resolved path and flags there, keyed by
+//! the thread. `bprm_committed_creds` runs once, past the point of no
+//! return and after `__set_task_comm`, so it has the right `comm` and
+//! never fires for a failed exec; it consumes the record and emits.
+//!
+//! If no record is found (e.g. tracing started mid-exec) the committed
+//! hook falls back to classifying its own `bprm->file`.
+//!
+//! `bpf_d_path` is permitted on both hooks on 6.12, and gives the file's
+//! real path rather than argv[0].
 
-use aegis_common::{EventKind, EXEC_FROM_TMP, EXEC_MEMFD, PATH_TRUNCATED};
+use aegis_common::{EventKind, EXEC_FROM_TMP, EXEC_MEMFD, PATH_MAX_EV, PATH_TRUNCATED};
 use aya_ebpf::{
     bindings::path,
-    helpers::{bpf_d_path, bpf_probe_read_kernel_str_bytes},
+    helpers::{bpf_d_path, bpf_get_current_pid_tgid, bpf_probe_read_kernel_str_bytes},
     macros::{lsm, map},
-    maps::PerCpuArray,
+    maps::{LruHashMap, PerCpuArray},
     programs::LsmContext,
 };
 
@@ -27,16 +31,43 @@ const SCRATCH_LEN: usize = 4096;
 const ENAMETOOLONG: i64 = 36;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 
+/// The original executed file's verdict, carried from the first
+/// `bprm_check_security` to `bprm_committed_creds`, keyed by pid_tgid.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExecRecord {
+    /// The `linux_binprm` this verdict belongs to, so a later binfmt
+    /// rewrite of the same exec (same bprm) doesn't overwrite it, and a
+    /// stale entry from an earlier exec is recognised and replaced.
+    bprm: u64,
+    flags: u32,
+    path_len: u32,
+    path: [u8; PATH_MAX_EV],
+}
+
 /// Room for a full PATH_MAX path, so the prefix checks below see the
-/// start of a path even when it's too long for `Event::path`.
+/// start of a path even when it's too long for the 256-byte field.
 #[map]
 static SCRATCH: PerCpuArray<[u8; SCRATCH_LEN]> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
+static RECORDS: LruHashMap<u64, ExecRecord> = LruHashMap::with_max_entries(4096, 0);
+
+#[map]
+static REC_BUILD: PerCpuArray<ExecRecord> = PerCpuArray::with_max_entries(1, 0);
+
+#[lsm(hook = "bprm_check_security")]
+pub fn aegis_exec_check(ctx: LsmContext) -> i32 {
+    let _ = try_check(&ctx);
+    // Gating hook: 0 allows the exec. We observe, never deny.
+    0
+}
 
 #[lsm(hook = "bprm_committed_creds")]
 pub fn aegis_exec(ctx: LsmContext) -> i32 {
     let _ = try_exec(&ctx);
-    // fmod_ret semantics: a non-zero return could only add a denial, and
-    // 0 cannot override one another LSM already made. We only observe.
+    // bprm_committed_creds is a void LSM hook; the kernel ignores this
+    // return. We only observe.
     0
 }
 
@@ -63,8 +94,9 @@ fn on_tmpfs(file: *const u8) -> bool {
     magic == TMPFS_MAGIC
 }
 
-fn try_exec(ctx: &LsmContext) -> Option<()> {
-    let bprm: *const u8 = ctx.arg(0);
+/// Resolves `bprm->file` and writes its path into `out`, returning
+/// `(flags, path_len)`. `out` must already be zeroed.
+fn classify(bprm: *const u8, out: &mut [u8; PATH_MAX_EV]) -> (u32, u32) {
     // Plain loads, not bpf_probe_read: bpf_d_path only accepts a pointer
     // the verifier can type as `struct path` by walking BTF from `bprm`.
     // OFFSETS is frozen rodata, so the verifier sees these as constants.
@@ -72,41 +104,84 @@ fn try_exec(ctx: &LsmContext) -> Option<()> {
     let file = unsafe { *(bprm.add(file_off) as *const *const u8) };
     let fpath = unsafe { file.add(path_off) } as *mut path;
 
-    let buf = SCRATCH.get_ptr_mut(0)?;
+    let Some(buf) = SCRATCH.get_ptr_mut(0) else {
+        return (0, 0);
+    };
     let n = unsafe { bpf_d_path(fpath, buf.cast(), SCRATCH_LEN as u32) };
-    let tmpfs = on_tmpfs(file);
+
+    let mut flags = 0;
+    if on_tmpfs(file) {
+        flags |= EXEC_FROM_TMP;
+    }
+    if n == -ENAMETOOLONG {
+        flags |= PATH_TRUNCATED;
+    }
+    if n <= 0 {
+        return (flags, 0);
+    }
+    let s = unsafe { &*buf };
+    // n counts the trailing NUL.
+    if n as usize > out.len() {
+        flags |= PATH_TRUNCATED;
+    }
+    // A disk-backed /tmp won't trip the tmpfs check, so keep the prefixes.
+    if starts_with(s, b"/tmp/") || starts_with(s, b"/var/tmp/") || starts_with(s, b"/dev/shm/") {
+        flags |= EXEC_FROM_TMP;
+    }
+    // A memfd's dentry is "memfd:<name>" on an unmounted tmpfs, so d_path
+    // renders it "/memfd:<name> (deleted)". It's tmpfs too, so it also
+    // carries EXEC_FROM_TMP.
+    if starts_with(s, b"/memfd:") {
+        flags |= EXEC_MEMFD;
+    }
+    let path_len =
+        unsafe { bpf_probe_read_kernel_str_bytes(s.as_ptr(), out) }.map_or(0, |p| p.len() as u32);
+    (flags, path_len)
+}
+
+fn try_check(ctx: &LsmContext) -> Option<()> {
+    let bprm: *const u8 = ctx.arg(0);
+    let key = bpf_get_current_pid_tgid();
+    // First rewrite wins: a later depth of the same exec shares this bprm.
+    if let Some(e) = unsafe { RECORDS.get(&key) } {
+        if e.bprm == bprm as u64 {
+            return Some(());
+        }
+    }
+    let rec = unsafe { &mut *REC_BUILD.get_ptr_mut(0)? };
+    unsafe { core::ptr::write_bytes(rec as *mut ExecRecord, 0, 1) };
+    rec.bprm = bprm as u64;
+    let (flags, path_len) = classify(bprm, &mut rec.path);
+    rec.flags = flags;
+    rec.path_len = path_len;
+    let _ = RECORDS.insert(&key, &*rec, 0);
+    Some(())
+}
+
+fn try_exec(ctx: &LsmContext) -> Option<()> {
+    let bprm: *const u8 = ctx.arg(0);
+    let key = bpf_get_current_pid_tgid();
+    let rec = unsafe { RECORDS.get(&key) };
 
     emit(EventKind::Exec, |ev| {
         current(ev);
-        if tmpfs {
-            ev.flags |= EXEC_FROM_TMP;
-        }
-        if n == -ENAMETOOLONG {
-            ev.flags |= PATH_TRUNCATED;
-        }
-        if n <= 0 {
-            return;
-        }
-        let s = unsafe { &*buf };
-        // n counts the trailing NUL.
-        if n as usize > ev.path.len() {
-            ev.flags |= PATH_TRUNCATED;
-        }
-        // A disk-backed /tmp won't trip the tmpfs check, so keep the
-        // path prefixes too.
-        if starts_with(s, b"/tmp/") || starts_with(s, b"/var/tmp/") || starts_with(s, b"/dev/shm/")
-        {
-            ev.flags |= EXEC_FROM_TMP;
-        }
-        // A memfd's dentry is "memfd:<name>" on an unmounted tmpfs, so
-        // d_path renders it as "/memfd:<name> (deleted)". It's tmpfs too,
-        // so it also carries EXEC_FROM_TMP.
-        if starts_with(s, b"/memfd:") {
-            ev.flags |= EXEC_MEMFD;
-        }
-        if let Ok(p) = unsafe { bpf_probe_read_kernel_str_bytes(s.as_ptr(), &mut ev.path) } {
-            ev.path_len = p.len() as u32;
+        match rec {
+            // The common path: the original file's verdict, recorded at
+            // the first bprm_check_security of this exec.
+            Some(r) if r.bprm == bprm as u64 => {
+                ev.flags |= r.flags;
+                ev.path = r.path;
+                ev.path_len = r.path_len;
+            }
+            // No record (tracing began mid-exec): fall back to this
+            // hook's own file, which for a script is the interpreter.
+            _ => {
+                let (flags, path_len) = classify(bprm, &mut ev.path);
+                ev.flags |= flags;
+                ev.path_len = path_len;
+            }
         }
     });
+    let _ = RECORDS.remove(&key);
     Some(())
 }

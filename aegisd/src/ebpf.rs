@@ -79,6 +79,11 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
         )))
         .context("loading eBPF object")?;
 
+    // Records the original file at the first check; emits at commit.
+    let check: &mut Lsm = prog(&mut ebpf, "aegis_exec_check")?;
+    check.load("bprm_check_security", &kernel_btf)?;
+    check.attach()?;
+
     let lsm: &mut Lsm = prog(&mut ebpf, "aegis_exec")?;
     lsm.load("bprm_committed_creds", &kernel_btf)?;
     lsm.attach()?;
