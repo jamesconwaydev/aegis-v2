@@ -117,6 +117,7 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
     for (name, category, tracepoint) in [
         ("aegis_exit", "sched", "sched_process_exit"),
         ("aegis_ptrace", "syscalls", "sys_enter_ptrace"),
+        ("aegis_ptrace_exit", "syscalls", "sys_exit_ptrace"),
         ("aegis_memfd", "syscalls", "sys_enter_memfd_create"),
         ("aegis_connect", "sock", "inet_sock_set_state"),
     ] {

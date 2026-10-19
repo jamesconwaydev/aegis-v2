@@ -28,7 +28,7 @@
 //! showed a signal kind it hadn't before, or a minute has passed since
 //! the incident last spoke. The rest are counted in `incident_suppressed`.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -108,10 +108,16 @@ struct Deferred {
 }
 
 /// What an open incident has already said, so a repeat isn't said again.
+#[derive(Default)]
 struct Spoken {
-    tier: Tier,
-    seen: HashSet<(ProcKey, SignalKind)>,
+    tier: Option<Tier>,
+    /// Per member, the signal kinds already recorded, one bit per kind.
+    seen: HashMap<ProcKey, u8>,
     last_ns: Option<u64>,
+}
+
+fn bit(k: SignalKind) -> u8 {
+    1 << k as u8
 }
 
 pub struct Pipeline {
@@ -273,6 +279,12 @@ impl Pipeline {
     /// Scores a signal now, or defers it if the verdict it needs is still
     /// in flight.
     fn consider(&mut self, key: ProcKey, sig: Signal, target: Option<PathBuf>, ts_ns: u64) {
+        // Trust is judged below, on this process and its parent: finish
+        // reading either's environment first.
+        self.table.settle_env(&key);
+        if let Some(parent) = self.table.get(&key).and_then(|p| p.parent) {
+            self.table.settle_env(&parent);
+        }
         let Some(subject) = self.table.get(&key).cloned() else {
             return;
         };
@@ -442,7 +454,11 @@ impl Pipeline {
     fn drop_state(&mut self, key: &ProcKey) {
         self.scorer.on_exit(key);
         self.scan.on_exit(key);
-        self.groups.remove(key);
+        if let Some(g) = self.groups.remove(key) {
+            if let Some(s) = self.spoken.get_mut(&g) {
+                s.seen.remove(key);
+            }
+        }
     }
 
     /// Finishes forgetting exited processes once nothing of theirs is
@@ -530,7 +546,12 @@ impl Pipeline {
             .chain(ancestors.iter().cloned())
             .filter(|p| !matches!(p.key.tgid, 1 | 2))
             .collect();
-        self.record(&d, tree, &g);
+        // Dropped (writer queue full): nothing counts as said, so the
+        // next decision tries again, telemetry included.
+        if !self.record(&d, tree, &g) {
+            return;
+        }
+        self.said(&g, subject.key, &d, ts_ns);
         let incident = g;
         self.sinks.emit(&TelemetryRecord {
             ts_unix_ns: now_ns(),
@@ -550,34 +571,36 @@ impl Pipeline {
         });
     }
 
-    /// Whether incident `g` should record this decision: its tier rose,
-    /// this process shows this signal kind for the first time, or the
-    /// incident has been quiet for a heartbeat. Updates what it has said.
-    fn worth_saying(&mut self, g: &str, key: ProcKey, d: &Decision, ts_ns: u64) -> bool {
-        let kinds = || {
-            d.evidence
-                .iter()
-                .map(move |e| (key, SignalKind::of(&e.signal)))
+    /// Whether incident `g` should record this decision: its first, a
+    /// tier rise, this process showing this signal kind for the first
+    /// time, or a heartbeat since the incident last recorded.
+    fn worth_saying(&self, g: &str, key: ProcKey, d: &Decision, ts_ns: u64) -> bool {
+        let Some(s) = self.spoken.get(g) else {
+            return true;
         };
-        let s = self.spoken.entry(g.to_string()).or_insert_with(|| Spoken {
-            tier: Tier::Log,
-            seen: HashSet::new(),
-            last_ns: None,
-        });
-        let first = s.last_ns.is_none();
-        let rose = d.tier > s.tier;
-        let new = kinds().next_back().is_some_and(|k| !s.seen.contains(&k));
-        let beat = s
-            .last_ns
-            .is_some_and(|l| ts_ns.saturating_sub(l) >= HEARTBEAT_NS);
-        if !(first || rose || new || beat) {
-            return false;
-        }
-        s.tier = s.tier.max(d.tier);
+        let Some(last) = s.last_ns else {
+            return true;
+        };
+        let rose = s.tier.is_none_or(|t| d.tier > t);
+        let seen = s.seen.get(&key).copied().unwrap_or(0);
+        let new = d
+            .evidence
+            .last()
+            .is_some_and(|e| seen & bit(SignalKind::of(&e.signal)) == 0);
+        let beat = ts_ns.saturating_sub(last) >= HEARTBEAT_NS;
+        rose || new || beat
+    }
+
+    /// Notes what a recorded decision said: its tier, the time, and every
+    /// signal kind it carries for this process.
+    fn said(&mut self, g: &str, key: ProcKey, d: &Decision, ts_ns: u64) {
+        let s = self.spoken.entry(g.to_string()).or_default();
+        s.tier = s.tier.max(Some(d.tier));
         s.last_ns = Some(s.last_ns.unwrap_or(0).max(ts_ns));
-        // Everything this record carries has now been said.
-        s.seen.extend(kinds());
-        true
+        let seen = s.seen.entry(key).or_default();
+        for e in &d.evidence {
+            *seen |= bit(SignalKind::of(&e.signal));
+        }
     }
 
     /// Sum over kinds of the max decayed component across the live
@@ -617,11 +640,15 @@ impl Pipeline {
         }
     }
 
-    fn record(&mut self, d: &Decision, tree: Vec<ProcInfo>, id: &str) {
+    /// Sends the decision to be recorded; false if it was dropped.
+    fn record(&mut self, d: &Decision, tree: Vec<ProcInfo>, id: &str) -> bool {
         match &self.incidents.tx {
             Some(tx) => match tx.try_send((d.clone(), tree, self.mode, id.to_string())) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => self.incident_dropped += 1,
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    self.incident_dropped += 1;
+                    false
+                }
                 Err(TrySendError::Disconnected(_)) => {
                     self.incident_dropped += 1;
                     if !self.writer_gone_logged {
@@ -631,21 +658,24 @@ impl Pipeline {
                                  incidents are no longer recorded"
                         );
                     }
+                    false
                 }
             },
-            None => {
-                if let Err(e) = self
-                    .incidents
-                    .store
-                    .record_as(d, &tree, self.mode, Some(id))
-                {
+            None => match self
+                .incidents
+                .store
+                .record_as(d, &tree, self.mode, Some(id))
+            {
+                Ok(_) => true,
+                Err(e) => {
                     self.incidents.errors.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
                         "aegisd: recording incident for tgid {} failed: {e:#}",
                         d.key.tgid
                     );
+                    false
                 }
-            }
+            },
         }
     }
 }
@@ -771,7 +801,8 @@ mod tests {
         let mut p = Pipeline::new(&cfg, Incidents::inline(store), sinks, Box::new(Pid1), false);
         // No real processes behind these tgids: give each a clean
         // environment.
-        p.table.environ = |_, _| Some(b"PATH=/usr/bin\0".to_vec());
+        p.table.environ = |_, _, _| Some(b"PATH=/usr/bin\0".to_vec());
+        p.table.host_pidns = |_| true;
         (p, Dir(d))
     }
 
@@ -927,7 +958,7 @@ mod tests {
     #[test]
     fn a_preloaded_runc_is_quarantined_even_once_verified() {
         let (mut p, _d) = pipeline("preload");
-        p.table.environ = |_, _| Some(b"LD_PRELOAD=/tmp/evil.so\0".to_vec());
+        p.table.environ = |_, _, _| Some(b"LD_PRELOAD=/tmp/evil.so\0".to_vec());
         runc_self_clone(&mut p, Some(rpm("runc")));
         let l = p.store().list();
         assert_eq!(l.len(), 1);
@@ -945,6 +976,20 @@ mod tests {
         );
         // Shown as verified all the same.
         assert_eq!(inc.root.verification, "rpm_owned:runc");
+    }
+
+    #[test]
+    fn an_environment_read_too_early_is_read_again_and_trusted() {
+        // At the exec's commit the new environment isn't laid out yet:
+        // empty. By runc's memfd_create it is.
+        let (mut p, _d) = pipeline("env-late");
+        p.table.environ = |_, _, _| Some(Vec::new());
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
+        p.table.environ = |_, _, _| Some(b"PATH=/usr/bin\0".to_vec());
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
+        assert_eq!(p.store().open_count(), 0);
     }
 
     #[test]
@@ -1053,6 +1098,48 @@ mod tests {
         let n = std::fs::read_to_string(&log).unwrap().lines().count();
         let _ = std::fs::remove_file(&log);
         assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn a_decision_dropped_on_a_full_queue_is_not_taken_as_said() {
+        let (mut p, _d) = pipeline("full");
+        // A writer queue with room for one.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RecordJob>(1);
+        p.incidents.tx = Some(tx);
+        let mx = || exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP);
+        p.handle(&exec(60, "/tmp/x", 0));
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        // The opening record takes the one slot; nothing drains it.
+        p.handle(&mx());
+        // A new process with a new kind: news, but the queue is full.
+        p.handle(&fork(60, 61));
+        p.handle(&ev(EventKind::MemfdCreate, 61));
+        assert_eq!(p.incident_dropped, 1);
+        assert_eq!(p.incident_suppressed, 0);
+        // Room again: the same news is still news, and gets through.
+        assert_eq!(rx.try_iter().count(), 1, "the opening record");
+        p.handle(&ev(EventKind::MemfdCreate, 61));
+        assert_eq!(rx.try_iter().count(), 1);
+        assert_eq!(p.incident_suppressed, 0);
+        // Said now, so a repeat is not.
+        p.handle(&ev(EventKind::MemfdCreate, 61));
+        assert_eq!(p.incident_suppressed, 1);
+    }
+
+    #[test]
+    fn an_exited_member_leaves_nothing_in_the_incident_state() {
+        let (mut p, _d) = pipeline("prune");
+        let mx = || exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP);
+        p.handle(&exec(60, "/tmp/x", 0));
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        p.handle(&mx());
+        p.handle(&fork(60, 61));
+        p.handle(&ev(EventKind::MemfdCreate, 61));
+        let g = p.groups[&key(61)].clone();
+        assert!(p.spoken[&g].seen.contains_key(&key(61)));
+        p.handle(&ev(EventKind::Exit, 61));
+        assert!(!p.spoken[&g].seen.contains_key(&key(61)));
+        assert!(p.spoken[&g].seen.contains_key(&key(60)));
     }
 
     #[test]

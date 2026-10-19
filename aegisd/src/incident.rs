@@ -36,6 +36,10 @@ const MAX_EVIDENCE: usize = 256;
 /// Timeline lines per incident; one "truncated" marker follows, then
 /// nothing more.
 pub const MAX_TIMELINE: u64 = 10_000;
+/// Members listed in `process_tree`; past this the flag is set. Later
+/// members still join the incident while aegisd runs, but aren't listed,
+/// so after a restart they aren't known to belong.
+pub const MAX_TREE: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct IncidentId(pub String);
@@ -130,6 +134,9 @@ pub struct Incident {
     /// Set once the evidence cap dropped something.
     #[serde(default)]
     pub evidence_truncated: bool,
+    /// Set once `MAX_TREE` kept a member out of `process_tree`.
+    #[serde(default)]
+    pub process_tree_truncated: bool,
     /// Lines in `timeline.jsonl`, the truncation marker included.
     #[serde(default)]
     pub timeline_lines: u64,
@@ -390,6 +397,7 @@ impl IncidentStore {
                     process_tree: vec![root],
                     evidence: vec![],
                     evidence_truncated: false,
+                    process_tree_truncated: false,
                     timeline_lines: 0,
                 }
             }
@@ -397,7 +405,11 @@ impl IncidentStore {
         let dir = self.dir.join(&inc.id);
 
         if !inc.process_tree.iter().any(|m| m.key() == d.key) {
-            inc.process_tree.push(ProcSummary::new(me));
+            if inc.process_tree.len() < MAX_TREE {
+                inc.process_tree.push(ProcSummary::new(me));
+            } else {
+                inc.process_tree_truncated = true;
+            }
         }
         // Upgrade only: a quarantine verdict never goes back to throttle.
         if verdict == "would_quarantine" {
@@ -562,6 +574,7 @@ mod tests {
             verification: Verification::Unverified,
             cgroup_id: 0,
             env_taint: None,
+            env_pending: false,
             ptraced: false,
         }
     }
@@ -842,6 +855,40 @@ mod tests {
             (inc.max_score, inc.timeline_lines),
             (90.0, MAX_TIMELINE + 1)
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_tree_stops_at_the_cap_and_says_so() {
+        let dir = tmp("treecap");
+        let st = IncidentStore::open(&dir).unwrap();
+        let root = proc(10, None, b"/tmp/x");
+        let id = st
+            .record(
+                &dec(10, Tier::Throttle, 60.0),
+                std::slice::from_ref(&root),
+                Mode::Audit,
+            )
+            .unwrap();
+        // Fill the tree to the cap without a write per member.
+        {
+            let mut g = st.inner.lock().unwrap();
+            let inc = g.incidents.get_mut(&id.0).unwrap();
+            while inc.process_tree.len() < MAX_TREE {
+                let mut m = inc.process_tree[0].clone();
+                m.tgid = 100_000 + inc.process_tree.len() as u32;
+                inc.process_tree.push(m);
+            }
+        }
+        let child = proc(11, Some(10), b"/tmp/y");
+        let got = st
+            .record(&dec(11, Tier::Throttle, 60.0), &[child, root], Mode::Audit)
+            .unwrap();
+        assert_eq!(got, id, "still joins the incident");
+        let inc = st.get(&id).unwrap();
+        assert_eq!(inc.process_tree.len(), MAX_TREE);
+        assert!(inc.process_tree_truncated);
+        assert!(inc.process_tree.iter().all(|m| m.tgid != 11));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -544,6 +544,7 @@ mod tests {
             verification: v,
             cgroup_id: 0,
             env_taint: None,
+            env_pending: false,
             ptraced: false,
         }
     }

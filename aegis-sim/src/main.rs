@@ -31,7 +31,13 @@ enum Cmd {
     TmpDropper,
     /// Copy this binary into an in-memory file and execute that. Exercises
     /// memfd_create (20) and exec-of-a-memfd (65).
-    MemfdExec,
+    MemfdExec {
+        /// Wait this long first, as a container runtime does real work
+        /// before its memfd. aegisd reads a process's environment just
+        /// after its exec, and one already gone reads as tainted.
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u64,
+    },
     /// Connect to many closed loopback ports fast. Exercises the egress
     /// scan signal (40). Targets are refused to 127.0.0.0/8 or the host.
     PortScan {
@@ -61,7 +67,10 @@ fn main() {
     let code = match Cli::parse().cmd {
         Cmd::Noop => 0,
         Cmd::TmpDropper => linux::tmp_dropper(),
-        Cmd::MemfdExec => linux::memfd_exec(),
+        Cmd::MemfdExec { wait_ms } => {
+            std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            linux::memfd_exec()
+        }
         Cmd::PortScan { target } => linux::port_scan(&target),
         Cmd::Chain { cmd } => linux::chain(&cmd),
     };

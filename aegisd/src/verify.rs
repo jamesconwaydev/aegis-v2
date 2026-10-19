@@ -26,7 +26,8 @@ pub enum Verification {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Owner {
     Owned(String),
-    /// rpm ran and said so: exit 1 and "is not owned by any package".
+    /// rpm ran and said so: exit 1, "is not owned by any package", and
+    /// nothing on stderr.
     NotOwned,
     /// Anything else: a timeout, a spawn failure, another exit or
     /// message. Never cached.
@@ -200,29 +201,38 @@ pub struct Rpm;
 const RPM: &str = "/usr/bin/rpm";
 pub const RPM_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Runs `rpm args`, returning (exit code, stdout bytes), or None on spawn
-/// failure or timeout. The code is None when rpm died on a signal.
-fn rpm(args: &[&std::ffi::OsStr]) -> Option<(Option<i32>, Vec<u8>)> {
+/// What one rpm run left: exit code (None when it died on a signal),
+/// stdout and stderr.
+type RpmRun = (Option<i32>, Vec<u8>, Vec<u8>);
+
+/// Runs `rpm args`, or None on spawn failure or timeout.
+fn rpm(args: &[&std::ffi::OsStr]) -> Option<RpmRun> {
     let mut child = Command::new(RPM)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .ok()?;
-    let mut out = child.stdout.take()?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut s = Vec::new();
-        let r = out.read_to_end(&mut s);
-        let _ = tx.send(r.ok().map(|_| s));
-    });
+    // One reader per pipe, so neither can fill up and stall rpm.
+    let drain = |mut p: Box<dyn Read + Send>| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut s = Vec::new();
+            let r = p.read_to_end(&mut s);
+            let _ = tx.send(r.ok().map(|_| s));
+        });
+        rx
+    };
+    let out = drain(Box::new(child.stdout.take()?));
+    let err = drain(Box::new(child.stderr.take()?));
     let deadline = Instant::now() + RPM_TIMEOUT;
-    if let Ok(Some(s)) = rx.recv_timeout(RPM_TIMEOUT) {
+    let left = || deadline.saturating_duration_since(Instant::now());
+    if let (Ok(Some(o)), Ok(Some(e))) = (out.recv_timeout(left()), err.recv_timeout(left())) {
         // EOF doesn't mean exited; don't block on wait() forever.
         while Instant::now() < deadline {
             if let Ok(Some(st)) = child.try_wait() {
-                return Some((st.code(), s));
+                return Some((st.code(), o, e));
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -245,7 +255,7 @@ impl RpmDb for Rpm {
     }
 
     fn verify(&self, p: &Path, f: &File, md: &Metadata) -> Option<bool> {
-        let (code, out) = rpm(&[
+        let (code, out, _) = rpm(&[
             "-qf".as_ref(),
             "--dump".as_ref(),
             "--".as_ref(),
@@ -260,9 +270,10 @@ impl RpmDb for Rpm {
 
 /// Reads `rpm -qf --qf '%{NAME}\n' -- p`'s outcome. Only exit 0 with a
 /// name is owned, and only exit 1 with rpm's own "not owned" line for
-/// `p` is not owned; everything else is indeterminate.
-fn classify_owner(p: &Path, r: Option<(Option<i32>, Vec<u8>)>) -> Owner {
-    let Some((code, out)) = r else {
+/// `p` and nothing on stderr is not owned; everything else (a warning
+/// or error beside it included) is indeterminate.
+fn classify_owner(p: &Path, r: Option<RpmRun>) -> Owner {
+    let Some((code, out, err)) = r else {
         return Owner::Indeterminate;
     };
     let mut lines = out.split(|&b| b == b'\n');
@@ -279,7 +290,7 @@ fn classify_owner(p: &Path, r: Option<(Option<i32>, Vec<u8>)>) -> Owner {
                 Owner::Owned(name)
             }
         }
-        Some(1) => {
+        Some(1) if err.is_empty() => {
             let mut want = b"file ".to_vec();
             want.extend_from_slice(p.as_os_str().as_bytes());
             want.extend_from_slice(b" is not owned by any package");
@@ -462,7 +473,9 @@ mod tests {
     #[test]
     fn rpm_owner_outcomes() {
         let p = Path::new("/tmp/x");
-        let r = |code: Option<i32>, out: &[u8]| classify_owner(p, Some((code, out.to_vec())));
+        let r = |code: Option<i32>, out: &[u8]| {
+            classify_owner(p, Some((code, out.to_vec(), Vec::new())))
+        };
         assert_eq!(
             r(Some(0), b"coreutils-single\nother\n"),
             Owner::Owned("coreutils-single".into())
@@ -482,6 +495,18 @@ mod tests {
             Owner::Indeterminate
         );
         assert_eq!(r(Some(0), b"\n"), Owner::Indeterminate);
+        // Anything on stderr makes "not owned" untrustworthy.
+        assert_eq!(
+            classify_owner(
+                p,
+                Some((
+                    Some(1),
+                    b"file /tmp/x is not owned by any package\n".to_vec(),
+                    b"error: rpmdb: damaged header\n".to_vec()
+                ))
+            ),
+            Owner::Indeterminate
+        );
         assert_eq!(r(Some(2), b""), Owner::Indeterminate);
         assert_eq!(r(None, b""), Owner::Indeterminate, "killed by a signal");
         assert_eq!(
