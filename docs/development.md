@@ -192,6 +192,50 @@ ausearch -m AVC -ts recent      # should say <no matches>
 for a denial that's hiding; `semodule -B` turns them back on. Never
 commit a `permissive aegisd_t;` line.
 
+## End-to-end tests
+
+`cargo xtask e2e` checks the whole thing on a real Rocky 10 host. It
+builds the RPMs and the `aegis-sim` attack simulator for the host's
+architecture (on your machine, never on the host), installs them over
+SSH, runs every scenario in `tests/e2e/scenarios.toml`, and checks what
+aegisd recorded.
+
+```sh
+cargo xtask e2e --host root@203.0.113.10 --key ~/.ssh/test-host
+```
+
+For the Lima VM, export its SSH config and run as the login user with
+sudo:
+
+```sh
+limactl show-ssh --format=config aegis-rocky10 > lima.ssh
+cargo xtask e2e --host lima-aegis-rocky10 --ssh-config lima.ssh --sudo
+```
+
+Use a disposable host. The harness installs `gdb`, `podman`,
+`python3-pip` and `strace` if they're missing, turns SELinux enforcing
+for the run, and stops and restarts aegisd between scenarios. Afterwards
+it removes the packages it added, the aegis RPMs and
+`/var/lib/aegis-v2`, and puts SELinux back how it found it. `--keep`
+leaves everything installed.
+
+Each scenario runs over a fresh SSH connection, with the incident store
+cleared first. It passes when:
+
+- its command exits 0,
+- `aegisctl incidents list --json` shows exactly what `expect` says:
+  `none`, or one incident with `would_throttle` or `would_quarantine`,
+- no SELinux denial mentioning aegis was logged, and
+- `/etc` hashes the same before and after, since v0.1 must never change
+  the host.
+
+There are ten scenarios: five attack simulations (`tmp-dropper`,
+`memfd-exec`, `ptrace-daemon`, `port-scan`, `chain`) and five benign
+workloads that must not trip anything (`dnf-install`, `gdb-attach`,
+`pip-download`, `podman-run`, `ssh-login`). Adding one means adding a
+`[[scenario]]` with a `name`, a shell `run` command and an `expect`.
+`aegis-sim --help` lists the simulators.
+
 ## Licences and CI
 
 `deny.toml` says which licences a dependency may carry, and the list is

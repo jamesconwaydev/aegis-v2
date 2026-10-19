@@ -52,5 +52,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tag publishes x86_64 and aarch64 RPMs as a GitHub release.
 - The RPM ships the licence text of every crate compiled into it, and
   its `License:` tag now names all of them.
+- A README with an animated header, and a full set of docs under
+  `docs/`: installation, preflight, configuration, scoring, incidents,
+  telemetry, `aegisctl`, SELinux, the threat model, troubleshooting, an
+  FAQ, releasing and the roadmap.
 - Contributor scaffolding: issue forms, pull request template, security
   policy, code of conduct and contributing guide.

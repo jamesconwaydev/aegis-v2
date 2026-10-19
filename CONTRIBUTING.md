@@ -14,8 +14,8 @@ cargo xtask build --release
 ```
 
 [docs/development.md](docs/development.md) covers the other architecture,
-picking a container engine, the caches, and building the RPMs with
-`cargo xtask rpm`. `cargo xtask e2e` arrives in a later PR.
+picking a container engine, the caches, building the RPMs with
+`cargo xtask rpm`, and the end-to-end tests with `cargo xtask e2e`.
 
 ## Pull requests
 
@@ -39,8 +39,8 @@ what is new rather than "update stuff", and wrap the body at 72.
 
 ## Before you push
 
-Run these. CI will run them too once the workflows land, and they're quicker on
-your machine. Clippy and the tests need the build container;
+Run these. CI runs them too, but they're quicker on your machine. Clippy
+and the tests need the build container;
 [docs/development.md](docs/development.md) has the command.
 
 ```sh
