@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ["v*.*.*"]
+  # A dry run from a branch: every check and both RPM builds, no release.
+  workflow_dispatch:
 
 # One run per tag, and a second push of the same tag waits rather than
 # cancelling a release halfway through publishing.
@@ -14,7 +16,53 @@ permissions:
   contents: read
 
 jobs:
+  # Everything that can stop a release, before any build starts.
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the versions agree
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          spec=packaging/aegis-v2.spec
+          grep -q '^Version: *%{aegis_version}$' "$spec" \
+            || fail "$spec must take Version from aegis_version (Cargo.toml)"
+          entry=$(sed -n '/^%changelog/{n;s/.* - \([^ ]*\)-[^-]*$/\1/p;q;}' "$spec")
+          test "$entry" = "$version" \
+            || fail "$spec %changelog starts at $entry, Cargo.toml is $version"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            test "v$version" = "$GITHUB_REF_NAME" \
+              || fail "tag $GITHUB_REF_NAME, Cargo.toml $version"
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+              || fail "$GITHUB_REF_NAME is not on main"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      # The notes are this version's CHANGELOG section, and there must be
+      # one: a release without notes fails here, before anything builds.
+      - name: Extract release notes
+        run: |
+          awk -v h="## [$VERSION]" '
+            index($0, h) == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          grep -q '[^[:space:]]' notes.md \
+            || { echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; }
+          cat notes.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notes
+          path: notes.md
+          if-no-files-found: error
+          retention-days: 7
+
   rpm:
+    needs: check
     strategy:
       matrix:
         include:
@@ -31,21 +79,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Check the tag matches the crate version
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          test "v$version" = "$GITHUB_REF_NAME" \
-            || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version" >&2; exit 1; }
       - uses: ./.github/actions/build-image
         with:
           arch: ${{ matrix.arch }}
-      # xtask runs on the host; the arm runner may not carry rustup.
-      - name: Install rustup
-        run: |
-          command -v rustup && exit 0
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain none
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # xtask runs on the host, so the runner image must carry rustup.
+      - name: Check for rustup
+        run: command -v rustup || { echo "::error::no rustup on ${{ matrix.runner }}"; exit 1; }
       - run: cargo xtask rpm --arch ${{ matrix.arch }}
         env:
           AEGIS_CONTAINER_ENGINE: docker
@@ -57,15 +96,13 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: rpm
+    needs: [check, rpm]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: rpm-*
@@ -74,24 +111,15 @@ jobs:
       - name: Write SHA256SUMS
         working-directory: out
         run: sha256sum -- *.rpm | tee SHA256SUMS
-      # The notes are this version's CHANGELOG section, and there must be
-      # one: a release without notes fails here, before anything is public.
-      - name: Extract release notes
-        run: |
-          v=${GITHUB_REF_NAME#v}
-          awk -v h="## [$v]" '
-            index($0, h) == 1 { on = 1; next }
-            on && /^## \[/ { exit }
-            on { print }
-          ' CHANGELOG.md > notes.md
-          grep -q '[^[:space:]]' notes.md \
-            || { echo "CHANGELOG.md has no section for $v" >&2; exit 1; }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notes
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           pre=
-          case "$GITHUB_REF_NAME" in v0.*) pre=--prerelease ;; esac
+          case "$GITHUB_REF_NAME" in v0.* | *-*) pre=--prerelease ;; esac
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md \
             $pre out/*

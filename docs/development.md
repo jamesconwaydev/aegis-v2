@@ -203,15 +203,23 @@ exception: it runs in the kernel, and no userspace binary links it.
 Every pull request runs seven checks, and main won't take a merge
 until all of them pass: `fmt`, `clippy`, `test`, `deny`, `ebpf-build`,
 `rpm` and `docs`. A change that only touches `docs/` or Markdown skips
-the Rust jobs, and a skipped job counts as passing. Pushing again
+the Rust jobs, and a skipped job counts as passing. If the step that
+decides breaks, every job runs. Pushing again
 cancels the run it replaces, and every job has a timeout, so nothing
 runs on after it's useful.
 
 Pushing a `v*.*.*` tag builds the x86_64 and aarch64 RPMs and publishes
 a GitHub release with a `SHA256SUMS` file. The notes come from that
 version's section of `CHANGELOG.md`, so write it before you tag. With
-no section, the release fails before anything goes public. The tag has
-to match the version in `Cargo.toml`.
+no section, the release fails before anything builds. The tag has to
+match the version in `Cargo.toml` and point at a commit on main. The
+RPM takes its version from `Cargo.toml` too, so bumping a release means
+`Cargo.toml`, a new `%changelog` entry in the spec, and the CHANGELOG
+section.
+
+To try all of that without publishing, run the Release workflow by hand
+from the Actions tab (or `gh workflow run release.yml`). It runs every
+check and builds both RPMs, and stops short of the release.
 
 ## Caches
 

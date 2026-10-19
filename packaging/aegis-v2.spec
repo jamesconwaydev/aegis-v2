@@ -2,14 +2,16 @@
 #
 # Built by `cargo xtask rpm`, which compiles aegisd and aegisctl first
 # and runs rpmbuild with _sourcedir at the repository root and
-# aegis_bindir at dist/<arch>.
+# aegis_bindir at dist/<arch>. It also defines aegis_version from the
+# workspace version in Cargo.toml.
 
 # The binaries come prebuilt from cargo; there's no debuginfo to split.
 %global debug_package %{nil}
 %global selinuxtype targeted
+%{!?aegis_version:%{error:aegis_version is unset; build with cargo xtask rpm}}
 
 Name:           aegis-v2
-Version:        0.1.0
+Version:        %{aegis_version}
 Release:        1%{?dist}
 Summary:        Runtime threat detection for Rocky Linux, built on eBPF
 # Aegis itself, the GPL-2.0-only eBPF object aegisd embeds, then every
