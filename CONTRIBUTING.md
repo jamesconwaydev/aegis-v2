@@ -6,16 +6,16 @@ and how to get one merged without a long back-and-forth.
 ## Building
 
 Aegis builds inside a Rocky Linux 10 container, so everyone compiles against
-the same toolchain and kernel headers as the people running it. The wrapper for
-that is `cargo xtask`, and it isn't in the repo yet. It arrives in a later PR.
-The planned entry points are:
+the same toolchain and kernel headers as the people running it. You need Rust
+and podman or docker; `cargo xtask` does the rest:
 
-- `cargo xtask build` to build everything in the container
-- `cargo xtask rpm` to produce the RPM
-- `cargo xtask e2e` to run the end-to-end tests
+```sh
+cargo xtask build --release
+```
 
-Until they land there's nothing to build, so there's nothing to get wrong. This
-page will be updated when they do.
+[docs/development.md](docs/development.md) covers the other architecture,
+picking a container engine, and the caches. `cargo xtask rpm` and
+`cargo xtask e2e` arrive in later PRs.
 
 ## Pull requests
 
@@ -39,7 +39,9 @@ what is new rather than "update stuff", and wrap the body at 72.
 
 ## Before you push
 
-Run these. CI will run them too once the workflows land, and they're quicker on your machine.
+Run these. CI will run them too once the workflows land, and they're quicker on
+your machine. Clippy and the tests need the build container;
+[docs/development.md](docs/development.md) has the command.
 
 ```sh
 cargo fmt --all -- --check
@@ -56,7 +58,7 @@ which kernel. eBPF code in particular can behave differently between kernels.
 
 ## Licensing and headers
 
-Userspace code is licensed `MIT OR Apache-2.0`. The future `aegis-ebpf` crate is
+Userspace code is licensed `MIT OR Apache-2.0`. The `aegis-ebpf` crate is
 `GPL-2.0-only`, because the kernel requires it for eBPF programs. By
 contributing, you agree your work is licensed under the terms of the part of
 the project you changed. There's no DCO sign-off and no CLA.

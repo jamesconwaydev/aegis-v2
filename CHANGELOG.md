@@ -13,5 +13,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Cargo workspace (`aegis-common`, `aegis-ebpf`, `aegisd`, `aegisctl`) and
+  a Rocky Linux 10 build container driven by `cargo xtask build`.
 - Contributor scaffolding: issue forms, pull request template, security
   policy, code of conduct and contributing guide.

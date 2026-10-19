@@ -1,0 +1,115 @@
+# Development
+
+Aegis ships to Rocky Linux 10, so that's where it gets compiled. You don't need
+a Rocky box for it, though. Every build runs inside a Rocky 10 container, and
+your machine only has to supply two things: Rust (through
+[rustup](https://rustup.rs)) and either podman or docker.
+
+## Building
+
+```sh
+cargo xtask build --release                 # your machine's architecture
+cargo xtask build --arch x86_64 --release   # the other one
+```
+
+The binaries land in `dist/<arch>/aegisd` and `dist/<arch>/aegisctl`. Drop
+`--release` for a debug build.
+
+The first run builds the image, which takes a few minutes. After that a clean
+build is about 15 seconds on aarch64 and a minute on emulated x86_64. When you
+want a fresh image, say because nightly moved or the Containerfile changed,
+rebuild it:
+
+```sh
+cargo xtask container --arch aarch64
+```
+
+## Choosing podman or docker
+
+xtask uses podman if it can find it, then docker. To pick one yourself:
+
+```sh
+export AEGIS_CONTAINER_ENGINE=docker
+```
+
+On macOS, check the podman machine's memory before anything else. It starts at
+2 GiB, and a Rust build runs out long before that's enough. Give it 8:
+
+```sh
+podman machine stop
+podman machine set --memory 8192 --cpus 8
+podman machine start
+```
+
+## x86_64 on Apple Silicon
+
+x86_64 builds run the x86_64 image under emulation (`--platform linux/amd64`).
+Cross-compiling would be faster, but it needs an x86_64 glibc and gcc sysroot
+in the image and a linker setup to match. Emulation needs none of that.
+
+There's one catch. Podman's machine emulates with qemu, and rustc segfaults
+under it (`qemu: uncaught target signal 11`). Docker Desktop runs x86_64
+through Rosetta instead, and rustc is fine there. So on a Mac, build x86_64
+with docker:
+
+```sh
+AEGIS_CONTAINER_ENGINE=docker cargo xtask build --arch x86_64 --release
+```
+
+On an x86_64 Linux host it's the other way round: x86_64 builds natively, and
+aarch64 is the emulated one.
+
+## What's in the image
+
+`build/Containerfile` starts from `rockylinux/rockylinux:10` and adds:
+
+- gcc, clang and llvm, plus the RPM tooling (`rpm-build`,
+  `selinux-policy-devel`, `systemd-rpm-macros`)
+- Rust stable with `rust-src`, clippy and rustfmt, for userspace
+- Rust nightly with `rust-src`, for the eBPF crate
+- `bpf-linker`, taken from upstream's release binaries
+
+That last one comes as a binary because building it from source needs a system
+LLVM matching the one inside rustc nightly, and Rocky doesn't ship it. The
+release binary bundles the right LLVM.
+
+## How the eBPF crate gets built
+
+You never build `aegis-ebpf` directly. `aegisd/build.rs` hands it to
+[`aya-build`](https://crates.io/crates/aya-build), which runs nightly cargo
+with `-Z build-std=core` for the BPF target and leaves the object in
+`OUT_DIR`. This is the wiring from
+[aya-template](https://github.com/aya-rs/aya-template), with the crates
+renamed.
+
+It also means `cargo build` on a Mac fails in `aegisd`'s build script: there's
+no `bpf-linker`, and nothing to load the result into anyway. Formatting works
+on the host. Run clippy and the tests in the container:
+
+```sh
+podman run --rm -v "$PWD:/src:z" -w /src \
+  -v aegis-cargo-aarch64:/usr/local/cargo/registry \
+  -v aegis-target-aarch64:/target -e CARGO_TARGET_DIR=/target \
+  aegis-build:rocky10-aarch64 \
+  sh -c 'cargo clippy --all-targets -- -D warnings && cargo test'
+```
+
+## Caches
+
+Two named volumes per architecture keep rebuilds quick:
+
+- `aegis-cargo-<arch>` holds the crate registry
+- `aegis-target-<arch>` holds the target directory
+
+The target directory sits in a volume rather than in `./target` because a bind
+mount through the macOS VM is slow, and it would mix Linux artifacts with your
+host's. If a build gets into a strange state, delete both and start over:
+
+```sh
+podman volume rm aegis-cargo-aarch64 aegis-target-aarch64
+```
+
+## Minimum Rust version
+
+The workspace pins `rust-version = "1.98"`, because `aya-build` 0.2.1 won't
+build on anything older. Raise it when a dependency does.
