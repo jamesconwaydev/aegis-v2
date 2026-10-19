@@ -170,6 +170,13 @@ noarch `aegis-v2-selinux-0.1.0-1.el10.noarch.rpm`. The spec is
 `packaging/aegis-v2.spec`, the unit is `packaging/aegisd.service`, and
 the policy module lives in `selinux/`.
 
+Every crate compiled into the binaries ships its licence text in
+`/usr/share/licenses/aegis-v2/THIRD-PARTY-LICENSES`. cargo-about writes
+that file during the build, from `packaging/about.toml`. The spec's
+`License:` tag lists the same licences by hand, so when `Cargo.lock`
+brings in a new one, update the tag; the comment above it has the
+command that lists them.
+
 Test a policy change on an enforcing x86_64 host, not under Lima. Install
 both RPMs, start the daemon, put it through its paces, then look for
 denials:
@@ -184,6 +191,27 @@ ausearch -m AVC -ts recent      # should say <no matches>
 `semodule -DB` turns off the policy's dontaudit rules while you hunt
 for a denial that's hiding; `semodule -B` turns them back on. Never
 commit a `permissive aegisd_t;` line.
+
+## Licences and CI
+
+`deny.toml` says which licences a dependency may carry, and the list is
+permissive only. A new crate under anything else fails `cargo deny
+check` until someone reads its licence and adds it, to `deny.toml` and
+to `packaging/about.toml` alike. `aegis-ebpf` is the one GPL-2.0-only
+exception: it runs in the kernel, and no userspace binary links it.
+
+Every pull request runs seven checks, and main won't take a merge
+until all of them pass: `fmt`, `clippy`, `test`, `deny`, `ebpf-build`,
+`rpm` and `docs`. A change that only touches `docs/` or Markdown skips
+the Rust jobs, and a skipped job counts as passing. Pushing again
+cancels the run it replaces, and every job has a timeout, so nothing
+runs on after it's useful.
+
+Pushing a `v*.*.*` tag builds the x86_64 and aarch64 RPMs and publishes
+a GitHub release with a `SHA256SUMS` file. The notes come from that
+version's section of `CHANGELOG.md`, so write it before you tag. With
+no section, the release fails before anything goes public. The tag has
+to match the version in `Cargo.toml`.
 
 ## Caches
 

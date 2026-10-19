@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+# One run per tag, and a second push of the same tag waits rather than
+# cancelling a release halfway through publishing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  rpm:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            # The noarch SELinux RPM comes out of both builds; ship one.
+            files: dist/rpm/*.rpm
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            files: dist/rpm/*.aarch64.rpm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the tag matches the crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" \
+            || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version" >&2; exit 1; }
+      - uses: ./.github/actions/build-image
+        with:
+          arch: ${{ matrix.arch }}
+      # xtask runs on the host; the arm runner may not carry rustup.
+      - name: Install rustup
+        run: |
+          command -v rustup && exit 0
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: cargo xtask rpm --arch ${{ matrix.arch }}
+        env:
+          AEGIS_CONTAINER_ENGINE: docker
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: rpm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rpm-*
+          path: out
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        working-directory: out
+        run: sha256sum -- *.rpm | tee SHA256SUMS
+      # The notes are this version's CHANGELOG section, and there must be
+      # one: a release without notes fails here, before anything is public.
+      - name: Extract release notes
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          awk -v h="## [$v]" '
+            index($0, h) == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          grep -q '[^[:space:]]' notes.md \
+            || { echo "CHANGELOG.md has no section for $v" >&2; exit 1; }
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=
+          case "$GITHUB_REF_NAME" in v0.*) pre=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md \
+            $pre out/*

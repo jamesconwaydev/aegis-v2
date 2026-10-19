@@ -136,16 +136,13 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-/// A hash of build/Containerfile, stamped on the image as a label so a
-/// changed Containerfile means a rebuild. DefaultHasher is only stable
-/// within one Rust release, and the toolchain is pinned; a new one at
-/// worst costs one extra rebuild.
+/// The sha256 of build/Containerfile, stamped on the image as a label so
+/// a changed Containerfile means a rebuild. CI stamps the same value with
+/// `sha256sum`, so xtask accepts an image CI built.
 fn containerfile_hash() -> Result<String> {
-    use std::hash::{DefaultHasher, Hasher};
+    use sha2::{Digest, Sha256};
     let body = std::fs::read(root().join("build/Containerfile"))?;
-    let mut h = DefaultHasher::new();
-    h.write(&body);
-    Ok(format!("{:016x}", h.finish()))
+    Ok(format!("{:x}", Sha256::digest(body)))
 }
 
 const LABEL: &str = "aegis.containerfile";

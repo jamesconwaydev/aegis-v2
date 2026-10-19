@@ -47,5 +47,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - OTLP export now needs one more step on an SELinux host:
   `setsebool -P aegisd_can_network_connect 1`. Until you run it, aegisd
   can't open a socket to anything.
+- CI on every pull request: formatting, clippy, tests, a licence and
+  advisory audit, the eBPF build, an x86_64 RPM and a docs lint. A `v*`
+  tag publishes x86_64 and aarch64 RPMs as a GitHub release.
+- The RPM ships the licence text of every crate compiled into it, and
+  its `License:` tag now names all of them.
 - Contributor scaffolding: issue forms, pull request template, security
   policy, code of conduct and contributing guide.
