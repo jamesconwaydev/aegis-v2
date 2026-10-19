@@ -109,6 +109,9 @@ pub struct Incident {
     pub id: String,
     pub created: String,
     pub updated: String,
+    /// `updated` as Unix nanoseconds; the load window works from this.
+    #[serde(default)]
+    pub updated_ns: u64,
     pub mode: String,
     pub verdict: String,
     pub max_score: f64,
@@ -117,6 +120,9 @@ pub struct Incident {
     /// Every member process, root first.
     pub process_tree: Vec<ProcSummary>,
     pub evidence: Vec<EvidenceRecord>,
+    /// Set once the evidence cap dropped something.
+    #[serde(default)]
+    pub evidence_truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,6 +160,11 @@ fn private_dir(p: &Path) -> Result<()> {
     Ok(())
 }
 
+fn fsync_dir(p: &Path) -> Result<()> {
+    File::open(p)?.sync_all()?;
+    Ok(())
+}
+
 fn private_append(p: &Path) -> Result<File> {
     let f = OpenOptions::new()
         .create(true)
@@ -164,36 +175,114 @@ fn private_append(p: &Path) -> Result<File> {
     Ok(f)
 }
 
-fn new_id(taken: &BTreeMap<String, Incident>) -> String {
+/// Write `path` through a temp file: data synced, renamed over, then the
+/// directory synced so the rename itself survives a crash.
+fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let res = (|| -> Result<()> {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res?;
+    fsync_dir(path.parent().context("no parent")?)
+}
+
+/// Create a fresh incident dir under `root`, retrying on an id clash.
+fn create_incident_dir(root: &Path, taken: &BTreeMap<String, Incident>) -> Result<String> {
     let (y, mo, d, h, mi, s) = civil(now_ns() / 1_000_000_000);
-    loop {
+    for _ in 0..32 {
         let r = std::collections::hash_map::RandomState::new()
             .build_hasher()
             .finish() as u16;
         let id = format!("AEG-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}-{r:04x}");
-        if !taken.contains_key(&id) {
-            return id;
+        if taken.contains_key(&id) {
+            continue;
+        }
+        match DirBuilder::new().mode(0o700).create(root.join(&id)) {
+            Ok(()) => {
+                fs::set_permissions(root.join(&id), fs::Permissions::from_mode(0o700))?;
+                fsync_dir(root)?;
+                return Ok(id);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
         }
     }
+    bail!("could not find a free incident id")
+}
+
+/// Boot time as Unix seconds, from `/proc/stat`. `ProcKey` start times
+/// are relative to boot, so a member from an earlier boot says nothing
+/// about a process running now.
+pub fn boot_time_secs() -> Option<u64> {
+    fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
+}
+
+const KEEP_SECS: u64 = 30 * 86400;
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 impl IncidentStore {
-    /// Create the directory if needed and reload open incidents from it.
+    /// Create the directory if needed and reload recent incidents.
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_at(dir, boot_time_secs().unwrap_or(0), now_ns() / 1_000_000_000)
+    }
+
+    /// `open` with the boot time and the current time injected.
+    ///
+    /// Only incidents updated in the last 30 days are loaded into memory,
+    /// and only those updated since boot feed the process index. Older
+    /// ones stay on disk: `get` still finds them, `list` does not.
+    /// ponytail: no eviction while running and `list` is recent-only; add
+    /// an eviction pass and a disk scan if either matters.
+    pub fn open_at(dir: &Path, boot_secs: u64, now_secs: u64) -> Result<Self> {
         private_dir(dir)?;
         let mut inner = Inner::default();
         for ent in fs::read_dir(dir)? {
-            let p = ent?.path().join("incident.json");
-            let Ok(raw) = fs::read(&p) else { continue };
-            match serde_json::from_slice::<Incident>(&raw) {
-                Ok(inc) => {
-                    for m in &inc.process_tree {
-                        inner.index.insert(m.key(), inc.id.clone());
-                    }
-                    inner.incidents.insert(inc.id.clone(), inc);
+            let ent = ent?;
+            let name = ent.file_name().to_string_lossy().into_owned();
+            let p = ent.path().join("incident.json");
+            let inc = match fs::read(&p)
+                .map_err(anyhow::Error::from)
+                .and_then(|raw| Ok(serde_json::from_slice::<Incident>(&raw)?))
+            {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("aegisd: ignoring incident {name}: {}: {e}", p.display());
+                    continue;
                 }
-                Err(e) => eprintln!("aegisd: skipping {}: {e}", p.display()),
+            };
+            if inc.id != name {
+                eprintln!("aegisd: ignoring {name}: incident.json says id {}", inc.id);
+                continue;
             }
+            let updated = inc.updated_ns / 1_000_000_000;
+            if updated + KEEP_SECS < now_secs {
+                continue;
+            }
+            if updated >= boot_secs {
+                for m in &inc.process_tree {
+                    inner.index.insert(m.key(), inc.id.clone());
+                }
+            }
+            inner.incidents.insert(inc.id.clone(), inc);
         }
         Ok(Self {
             dir: dir.into(),
@@ -203,6 +292,10 @@ impl IncidentStore {
 
     /// `tree` holds the decision's process and its ancestors, nearest
     /// first, as `ProcTable::parent_chain` returns them.
+    ///
+    /// Order on failure: `incident.json` is written first, then the
+    /// timeline line, and memory is updated last. A failed call leaves
+    /// disk at worst one step ahead; the next record rewrites it.
     pub fn record(&self, d: &Decision, tree: &[ProcInfo], mode: Mode) -> Result<IncidentId> {
         let Some(verdict) = verdict(d.tier) else {
             bail!("tier log is not an incident");
@@ -212,12 +305,13 @@ impl IncidentStore {
             .find(|p| p.key == d.key)
             .context("decision process missing from tree")?;
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let existing = tree
-            .iter()
-            .filter(|p| p.key != d.key)
-            .find_map(|p| g.index.get(&p.key))
-            .or_else(|| g.index.get(&d.key))
-            .cloned();
+        // The process's own membership wins; then the nearest ancestor's.
+        let existing = g.index.get(&d.key).cloned().or_else(|| {
+            tree.iter()
+                .filter(|p| p.key != d.key)
+                .find_map(|p| g.index.get(&p.key))
+                .cloned()
+        });
         let now = now_ns();
         let ts = rfc3339(now);
 
@@ -226,9 +320,10 @@ impl IncidentStore {
             None => {
                 let root = ProcSummary::new(me);
                 Incident {
-                    id: new_id(&g.incidents),
+                    id: create_incident_dir(&self.dir, &g.incidents)?,
                     created: ts.clone(),
                     updated: ts.clone(),
+                    updated_ns: now,
                     mode: mode_str(mode).into(),
                     verdict: verdict.into(),
                     max_score: d.score,
@@ -236,11 +331,11 @@ impl IncidentStore {
                     root: root.clone(),
                     process_tree: vec![root],
                     evidence: vec![],
+                    evidence_truncated: false,
                 }
             }
         };
         let dir = self.dir.join(&inc.id);
-        private_dir(&dir)?;
 
         if !inc.process_tree.iter().any(|m| m.key() == d.key) {
             inc.process_tree.push(ProcSummary::new(me));
@@ -250,6 +345,7 @@ impl IncidentStore {
             inc.verdict = verdict.into();
         }
         inc.updated = ts.clone();
+        inc.updated_ns = now;
         inc.score = d.score;
         inc.max_score = inc.max_score.max(d.score);
         for e in d.evidence.iter().map(EvidenceRecord::new) {
@@ -257,11 +353,20 @@ impl IncidentStore {
                 .evidence
                 .iter()
                 .any(|x| (x.ts_ns, &x.signal, &x.reason) == (e.ts_ns, &e.signal, &e.reason));
-            if !seen && inc.evidence.len() < MAX_EVIDENCE {
+            if seen {
+                continue;
+            }
+            if inc.evidence.len() < MAX_EVIDENCE {
                 inc.evidence.push(e);
+            } else {
+                inc.evidence_truncated = true;
             }
         }
 
+        write_atomic(
+            &dir.join("incident.json"),
+            &serde_json::to_vec_pretty(&inc)?,
+        )?;
         let line = json!({
             "ts": ts,
             "tgid": d.key.tgid,
@@ -272,17 +377,6 @@ impl IncidentStore {
             "evidence": d.evidence.iter().map(EvidenceRecord::new).collect::<Vec<_>>(),
         });
         writeln!(private_append(&dir.join("timeline.jsonl"))?, "{line}")?;
-
-        let tmp = dir.join("incident.json.tmp");
-        let mut f = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.set_permissions(fs::Permissions::from_mode(0o600))?;
-        f.write_all(&serde_json::to_vec_pretty(&inc)?)?;
-        fs::rename(&tmp, dir.join("incident.json"))?;
 
         let id = inc.id.clone();
         g.index.insert(d.key, id.clone());
@@ -305,9 +399,19 @@ impl IncidentStore {
             .collect()
     }
 
+    /// Memory first, then disk (incidents older than the load window).
     pub fn get(&self, id: &IncidentId) -> Option<Incident> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.incidents.get(&id.0).cloned()
+        if let Some(i) = g.incidents.get(&id.0) {
+            return Some(i.clone());
+        }
+        if !valid_id(&id.0) {
+            return None;
+        }
+        let raw = fs::read(self.dir.join(&id.0).join("incident.json")).ok()?;
+        serde_json::from_slice(&raw)
+            .ok()
+            .filter(|i: &Incident| i.id == id.0)
     }
 }
 
@@ -318,8 +422,16 @@ mod tests {
     use crate::telemetry::{jsonl, unb64, TelemetryRecord};
     use std::os::unix::fs::MetadataExt;
 
-    extern "C" {
-        fn umask(m: u32) -> u32;
+    /// umask is process-wide, so permission tests take turns.
+    static UMASK: Mutex<()> = Mutex::new(());
+
+    fn with_umask<T>(mask: libc::mode_t, f: impl FnOnce() -> T) -> T {
+        let _g = UMASK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: umask only changes this process's file creation mask.
+        let old = unsafe { libc::umask(mask) };
+        let r = f();
+        unsafe { libc::umask(old) };
+        r
     }
 
     fn key(tgid: u32) -> ProcKey {
@@ -452,19 +564,19 @@ mod tests {
     #[test]
     fn permissions_are_0700_0600() {
         let dir = tmp("perm");
-        // SAFETY: umask only changes this process's file creation mask.
-        let old = unsafe { umask(0) };
-        let st = IncidentStore::open(&dir).unwrap();
-        let id = st
-            .record(
-                &dec(10, Tier::Throttle, 6.0),
-                &[proc(10, None, b"/tmp/x")],
-                Mode::Audit,
-            )
-            .unwrap();
-        let j = jsonl::JsonLines::open(&dir.join("t.jsonl")).unwrap();
-        unsafe { umask(old) };
-        drop(j);
+        let (st, id, j) = with_umask(0, || {
+            let st = IncidentStore::open(&dir).unwrap();
+            let id = st
+                .record(
+                    &dec(10, Tier::Throttle, 6.0),
+                    &[proc(10, None, b"/tmp/x")],
+                    Mode::Audit,
+                )
+                .unwrap();
+            let j = jsonl::JsonLines::open(&dir.join("t.jsonl")).unwrap();
+            (st, id, j)
+        });
+        drop((st, j));
         let mode = |p: PathBuf| fs::metadata(p).unwrap().mode() & 0o777;
         assert_eq!(mode(dir.clone()), 0o700);
         assert_eq!(mode(dir.join(&id.0)), 0o700);
@@ -505,5 +617,113 @@ mod tests {
         };
         let l: serde_json::Value = serde_json::from_str(&jsonl::line(&rec)).unwrap();
         assert_eq!(unb64(l["path_b64"].as_str().unwrap()), raw);
+    }
+
+    #[test]
+    fn own_membership_beats_ancestor() {
+        let dir = tmp("own");
+        let st = IncidentStore::open(&dir).unwrap();
+        let child = proc(11, Some(10), b"/tmp/c");
+        let parent = proc(10, None, b"/tmp/p");
+        // Child is decided first with no incident above it, then the
+        // parent roots its own; the child must stay in its original one.
+        let a = st
+            .record(
+                &dec(11, Tier::Throttle, 6.0),
+                std::slice::from_ref(&child),
+                Mode::Audit,
+            )
+            .unwrap();
+        let b = st
+            .record(
+                &dec(10, Tier::Throttle, 6.0),
+                std::slice::from_ref(&parent),
+                Mode::Audit,
+            )
+            .unwrap();
+        assert_ne!(a, b);
+        let c = st
+            .record(&dec(11, Tier::Throttle, 7.0), &[child, parent], Mode::Audit)
+            .unwrap();
+        assert_eq!(c, a);
+        assert_eq!(st.get(&b).unwrap().process_tree.len(), 1);
+    }
+
+    #[test]
+    fn open_logs_and_skips_bad_dirs_and_applies_windows() {
+        let dir = tmp("open");
+        let st = IncidentStore::open(&dir).unwrap();
+        let id = st
+            .record(
+                &dec(10, Tier::Throttle, 6.0),
+                &[proc(10, None, b"/tmp/x")],
+                Mode::Audit,
+            )
+            .unwrap();
+        fs::create_dir(dir.join("AEG-empty")).unwrap();
+        fs::create_dir(dir.join("AEG-corrupt")).unwrap();
+        fs::write(dir.join("AEG-corrupt/incident.json"), b"{nope").unwrap();
+        // Right content, wrong directory name.
+        fs::create_dir(dir.join("AEG-moved")).unwrap();
+        fs::copy(
+            dir.join(&id.0).join("incident.json"),
+            dir.join("AEG-moved/incident.json"),
+        )
+        .unwrap();
+        let now = now_ns() / 1_000_000_000;
+
+        let st = IncidentStore::open_at(&dir, 0, now).unwrap();
+        assert_eq!(st.list().len(), 1);
+
+        // Booted after the last update: listed, but not indexed.
+        let st = IncidentStore::open_at(&dir, now + 86400, now).unwrap();
+        assert_eq!(st.list().len(), 1);
+        let again = st
+            .record(
+                &dec(10, Tier::Throttle, 6.0),
+                &[proc(10, None, b"/tmp/x")],
+                Mode::Audit,
+            )
+            .unwrap();
+        assert_ne!(again, id);
+
+        // Older than 30 days: not loaded, but get() still reads it.
+        let st = IncidentStore::open_at(&dir, 0, now + 31 * 86400).unwrap();
+        assert!(st.list().is_empty());
+        assert!(st.get(&id).is_some());
+        assert!(st.get(&IncidentId("../x".into())).is_none());
+    }
+
+    #[test]
+    fn failed_write_leaves_no_tmp_and_evidence_cap_is_flagged() {
+        let dir = tmp("fail");
+        let st = IncidentStore::open(&dir).unwrap();
+        let root = proc(10, None, b"/tmp/x");
+        let mut d = dec(10, Tier::Throttle, 6.0);
+        d.evidence = (0..300)
+            .map(|i| Evidence {
+                ts_ns: i,
+                ..d.evidence[0].clone()
+            })
+            .collect();
+        let id = st
+            .record(&d, std::slice::from_ref(&root), Mode::Audit)
+            .unwrap();
+        let inc = st.get(&id).unwrap();
+        assert_eq!(inc.evidence.len(), MAX_EVIDENCE);
+        assert!(inc.evidence_truncated);
+
+        let j = dir.join(&id.0).join("incident.json");
+        fs::remove_file(&j).unwrap();
+        fs::create_dir_all(j.join("blocker")).unwrap();
+        assert!(st.record(&d, &[root], Mode::Audit).is_err());
+        assert!(!dir.join(&id.0).join("incident.json.tmp").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join(&id.0).join("timeline.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
 }
