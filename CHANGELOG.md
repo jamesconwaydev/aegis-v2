@@ -18,5 +18,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - eBPF probes for exec, fork, exit, ptrace attach, memfd_create and
   outbound TCP connects, streamed to aegisd over a ring buffer. A hidden
   `aegisd --dump-events` flag prints them as JSON lines.
+- A risk score for every process, halving every 30 seconds of quiet. A
+  run from a temp directory, a memfd, a ptrace attach to a system daemon
+  or a burst of outbound connects each adds to it. When dnf, gdb or nmap
+  does what they're for, and the binary verifies, it adds nothing.
+  Nothing acts on the score yet.
 - Contributor scaffolding: issue forms, pull request template, security
   policy, code of conduct and contributing guide.

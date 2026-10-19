@@ -7,6 +7,8 @@ mod ebpf;
 #[allow(dead_code)]
 mod proctable;
 #[allow(dead_code)]
+mod scoring;
+#[allow(dead_code)]
 mod verify;
 
 use std::net::{Ipv4Addr, Ipv6Addr};

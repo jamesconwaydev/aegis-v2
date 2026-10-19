@@ -61,6 +61,12 @@ impl ProcTable {
         self.procs.get(k)
     }
 
+    /// The live process with this tgid, if we know it.
+    // ponytail: linear scan; index by tgid if the table gets large.
+    pub fn by_tgid(&self, tgid: u32) -> Option<&ProcInfo> {
+        self.procs.values().find(|p| p.key.tgid == tgid)
+    }
+
     /// Records the verdict for a process once the verifier has run.
     pub fn set_verification(&mut self, k: &ProcKey, v: Verification) {
         if let Some(p) = self.procs.get_mut(k) {
@@ -132,12 +138,9 @@ impl ProcTable {
         if self.procs.contains_key(&key) {
             return;
         }
-        // ponytail: linear scan; index by tgid if the table gets large.
-        let parent = self
-            .procs
-            .keys()
-            .find(|k| k.tgid == ev.ppid && ev.ppid != 0)
-            .copied();
+        let parent = (ev.ppid != 0)
+            .then(|| self.by_tgid(ev.ppid).map(|p| p.key))
+            .flatten();
         self.procs.insert(
             key,
             ProcInfo {
