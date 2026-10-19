@@ -2,6 +2,7 @@
 //! Executable verification against the RPM database.
 
 use std::collections::HashMap;
+use std::fs::{File, Metadata};
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -9,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
@@ -23,10 +25,13 @@ pub enum Verification {
 pub trait RpmDb {
     /// Name of the package that owns `p`, if any.
     fn owner(&self, p: &Path) -> Option<String>;
-    /// Whether `p` still matches the database (digest, size and mode).
+    /// Whether the file still matches the database (digest, size and
+    /// mode). `p` is only for the database lookup; `f` and `md` are the
+    /// one handle the Verifier opened, and must be what gets hashed and
+    /// compared, so the file can't be swapped between check and hash.
     /// `None` means we couldn't tell (rpm failed, timed out, or the
     /// database has nothing usable for the file).
-    fn verify(&self, p: &Path) -> Option<bool>;
+    fn verify(&self, p: &Path, f: &File, md: &Metadata) -> Option<bool>;
 }
 
 /// (dev, ino, size, mtime sec/nsec, ctime sec/nsec). ctime can't be set
@@ -51,22 +56,28 @@ impl<D: RpmDb> Verifier<D> {
     /// not is `Modified`. Everything else defers to the rpmdb. Results are
     /// cached per file identity, so `pinned` must not change between calls.
     pub fn verify(&self, exe: &Path, pinned: &[(PathBuf, [u8; 32])]) -> Verification {
-        let id = std::fs::metadata(exe).ok().map(|m| {
-            (
-                m.dev(),
-                m.ino(),
-                m.size(),
-                m.mtime(),
-                m.mtime_nsec(),
-                m.ctime(),
-                m.ctime_nsec(),
-            )
-        });
-        if let Some(v) = id.and_then(|id| self.cache.lock().unwrap().get(&id).cloned()) {
+        // Open once: the key, the size/mode and the hash all come from this
+        // handle, so a swap after this point can't change what we vouch for.
+        let Some((f, md)) = File::open(exe).ok().and_then(|f| {
+            let md = f.metadata().ok()?;
+            Some((f, md))
+        }) else {
+            return Verification::Unverified;
+        };
+        let id = (
+            md.dev(),
+            md.ino(),
+            md.size(),
+            md.mtime(),
+            md.mtime_nsec(),
+            md.ctime(),
+            md.ctime_nsec(),
+        );
+        if let Some(v) = self.cache.lock().unwrap().get(&id).cloned() {
             return v;
         }
-        let (v, cacheable) = self.compute(exe, pinned);
-        if let (Some(id), true) = (id, cacheable) {
+        let (v, cacheable) = self.compute(exe, &f, &md, pinned);
+        if cacheable {
             // ponytail: unbounded, but bounded by the number of distinct
             // executables seen; add an LRU if it ever grows.
             self.cache.lock().unwrap().insert(id, v.clone());
@@ -76,15 +87,21 @@ impl<D: RpmDb> Verifier<D> {
 
     /// The verdict, and whether it is safe to cache (indeterminate
     /// answers are not).
-    fn compute(&self, exe: &Path, pinned: &[(PathBuf, [u8; 32])]) -> (Verification, bool) {
+    fn compute(
+        &self,
+        exe: &Path,
+        f: &File,
+        md: &Metadata,
+        pinned: &[(PathBuf, [u8; 32])],
+    ) -> (Verification, bool) {
         if let Some((_, want)) = pinned.iter().find(|(p, _)| p == exe) {
-            return match sha256_file(exe) {
+            return match sha256_file(f) {
                 Some(got) if got == *want => (Verification::Pinned, true),
                 _ => (Verification::Modified, true),
             };
         }
         match self.db.owner(exe) {
-            Some(package) => match self.db.verify(exe) {
+            Some(package) => match self.db.verify(exe, f, md) {
                 Some(true) => (Verification::RpmOwned { package }, true),
                 Some(false) => (Verification::Modified, true),
                 None => (Verification::Unverified, false),
@@ -94,8 +111,7 @@ impl<D: RpmDb> Verifier<D> {
     }
 }
 
-fn sha256_file(p: &Path) -> Option<[u8; 32]> {
-    let mut f = std::fs::File::open(p).ok()?;
+fn sha256_file(mut f: &File) -> Option<[u8; 32]> {
     let mut h = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -129,14 +145,19 @@ fn rpm(args: &[&std::ffi::OsStr]) -> Option<(bool, Vec<u8>)> {
         let r = out.read_to_end(&mut s);
         let _ = tx.send(r.ok().map(|_| s));
     });
-    match rx.recv_timeout(RPM_TIMEOUT) {
-        Ok(Some(s)) => Some((child.wait().ok()?.success(), s)),
-        _ => {
-            let _ = child.kill();
-            let _ = child.wait();
-            None
+    let deadline = Instant::now() + RPM_TIMEOUT;
+    if let Ok(Some(s)) = rx.recv_timeout(RPM_TIMEOUT) {
+        // EOF doesn't mean exited; don't block on wait() forever.
+        while Instant::now() < deadline {
+            if let Ok(Some(st)) = child.try_wait() {
+                return Some((st.success(), s));
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
 }
 
 impl RpmDb for Rpm {
@@ -155,7 +176,7 @@ impl RpmDb for Rpm {
         (ok && !name.is_empty()).then_some(name)
     }
 
-    fn verify(&self, p: &Path) -> Option<bool> {
+    fn verify(&self, p: &Path, f: &File, md: &Metadata) -> Option<bool> {
         let (ok, out) = rpm(&[
             "-qf".as_ref(),
             "--dump".as_ref(),
@@ -165,8 +186,7 @@ impl RpmDb for Rpm {
         if !ok {
             return None;
         }
-        let md = std::fs::metadata(p).ok()?;
-        dump_matches(&out, p, md.len(), md.mode(), || sha256_file(p))
+        dump_matches(&out, p, md.len(), md.mode(), || sha256_file(f))
     }
 }
 
@@ -214,19 +234,35 @@ mod tests {
         fn owner(&self, _: &Path) -> Option<String> {
             self.owner.map(String::from)
         }
-        fn verify(&self, _: &Path) -> Option<bool> {
+        fn verify(&self, _: &Path, _: &File, _: &Metadata) -> Option<bool> {
             self.ok
         }
     }
 
-    fn v(owner: Option<&'static str>, ok: Option<bool>, p: &str) -> Verification {
-        Verifier::new(Fake { owner, ok }).verify(Path::new(p), &[])
+    /// A real file (the Verifier opens it), removed on drop.
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(name: &str, body: &[u8]) -> Self {
+            let p = std::env::temp_dir().join(format!("aegis-{name}-{}", std::process::id()));
+            std::fs::write(&p, body).unwrap();
+            Tmp(p)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn v(name: &str, owner: Option<&'static str>, ok: Option<bool>) -> Verification {
+        let t = Tmp::new(name, b"x");
+        Verifier::new(Fake { owner, ok }).verify(&t.0, &[])
     }
 
     #[test]
     fn verify_rpm_owned_unmodified() {
         assert_eq!(
-            v(Some("bash"), Some(true), "/usr/bin/bash"),
+            v("owned", Some("bash"), Some(true)),
             Verification::RpmOwned {
                 package: "bash".into()
             }
@@ -235,21 +271,18 @@ mod tests {
 
     #[test]
     fn verify_comm_named_cargo_in_tmp_is_unverified() {
-        assert_eq!(v(None, None, "/tmp/cargo"), Verification::Unverified);
+        assert_eq!(v("cargo", None, None), Verification::Unverified);
     }
 
     #[test]
     fn verify_modified_binary() {
-        assert_eq!(
-            v(Some("bash"), Some(false), "/usr/bin/bash"),
-            Verification::Modified
-        );
+        assert_eq!(v("mod", Some("bash"), Some(false)), Verification::Modified);
     }
 
     #[test]
     fn verify_pinned_hash() {
-        let p = std::env::temp_dir().join(format!("aegis-pin-{}", std::process::id()));
-        std::fs::write(&p, b"hello").unwrap();
+        let t = Tmp::new("pin", b"hello");
+        let p = t.0.clone();
         let good: [u8; 32] = Sha256::digest(b"hello").into();
         let ver = Verifier::new(Fake {
             owner: None,
@@ -264,20 +297,18 @@ mod tests {
             ver.verify(&p, &[(p.clone(), [0; 32])]),
             Verification::Modified
         );
-        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]
     fn indeterminate_verify_is_unverified_and_not_cached() {
-        let p = std::env::temp_dir().join(format!("aegis-ind-{}", std::process::id()));
-        std::fs::write(&p, b"x").unwrap();
+        let t = Tmp::new("ind", b"x");
+        let p = t.0.clone();
         let ver = Verifier::new(Fake {
             owner: Some("bash"),
             ok: None,
         });
         assert_eq!(ver.verify(&p, &[]), Verification::Unverified);
         assert!(ver.cache.lock().unwrap().is_empty());
-        std::fs::remove_file(&p).unwrap();
     }
 
     // Captured from `rpm -qf --dump -- /usr/bin/true` (coreutils, Rocky 10.2,
@@ -339,6 +370,47 @@ mod tests {
     #[test]
     fn rpm_failure_is_indeterminate() {
         // Rpm::verify on a path rpm can't resolve (or no rpm installed): not Some.
-        assert_eq!(Rpm.verify(Path::new("/nonexistent/aegis-test")), None);
+        let t = Tmp::new("rpmfail", b"x");
+        let f = File::open(&t.0).unwrap();
+        let md = f.metadata().unwrap();
+        assert_eq!(Rpm.verify(&t.0, &f, &md), None);
+    }
+
+    /// Swaps the path for a different file during owner(), then judges by
+    /// reading the handle it is given. The verdict must describe the file
+    /// that was opened, not whatever the path points at now.
+    struct Swap {
+        path: PathBuf,
+        seen_ino: std::sync::Mutex<Option<u64>>,
+    }
+    impl RpmDb for Swap {
+        fn owner(&self, _: &Path) -> Option<String> {
+            let genuine = self.path.with_extension("genuine");
+            std::fs::write(&genuine, b"genuine").unwrap();
+            std::fs::rename(&genuine, &self.path).unwrap();
+            Some("bash".into())
+        }
+        fn verify(&self, _: &Path, mut f: &File, md: &Metadata) -> Option<bool> {
+            *self.seen_ino.lock().unwrap() = Some(md.ino());
+            let mut body = String::new();
+            f.read_to_string(&mut body).unwrap();
+            Some(body == "genuine")
+        }
+    }
+
+    #[test]
+    fn cache_key_and_hash_come_from_the_same_handle() {
+        let t = Tmp::new("swap", b"evil");
+        let evil_ino = std::fs::metadata(&t.0).unwrap().ino();
+        let ver = Verifier::new(Swap {
+            path: t.0.clone(),
+            seen_ino: Default::default(),
+        });
+        assert_eq!(ver.verify(&t.0, &[]), Verification::Modified);
+        assert_eq!(*ver.db.seen_ino.lock().unwrap(), Some(evil_ino));
+        // cached under the opened (evil) file's identity, not the swapped-in one
+        let cache = ver.cache.lock().unwrap();
+        assert!(cache.keys().all(|k| k.1 == evil_ino));
+        assert_eq!(cache.len(), 1);
     }
 }
