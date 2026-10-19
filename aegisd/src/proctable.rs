@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use aegis_common::{Event, EventKind, HAS_TTY};
@@ -21,6 +22,9 @@ pub struct ProcInfo {
     pub key: ProcKey,
     pub parent: Option<ProcKey>,
     pub exe: Option<PathBuf>,
+    /// (dev, ino) of the file `exe` names, as the kernel saw it at exec,
+    /// in `stat` encoding. Verification checks the host's file against it.
+    pub exe_id: Option<(u64, u64)>,
     pub comm: String,
     pub uid: u32,
     pub has_tty: bool,
@@ -32,6 +36,13 @@ pub struct ProcInfo {
 #[derive(Default)]
 pub struct ProcTable {
     procs: HashMap<ProcKey, ProcInfo>,
+}
+
+/// The exec'd file's (dev, ino) from the event. The kernel's `s_dev` is
+/// `major << 20 | minor`; `stat` encodes it differently.
+pub fn exe_id(ev: &Event) -> (u64, u64) {
+    let dev = libc::makedev(ev.exe_dev >> 20, ev.exe_dev & 0xf_ffff);
+    (dev, ev.exe_ino)
 }
 
 fn comm_str(c: &[u8; 16]) -> String {
@@ -132,6 +143,7 @@ impl ProcTable {
                 let n = (ev.path_len as usize).min(ev.path.len());
                 let p = self.procs.get_mut(&key).unwrap();
                 p.exe = Some(PathBuf::from(OsStr::from_bytes(&ev.path[..n])));
+                p.exe_id = Some(exe_id(ev));
                 p.comm = comm_str(&ev.comm);
                 p.has_tty = ev.flags & HAS_TTY != 0;
                 p.uid = ev.uid;
@@ -150,6 +162,7 @@ impl ProcTable {
                     key: ck,
                     parent: Some(key),
                     exe: parent.exe,
+                    exe_id: parent.exe_id,
                     selinux_domain: parent.selinux_domain,
                     verification: parent.verification,
                     ..parent
@@ -190,6 +203,11 @@ impl ProcTable {
                 exe: live
                     .then(|| std::fs::read_link(format!("/proc/{}/exe", ev.tgid)).ok())
                     .flatten(),
+                // What it runs now, read just after `exe` named it.
+                exe_id: live
+                    .then(|| std::fs::metadata(format!("/proc/{}/exe", ev.tgid)).ok())
+                    .flatten()
+                    .map(|m| (m.dev(), m.ino())),
                 comm: comm_str(&ev.comm),
                 uid: ev.uid,
                 has_tty: ev.flags & HAS_TTY != 0,
@@ -271,5 +289,16 @@ mod tests {
         );
         t.apply(&ev(EventKind::Exit, 11, 200));
         assert!(t.get(&ck).is_none());
+    }
+
+    #[test]
+    fn exe_id_converts_the_kernel_dev_to_stat_encoding() {
+        let mut e = ev(EventKind::Exec, 1, 1);
+        // sda1 is 8:1, and a minor past 255 checks the high bits.
+        e.exe_dev = (8 << 20) | 1;
+        e.exe_ino = 42;
+        assert_eq!(exe_id(&e), (libc::makedev(8, 1), 42));
+        e.exe_dev = (259 << 20) | 300;
+        assert_eq!(exe_id(&e).0, libc::makedev(259, 300));
     }
 }

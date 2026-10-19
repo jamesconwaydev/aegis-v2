@@ -70,6 +70,8 @@ fn kernel_offsets(btf: &btf::Btf) -> Result<KernelOffsets> {
         inode_i_sb: btf.offset("inode", "i_sb")?,
         super_block_s_magic: btf.offset("super_block", "s_magic")?,
         sock_sk_err: btf.offset("sock", "sk_err")?,
+        inode_i_ino: btf.offset("inode", "i_ino")?,
+        super_block_s_dev: btf.offset("super_block", "s_dev")?,
     })
 }
 

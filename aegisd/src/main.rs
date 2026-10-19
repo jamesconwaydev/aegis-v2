@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{Config, ConfigHandle};
 use crate::incident::{IncidentId, IncidentStore};
-use crate::pipeline::{Incidents, Pipeline};
+use crate::pipeline::{ExeKey, Incidents, Pipeline};
 use crate::telemetry::{mode_str, Sinks};
 use crate::verify::{Rpm, Verification, Verifier};
 
@@ -142,19 +142,35 @@ fn sd_notify(msg: &str) {
 struct Verifying {
     verifier: Arc<Verifier<Rpm>>,
     pinned: Arc<Vec<(PathBuf, [u8; 32])>>,
-    done: mpsc::UnboundedSender<(PathBuf, Verification)>,
+    done: mpsc::UnboundedSender<(ExeKey, Verification)>,
 }
 
 impl Verifying {
-    fn spawn(&self, path: PathBuf) {
+    /// Verifies the file a process executed, by the name it ran it as.
+    fn spawn(&self, key: ExeKey) {
         let (v, pins, done) = (
             self.verifier.clone(),
             self.pinned.clone(),
             self.done.clone(),
         );
         tokio::task::spawn_blocking(move || {
-            let r = v.verify(&path, &pins);
-            let _ = done.send((path, r));
+            let r = v.verify(&key.0, key.1, &pins);
+            let _ = done.send((key, r));
+        });
+    }
+
+    /// Verifies the host's file at `path`, so a later exec of it hits the
+    /// cache.
+    fn spawn_host(&self, path: PathBuf) {
+        let (v, pins, done) = (
+            self.verifier.clone(),
+            self.pinned.clone(),
+            self.done.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            if let Some((id, r)) = v.verify_host(&path, &pins) {
+                let _ = done.send(((path, id), r));
+            }
         });
     }
 
@@ -178,7 +194,7 @@ impl Verifying {
         paths.sort();
         paths.dedup();
         for p in paths {
-            self.spawn(p);
+            self.spawn_host(p);
         }
     }
 }
@@ -218,7 +234,6 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
         },
         Sinks::new(&c.telemetry),
         Box::new(scoring::ProcDaemons),
-        pipeline::resolve_exe,
         cli.debug,
     );
     let (done_tx, mut done) = mpsc::unbounded_channel();

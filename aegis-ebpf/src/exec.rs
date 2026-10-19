@@ -52,6 +52,9 @@ struct ExecRecord {
     flags: u32,
     path_len: u32,
     path: [u8; PATH_MAX_EV],
+    ino: u64,
+    dev: u32,
+    _pad: u32,
 }
 
 /// Room for a full PATH_MAX path, so the prefix checks below see the
@@ -92,20 +95,17 @@ fn starts_with(s: &[u8; SCRATCH_LEN], prefix: &[u8]) -> bool {
     true
 }
 
-/// True when `file` lives on a tmpfs mount (`/tmp`, `/dev/shm`, a memfd,
-/// or any bind mount of one). Catches what a path-prefix check misses:
-/// tmpfs mounted elsewhere, and paths that d_path can't render.
-#[inline(always)]
-fn on_tmpfs(file: *const u8) -> bool {
-    let inode: u64 = read(file, off!(file_f_inode));
-    let sb: u64 = read(inode as *const u8, off!(inode_i_sb));
-    let magic: u64 = read(sb as *const u8, off!(super_block_s_magic));
-    magic == TMPFS_MAGIC
+/// What `classify` learns about `bprm->file`.
+struct Classified {
+    flags: u32,
+    path_len: u32,
+    ino: u64,
+    dev: u32,
 }
 
-/// Resolves `bprm->file` and writes its path into `out`, returning
-/// `(flags, path_len)`. `out` must already be zeroed.
-fn classify(bprm: *const u8, out: &mut [u8; PATH_MAX_EV]) -> (u32, u32) {
+/// Resolves `bprm->file` and writes its path into `out`. `out` must
+/// already be zeroed.
+fn classify(bprm: *const u8, out: &mut [u8; PATH_MAX_EV]) -> Classified {
     // Plain loads, not bpf_probe_read: bpf_d_path only accepts a pointer
     // the verifier can type as `struct path` by walking BTF from `bprm`.
     // OFFSETS is frozen rodata, so the verifier sees these as constants.
@@ -113,20 +113,36 @@ fn classify(bprm: *const u8, out: &mut [u8; PATH_MAX_EV]) -> (u32, u32) {
     let file = unsafe { *(bprm.add(file_off) as *const *const u8) };
     let fpath = unsafe { file.add(path_off) } as *mut path;
 
+    // The inode it really is, for userspace to check the path against;
+    // and its filesystem: tmpfs (`/tmp`, `/dev/shm`, a memfd, or any bind
+    // mount of one) catches what a path-prefix check misses.
+    let inode: u64 = read(file, off!(file_f_inode));
+    let ino: u64 = read(inode as *const u8, off!(inode_i_ino));
+    let sb: u64 = read(inode as *const u8, off!(inode_i_sb));
+    let dev: u32 = read(sb as *const u8, off!(super_block_s_dev));
+    let magic: u64 = read(sb as *const u8, off!(super_block_s_magic));
+    let mut c = Classified {
+        flags: 0,
+        path_len: 0,
+        ino,
+        dev,
+    };
+
     let Some(buf) = SCRATCH.get_ptr_mut(0) else {
-        return (0, 0);
+        return c;
     };
     let n = unsafe { bpf_d_path(fpath, buf.cast(), SCRATCH_LEN as u32) };
 
     let mut flags = 0;
-    if on_tmpfs(file) {
+    if magic == TMPFS_MAGIC {
         flags |= EXEC_FROM_TMP;
     }
     if n == -ENAMETOOLONG {
         flags |= PATH_TRUNCATED;
     }
     if n <= 0 {
-        return (flags, 0);
+        c.flags = flags;
+        return c;
     }
     let s = unsafe { &*buf };
     // n counts the trailing NUL.
@@ -143,9 +159,10 @@ fn classify(bprm: *const u8, out: &mut [u8; PATH_MAX_EV]) -> (u32, u32) {
     if starts_with(s, b"/memfd:") {
         flags |= EXEC_MEMFD;
     }
-    let path_len =
+    c.flags = flags;
+    c.path_len =
         unsafe { bpf_probe_read_kernel_str_bytes(s.as_ptr(), out) }.map_or(0, |p| p.len() as u32);
-    (flags, path_len)
+    c
 }
 
 fn try_check(ctx: &LsmContext) -> Option<()> {
@@ -160,9 +177,11 @@ fn try_check(ctx: &LsmContext) -> Option<()> {
     let rec = unsafe { &mut *REC_BUILD.get_ptr_mut(0)? };
     unsafe { core::ptr::write_bytes(rec as *mut ExecRecord, 0, 1) };
     rec.bprm = bprm as u64;
-    let (flags, path_len) = classify(bprm, &mut rec.path);
-    rec.flags = flags;
-    rec.path_len = path_len;
+    let c = classify(bprm, &mut rec.path);
+    rec.flags = c.flags;
+    rec.path_len = c.path_len;
+    rec.ino = c.ino;
+    rec.dev = c.dev;
     let _ = RECORDS.insert(&key, &*rec, 0);
     Some(())
 }
@@ -181,13 +200,17 @@ fn try_exec(ctx: &LsmContext) -> Option<()> {
                 ev.flags |= r.flags;
                 ev.path = r.path;
                 ev.path_len = r.path_len;
+                ev.exe_ino = r.ino;
+                ev.exe_dev = r.dev;
             }
             // No matching record (tracing began mid-exec): fall back to
             // this hook's own file, which for a script is the interpreter.
             _ => {
-                let (flags, path_len) = classify(bprm, &mut ev.path);
-                ev.flags |= flags | EXEC_FALLBACK;
-                ev.path_len = path_len;
+                let c = classify(bprm, &mut ev.path);
+                ev.flags |= c.flags | EXEC_FALLBACK;
+                ev.path_len = c.path_len;
+                ev.exe_ino = c.ino;
+                ev.exe_dev = c.dev;
             }
         }
     });

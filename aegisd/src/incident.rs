@@ -522,6 +522,7 @@ mod tests {
             key: key(tgid),
             parent: parent.map(key),
             exe: Some(PathBuf::from(std::ffi::OsStr::from_bytes(exe))),
+            exe_id: None,
             comm: "c".into(),
             uid: 1000,
             has_tty: false,

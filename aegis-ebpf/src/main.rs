@@ -47,6 +47,8 @@ static OFFSETS: KernelOffsets = KernelOffsets {
     inode_i_sb: 0,
     super_block_s_magic: 0,
     sock_sk_err: 0,
+    inode_i_ino: 0,
+    super_block_s_dev: 0,
 };
 
 /// Volatile, so the compiler can't fold the zero the object ships with.

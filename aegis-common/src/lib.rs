@@ -85,6 +85,12 @@ pub struct Event {
     /// Fork: the child's own start time, so the child's `(tgid,
     /// start_time_ns)` identity can be formed from the fork event alone.
     pub child_start_time_ns: u64,
+    /// Exec: the executed file's inode number and its superblock's
+    /// `s_dev` (kernel encoding, `major << 20 | minor`). What the process
+    /// really ran, whatever `path` says.
+    pub exe_ino: u64,
+    pub exe_dev: u32,
+    pub _pad2: u32,
 }
 
 /// Kernel struct member offsets, in bytes. Rust has no CO-RE, so
@@ -108,6 +114,8 @@ pub struct KernelOffsets {
     pub inode_i_sb: u32,
     pub super_block_s_magic: u32,
     pub sock_sk_err: u32,
+    pub inode_i_ino: u32,
+    pub super_block_s_dev: u32,
 }
 
 #[cfg(feature = "user")]
@@ -118,7 +126,8 @@ unsafe impl aya::Pod for KernelOffsets {}
 // The eBPF side and userspace must agree on this layout byte for byte.
 const _: () = assert!(core::mem::offset_of!(Event, cgroup_id) == 40);
 const _: () = assert!(core::mem::offset_of!(Event, child_start_time_ns) == 368);
-const _: () = assert!(core::mem::size_of::<Event>() == 376);
+const _: () = assert!(core::mem::offset_of!(Event, exe_ino) == 376);
+const _: () = assert!(core::mem::size_of::<Event>() == 392);
 
 #[cfg(test)]
 mod tests {

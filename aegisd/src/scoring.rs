@@ -507,6 +507,7 @@ mod tests {
             key: key(tgid, 1),
             parent: None,
             exe: Some(exe.into()),
+            exe_id: None,
             comm: comm.into(),
             uid: 1000,
             has_tty: false,

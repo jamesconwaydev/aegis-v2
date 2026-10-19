@@ -39,31 +39,82 @@ pub trait RpmDb {
 /// still changes the key.
 type FileId = (u64, u64, u64, i64, i64, i64, i64);
 
+/// The host's root, seen from aegisd: pid 1's. aegisd's own may differ
+/// (ProtectSystem=strict, PrivateTmp), and a process's may differ more.
+pub const HOST_ROOT: &str = "/proc/1/root";
+
+/// `exe` (absolute) in the host's tree under `root`.
+pub fn on_host(root: &Path, exe: &Path) -> PathBuf {
+    root.join(exe.strip_prefix("/").unwrap_or(exe))
+}
+
 pub struct Verifier<D: RpmDb> {
     db: D,
     cache: Mutex<HashMap<FileId, Verification>>,
+    host_root: PathBuf,
 }
 
 impl<D: RpmDb> Verifier<D> {
     pub fn new(db: D) -> Self {
+        Self::with_root(db, HOST_ROOT)
+    }
+
+    /// Checks names against the tree at `root` instead of pid 1's.
+    pub fn with_root(db: D, root: impl Into<PathBuf>) -> Self {
         Self {
             db,
             cache: Mutex::new(HashMap::new()),
+            host_root: root.into(),
         }
     }
 
-    /// A pinned path whose hash matches is `Pinned`; one whose hash does
-    /// not is `Modified`. Everything else defers to the rpmdb. Results are
-    /// cached per file identity, so `pinned` must not change between calls.
-    pub fn verify(&self, exe: &Path, pinned: &[(PathBuf, [u8; 32])]) -> Verification {
-        // Open once: the key, the size/mode and the hash all come from this
-        // handle, so a swap after this point can't change what we vouch for.
-        let Some((f, md)) = File::open(exe).ok().and_then(|f| {
-            let md = f.metadata().ok()?;
-            Some((f, md))
-        }) else {
-            return Verification::Unverified;
-        };
+    /// Judges the file a process executed: inode `id` (dev, ino), which
+    /// it ran under the name `exe`. A pinned path whose hash matches is
+    /// `Pinned`; one whose hash does not is `Modified`. Everything else
+    /// defers to the rpmdb. Results are cached per file identity, so
+    /// `pinned` must not change between calls.
+    ///
+    /// `exe` is only a name. Inside a chroot or a container a process can
+    /// run any file under a trusted one, so unless the host's file at
+    /// `exe` is inode `id` itself, the answer is `Unverified`.
+    pub fn verify(
+        &self,
+        exe: &Path,
+        id: (u64, u64),
+        pinned: &[(PathBuf, [u8; 32])],
+    ) -> Verification {
+        match self.open_on_host(exe) {
+            Some((f, md)) if (md.dev(), md.ino()) == id => self.judge(exe, &f, &md, pinned),
+            _ => Verification::Unverified,
+        }
+    }
+
+    /// Verifies the host's file at `exe` when no process is running it
+    /// yet, returning its (dev, ino) with the verdict.
+    pub fn verify_host(
+        &self,
+        exe: &Path,
+        pinned: &[(PathBuf, [u8; 32])],
+    ) -> Option<((u64, u64), Verification)> {
+        let (f, md) = self.open_on_host(exe)?;
+        Some(((md.dev(), md.ino()), self.judge(exe, &f, &md, pinned)))
+    }
+
+    fn open_on_host(&self, exe: &Path) -> Option<(File, Metadata)> {
+        let f = File::open(on_host(&self.host_root, exe)).ok()?;
+        let md = f.metadata().ok()?;
+        Some((f, md))
+    }
+
+    /// The key, the size/mode and the hash all come from the one handle
+    /// `f`, so a swap after it was opened can't change what we vouch for.
+    fn judge(
+        &self,
+        exe: &Path,
+        f: &File,
+        md: &Metadata,
+        pinned: &[(PathBuf, [u8; 32])],
+    ) -> Verification {
         let id = (
             md.dev(),
             md.ino(),
@@ -76,7 +127,7 @@ impl<D: RpmDb> Verifier<D> {
         if let Some(v) = self.cache.lock().unwrap().get(&id).cloned() {
             return v;
         }
-        let (v, cacheable) = self.compute(exe, &f, &md, pinned);
+        let (v, cacheable) = self.compute(exe, f, md, pinned);
         if cacheable {
             // ponytail: unbounded, but bounded by the number of distinct
             // executables seen; add an LRU if it ever grows.
@@ -254,9 +305,65 @@ mod tests {
         }
     }
 
+    /// A Verifier whose "host" is our own root, so the temp files count.
+    fn ver<D: RpmDb>(db: D) -> Verifier<D> {
+        Verifier::with_root(db, "/")
+    }
+
+    /// Verifies `p` as a process running that very file would.
+    fn check<D: RpmDb>(ver: &Verifier<D>, p: &Path, pins: &[(PathBuf, [u8; 32])]) -> Verification {
+        ver.verify(p, ino(p), pins)
+    }
+
+    fn ino(p: &Path) -> (u64, u64) {
+        let md = std::fs::metadata(p).unwrap();
+        (md.dev(), md.ino())
+    }
+
     fn v(name: &str, owner: Option<&'static str>, ok: Option<bool>) -> Verification {
         let t = Tmp::new(name, b"x");
-        Verifier::new(Fake { owner, ok }).verify(&t.0, &[])
+        check(&ver(Fake { owner, ok }), &t.0, &[])
+    }
+
+    #[test]
+    fn a_lookalike_under_a_trusted_name_is_unverified() {
+        // What a chroot shows as /usr/bin/python3 is a copy, not the
+        // host's file. Same name, same bytes, different inode.
+        let host = Tmp::new("host-py", b"python");
+        let copy = Tmp::new("chroot-py", b"python");
+        let ver = ver(Fake {
+            owner: Some("python3"),
+            ok: Some(true),
+        });
+        let run = ino(&copy.0);
+        assert_eq!(ver.verify(&host.0, run, &[]), Verification::Unverified);
+        let pin: [u8; 32] = Sha256::digest(b"python").into();
+        assert_eq!(
+            ver.verify(&host.0, run, &[(host.0.clone(), pin)]),
+            Verification::Unverified,
+            "a pin names the host's file too"
+        );
+        assert!(ver.cache.lock().unwrap().is_empty());
+        // The host's own file still verifies.
+        assert_eq!(
+            check(&ver, &host.0, &[]),
+            Verification::RpmOwned {
+                package: "python3".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_name_missing_on_the_host_is_unverified() {
+        let t = Tmp::new("nohost", b"x");
+        let ver = Verifier::with_root(
+            Fake {
+                owner: Some("bash"),
+                ok: Some(true),
+            },
+            std::env::temp_dir().join("aegis-no-such-root"),
+        );
+        assert_eq!(check(&ver, &t.0, &[]), Verification::Unverified);
     }
 
     #[test]
@@ -284,17 +391,17 @@ mod tests {
         let t = Tmp::new("pin", b"hello");
         let p = t.0.clone();
         let good: [u8; 32] = Sha256::digest(b"hello").into();
-        let ver = Verifier::new(Fake {
+        let v = ver(Fake {
             owner: None,
             ok: None,
         });
-        assert_eq!(ver.verify(&p, &[(p.clone(), good)]), Verification::Pinned);
-        let ver = Verifier::new(Fake {
+        assert_eq!(check(&v, &p, &[(p.clone(), good)]), Verification::Pinned);
+        let v = ver(Fake {
             owner: None,
             ok: None,
         });
         assert_eq!(
-            ver.verify(&p, &[(p.clone(), [0; 32])]),
+            check(&v, &p, &[(p.clone(), [0; 32])]),
             Verification::Modified
         );
     }
@@ -303,11 +410,11 @@ mod tests {
     fn indeterminate_verify_is_unverified_and_not_cached() {
         let t = Tmp::new("ind", b"x");
         let p = t.0.clone();
-        let ver = Verifier::new(Fake {
+        let ver = ver(Fake {
             owner: Some("bash"),
             ok: None,
         });
-        assert_eq!(ver.verify(&p, &[]), Verification::Unverified);
+        assert_eq!(check(&ver, &p, &[]), Verification::Unverified);
         assert!(ver.cache.lock().unwrap().is_empty());
     }
 
@@ -402,11 +509,11 @@ mod tests {
     fn cache_key_and_hash_come_from_the_same_handle() {
         let t = Tmp::new("swap", b"evil");
         let evil_ino = std::fs::metadata(&t.0).unwrap().ino();
-        let ver = Verifier::new(Swap {
+        let ver = ver(Swap {
             path: t.0.clone(),
             seen_ino: Default::default(),
         });
-        assert_eq!(ver.verify(&t.0, &[]), Verification::Modified);
+        assert_eq!(check(&ver, &t.0, &[]), Verification::Modified);
         assert_eq!(*ver.db.seen_ino.lock().unwrap(), Some(evil_ino));
         // cached under the opened (evil) file's identity, not the swapped-in one
         let cache = ver.cache.lock().unwrap();

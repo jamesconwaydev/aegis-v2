@@ -6,7 +6,7 @@
 //! not do inline leave through a side door:
 //!
 //! - **Verification** (rpm + SHA-256) runs on the caller's blocking
-//!   pool. `handle` queues paths in `to_verify`; the verdict comes back
+//!   pool. `handle` queues jobs in `to_verify`; the verdict comes back
 //!   through `verified`.
 //! - **Incident writes** (fsync) go to a writer thread over a bounded
 //!   channel. Telemetry stays here, so a slow disk never holds up a
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aegis_common::{Event, EventKind, EXEC_MEMFD, PATH_TRUNCATED};
@@ -37,9 +37,12 @@ use crate::scoring::{
 use crate::telemetry::{now_ns, Sinks, TelemetryRecord};
 use crate::verify::Verification;
 
-/// Resolves a process's exe to the path aegisd should open to verify it.
-/// Takes the start time so a reused pid is caught.
-pub type Resolve = fn(u32, u64, &Path) -> Option<PathBuf>;
+/// What a verdict is about: the exe path, which names the file for rpm
+/// and the pins, and the (dev, ino) the process actually ran. Two
+/// processes showing the same path can run different files (one in a
+/// chroot, say), so they never share a verdict. These are also the jobs
+/// in `to_verify`.
+pub type ExeKey = (PathBuf, (u64, u64));
 
 /// A decision and the tree to record it against, sent to the writer.
 /// The id is the one the loop assigned when it opened the incident.
@@ -76,7 +79,7 @@ impl Incidents {
 
 /// A signal held back until the gate process's verification lands.
 struct Deferred {
-    gate: PathBuf,
+    gate: ExeKey,
     /// True when the verdict belongs to the parent (a TmpExec is judged
     /// by its parent), false when it belongs to the subject itself.
     gate_is_parent: bool,
@@ -96,10 +99,9 @@ pub struct Pipeline {
     incidents: Incidents,
     pub sinks: Sinks,
     mode: Mode,
-    resolve: Resolve,
-    /// Verifications in flight, by the path being verified: who is
+    /// Verifications in flight, by what is being verified: who is
     /// waiting, and the exe each had when it asked.
-    pending: HashMap<PathBuf, Vec<(ProcKey, PathBuf)>>,
+    pending: HashMap<ExeKey, Vec<(ProcKey, PathBuf)>>,
     deferred: Vec<Deferred>,
     /// Incident membership on the loop, by a local group number: the
     /// same grouping rule the store applies, kept here so the incident
@@ -109,8 +111,9 @@ pub struct Pipeline {
     /// scorer and group state is kept until those are scored.
     exited: Vec<ProcKey>,
     writer_gone_logged: bool,
-    /// Paths for the caller to verify. Each is queued once while in flight.
-    pub to_verify: Vec<PathBuf>,
+    /// Verifications for the caller to run. Each key is queued once while
+    /// in flight.
+    pub to_verify: Vec<ExeKey>,
     pub events_total: u64,
     pub incident_dropped: u64,
     pub verify_skipped: u64,
@@ -124,7 +127,6 @@ impl Pipeline {
         incidents: Incidents,
         sinks: Sinks,
         daemons: Box<dyn DaemonClassifier>,
-        resolve: Resolve,
         debug: bool,
     ) -> Self {
         let groups = incidents.store.memberships().into_iter().collect();
@@ -136,7 +138,6 @@ impl Pipeline {
             incidents,
             sinks,
             mode: cfg.general.mode,
-            resolve,
             pending: HashMap::new(),
             deferred: Vec::new(),
             // Seeded once from what the store loaded, so an incident opened
@@ -242,9 +243,7 @@ impl Pipeline {
         } else {
             Some(&subject)
         };
-        let gate = gated
-            .and_then(|p| p.exe.as_ref().map(|e| (p.key, e)))
-            .and_then(|(k, e)| (self.resolve)(k.tgid, k.start_time_ns, e));
+        let gate = gated.and_then(|p| Some((p.exe.clone()?, p.exe_id?)));
 
         if let Some(path) = gate {
             if self.pending.contains_key(&path) {
@@ -274,15 +273,17 @@ impl Pipeline {
     }
 
     fn request_verification(&mut self, key: ProcKey) {
-        let Some(exe) = self.table.get(&key).and_then(|p| p.exe.clone()) else {
+        let Some((exe, id)) = self
+            .table
+            .get(&key)
+            .and_then(|p| Some((p.exe.clone()?, p.exe_id?)))
+        else {
             return;
         };
         if exe.as_os_str().is_empty() {
             return;
         }
-        let Some(path) = (self.resolve)(key.tgid, key.start_time_ns, &exe) else {
-            return;
-        };
+        let path = (exe.clone(), id);
         if let Some(waiting) = self.pending.get_mut(&path) {
             if waiting.len() < MAX_WAITERS {
                 waiting.push((key, exe));
@@ -298,10 +299,10 @@ impl Pipeline {
         self.to_verify.push(path);
     }
 
-    /// The verdict for a path queued in `to_verify`. Applied to every
+    /// The verdict for a job queued in `to_verify`. Applied to every
     /// waiting process that still runs the exe it asked about, then any
-    /// signal that was waiting on this path is scored.
-    pub fn verified(&mut self, path: &Path, v: Verification) {
+    /// signal that was waiting on this key is scored.
+    pub fn verified(&mut self, path: &ExeKey, v: Verification) {
         for (k, exe) in self.pending.remove(path).unwrap_or_default() {
             if self.table.get(&k).and_then(|p| p.exe.as_ref()) == Some(&exe) {
                 self.table.set_verification(&k, v.clone());
@@ -311,7 +312,7 @@ impl Pipeline {
             let mut keep = Vec::new();
             let mut ready = Vec::new();
             for d in self.deferred.drain(..) {
-                if d.gate == path {
+                if d.gate == *path {
                     ready.push(d);
                 } else {
                     keep.push(d);
@@ -618,41 +619,6 @@ fn proc_start_ns(tgid: u32) -> Option<u64> {
     Some(ticks * 1_000_000_000 / clk_tck())
 }
 
-/// The path to verify `exe` by, for the process `tgid` that started at
-/// `start_time_ns`.
-///
-/// An exe path is only meaningful in the mount namespace of the process
-/// that ran it. A container (or a service with PrivateTmp and friends)
-/// has its own, where `/usr/bin/x` may be a different file from the
-/// host's. For such a process we open the file through
-/// `/proc/<tgid>/root`, which the kernel resolves in that process's
-/// namespace. The host rpmdb doesn't own that path, so in practice a
-/// container process stays `Unverified`, which is the safe answer: no
-/// allowlist offsets.
-///
-/// "The host" is pid 1's namespace, not ours. Under systemd aegisd has
-/// its own (ProtectSystem=strict, PrivateTmp), which sees the same /usr
-/// and /etc read-only and hides only /tmp, /var/tmp and /dev. A host
-/// path opened from here is therefore the host's file, or missing, and
-/// missing is `Unverified`.
-///
-/// None when the process is gone or a different one now holds the pid,
-/// since then its path means nothing to us; it stays `Unverified`.
-pub fn resolve_exe(tgid: u32, start_time_ns: u64, exe: &Path) -> Option<PathBuf> {
-    if !proc_start_matches(tgid, start_time_ns) {
-        return None;
-    }
-    static HOST: OnceLock<Option<PathBuf>> = OnceLock::new();
-    let host = HOST
-        .get_or_init(|| std::fs::read_link("/proc/1/ns/mnt").ok())
-        .as_ref()?;
-    let theirs = std::fs::read_link(format!("/proc/{tgid}/ns/mnt")).ok()?;
-    if &theirs == host {
-        return Some(exe.to_path_buf());
-    }
-    Some(PathBuf::from(format!("/proc/{tgid}/root")).join(exe.strip_prefix("/").ok()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,8 +631,12 @@ mod tests {
         }
     }
 
-    fn same_ns(_: u32, _: u64, exe: &Path) -> Option<PathBuf> {
-        Some(exe.to_path_buf())
+    fn exe_key(p: &str) -> ExeKey {
+        (p.into(), (0, 0))
+    }
+
+    fn lookups(jobs: &[ExeKey]) -> Vec<PathBuf> {
+        jobs.iter().map(|j| j.0.clone()).collect()
     }
 
     struct Dir(PathBuf);
@@ -688,14 +658,7 @@ mod tests {
             IncidentStore::open_at(&d, Some("boot".into()), now_ns() / 1_000_000_000).unwrap();
         let mut cfg = Config::default();
         cfg.allowlist.memfd_callers = vec!["/usr/bin/runc".into()];
-        let p = Pipeline::new(
-            &cfg,
-            Incidents::inline(store),
-            sinks,
-            Box::new(Pid1),
-            same_ns,
-            false,
-        );
+        let p = Pipeline::new(&cfg, Incidents::inline(store), sinks, Box::new(Pid1), false);
         (p, Dir(d))
     }
 
@@ -746,11 +709,17 @@ mod tests {
     /// before runc's verdict does, so the signals are deferred.
     fn runc_self_clone(p: &mut Pipeline, runc_verdict: Option<Verification>) {
         p.handle(&exec(50, "/usr/bin/bash", 0));
-        assert_eq!(std::mem::take(&mut p.to_verify), paths(&["/usr/bin/bash"]));
-        p.verified(Path::new("/usr/bin/bash"), rpm("bash"));
+        assert_eq!(
+            lookups(&std::mem::take(&mut p.to_verify)),
+            paths(&["/usr/bin/bash"])
+        );
+        p.verified(&exe_key("/usr/bin/bash"), rpm("bash"));
         p.handle(&fork(50, 60));
         p.handle(&exec(60, "/usr/bin/runc", 0));
-        assert_eq!(std::mem::take(&mut p.to_verify), paths(&["/usr/bin/runc"]));
+        assert_eq!(
+            lookups(&std::mem::take(&mut p.to_verify)),
+            paths(&["/usr/bin/runc"])
+        );
         // runc's verdict is NOT back yet: the memfd signals must defer.
         p.handle(&ev(EventKind::MemfdCreate, 60));
         p.handle(&exec(
@@ -761,7 +730,7 @@ mod tests {
         assert!(p.to_verify.is_empty(), "a memfd is not verified");
         assert_eq!(p.deferred.len(), 2, "memfd_create and memfd exec deferred");
         if let Some(v) = runc_verdict {
-            p.verified(Path::new("/usr/bin/runc"), v);
+            p.verified(&exe_key("/usr/bin/runc"), v);
         } else {
             // Verdict never comes: the deadline fires them as Unverified.
             p.flush_expired(Instant::now() + Duration::from_secs(3));
@@ -838,7 +807,7 @@ mod tests {
         p.to_verify.clear();
         p.handle(&ev(EventKind::MemfdCreate, 60));
         assert_eq!(p.deferred.len(), 1);
-        p.verified(Path::new("/usr/bin/runc"), rpm("runc"));
+        p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
         assert_eq!(p.store().open_count(), 0);
     }
 
@@ -876,16 +845,16 @@ mod tests {
     /// the scan: no single process reaches quarantine.
     fn split_chain(p: &mut Pipeline, parent: u32, child: u32, child_parent: u32) {
         p.handle(&exec(79, "/usr/bin/bash", 0));
-        p.verified(Path::new("/usr/bin/bash"), rpm("bash"));
+        p.verified(&exe_key("/usr/bin/bash"), rpm("bash"));
         p.handle(&fork(79, parent));
         p.handle(&exec(parent, "/tmp/xsh", EXEC_FROM_TMP));
-        p.verified(Path::new("/tmp/xsh"), Verification::Unverified);
+        p.verified(&exe_key("/tmp/xsh"), Verification::Unverified);
         p.handle(&fork(child_parent, child));
         for port in 0..20 {
             p.handle(&connect(parent, 40000 + port));
         }
         p.handle(&exec(child, "/tmp/st", EXEC_FROM_TMP));
-        p.verified(Path::new("/tmp/st"), Verification::Unverified);
+        p.verified(&exe_key("/tmp/st"), Verification::Unverified);
         p.handle(&ptrace_pid1(child));
         p.to_verify.clear();
         assert!(p.deferred.is_empty());
@@ -960,7 +929,7 @@ mod tests {
         let (mut p, _d) = pipeline("pid1");
         p.handle(&fork(1, 85));
         p.handle(&exec(85, "/tmp/x", EXEC_FROM_TMP));
-        p.verified(Path::new("/tmp/x"), Verification::Unverified);
+        p.verified(&exe_key("/tmp/x"), Verification::Unverified);
         p.handle(&ptrace_pid1(85));
         let l = p.store().list();
         assert_eq!(l.len(), 1);
@@ -981,12 +950,12 @@ mod tests {
         // Pid 73 moved on to another binary before the verdict came back.
         p.handle(&exec(73, "/usr/bin/x", 0));
         p.handle(&exec(73, "/usr/bin/y", 0));
-        assert_eq!(p.to_verify, paths(&["/usr/bin/x", "/usr/bin/y"]));
+        assert_eq!(lookups(&p.to_verify), paths(&["/usr/bin/x", "/usr/bin/y"]));
         assert_eq!(
             p.table.get(&key(70)).unwrap().verification,
             Verification::Unverified
         );
-        p.verified(Path::new("/usr/bin/x"), rpm("x"));
+        p.verified(&exe_key("/usr/bin/x"), rpm("x"));
         for t in [70, 71, 72] {
             assert_eq!(p.table.get(&key(t)).unwrap().verification, rpm("x"), "{t}");
         }
@@ -997,7 +966,7 @@ mod tests {
         // Done means done: the next exec of x asks again (the Verifier caches).
         p.handle(&exec(74, "/usr/bin/x", 0));
         assert_eq!(
-            p.to_verify.last().map(PathBuf::as_path),
+            p.to_verify.last().map(|j| j.0.as_path()),
             Some(Path::new("/usr/bin/x"))
         );
     }
@@ -1028,7 +997,10 @@ mod tests {
             start_time_ns: st,
         };
         assert_eq!(p.table.get(&k).unwrap().exe.as_ref(), Some(&exe));
-        assert_eq!(std::mem::take(&mut p.to_verify), std::slice::from_ref(&exe));
+        assert_eq!(
+            lookups(&std::mem::take(&mut p.to_verify)),
+            std::slice::from_ref(&exe)
+        );
     }
 
     #[test]
@@ -1043,20 +1015,20 @@ mod tests {
         assert!(p.table.get(&key(60)).is_none());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_exe_in_the_host_namespace_is_the_path_itself() {
-        let me = std::process::id();
-        let st = proc_start_ns(me).unwrap();
-        let p = Path::new("/usr/bin/true");
-        assert_eq!(resolve_exe(me, st, p).as_deref(), Some(p));
-        // A start time that doesn't match is pid reuse: refused.
-        assert_eq!(resolve_exe(me, st + 1_000_000_000, p), None);
-    }
-
-    #[test]
-    fn resolve_exe_of_a_dead_process_is_none() {
-        // Pid numbers stop well short of u32::MAX.
-        assert_eq!(resolve_exe(u32::MAX, 1, Path::new("/usr/bin/true")), None);
+    fn same_path_different_inode_is_verified_separately() {
+        let (mut p, _d) = pipeline("inode");
+        p.handle(&exec(80, "/usr/bin/python3", 0));
+        // A second process shows the same path but runs another file.
+        let mut e = exec(81, "/usr/bin/python3", 0);
+        e.exe_ino = 81;
+        p.handle(&e);
+        assert_eq!(p.to_verify.len(), 2, "no shared verdict across inodes");
+        p.verified(&exe_key("/usr/bin/python3"), rpm("python3"));
+        assert_eq!(p.table.get(&key(80)).unwrap().verification, rpm("python3"));
+        assert_eq!(
+            p.table.get(&key(81)).unwrap().verification,
+            Verification::Unverified
+        );
     }
 }
