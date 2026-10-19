@@ -39,6 +39,10 @@ enum Cmd {
     },
     /// Build RPMs for a test host, install them, run every scenario in
     /// tests/e2e/scenarios.toml, and assert what aegisd recorded.
+    ///
+    /// Destructive: it reinstalls aegis-v2, wipes /var/lib/aegis-v2 and
+    /// adds and removes packages on the host. It runs only on a host
+    /// that has the marker file /etc/aegis-e2e-host, or with --yes-wipe.
     E2e(e2e::Args),
 }
 

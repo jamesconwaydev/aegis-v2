@@ -65,6 +65,34 @@ S=/tmp/aegis-strace.$$; P=$(systemctl show -p MainPID --value sshd)
 # a system daemon (45). One incident: 25 + 40 + 45 = 110.
 expect = "would_quarantine"
 
+[[scenario]]
+name = "preload-memfd"
+run = """
+D=/etc/aegis-v2/allowlist.d/99-e2e-sim.toml
+H=$(sha256sum /usr/local/bin/aegis-sim | cut -d' ' -f1)
+printf '[allowlist]\nmemfd_callers = ["/usr/local/bin/aegis-sim"]\n[allowlist.pinned]\n"/usr/local/bin/aegis-sim" = "%s"\n' "$H" > $D
+systemctl reload aegisd && sleep 2
+LD_PRELOAD=/usr/lib64/libc.so.6 /usr/local/bin/aegis-sim memfd-exec; rc=$?
+rm -f $D; systemctl reload aegisd; [ $rc = 0 ]
+"""
+# aegis-sim, pinned and listed as a memfd caller for this scenario only,
+# so it verifies and its memfd_create (20) and memfd exec (65) would be
+# forgiven. LD_PRELOAD in its environment withholds that: 85.
+expect = "would_quarantine"
+
+[[scenario]]
+name = "pinned-memfd"
+run = """
+D=/etc/aegis-v2/allowlist.d/99-e2e-sim.toml
+H=$(sha256sum /usr/local/bin/aegis-sim | cut -d' ' -f1)
+printf '[allowlist]\nmemfd_callers = ["/usr/local/bin/aegis-sim"]\n[allowlist.pinned]\n"/usr/local/bin/aegis-sim" = "%s"\n' "$H" > $D
+systemctl reload aegisd && sleep 2
+/usr/local/bin/aegis-sim memfd-exec; rc=$?
+rm -f $D; systemctl reload aegisd; [ $rc = 0 ]
+"""
+# The same, without the preload: the control for the scenario above.
+expect = "none"
+
 # --- Benign activity that must not trip a detection ----------------------
 
 [[scenario]]

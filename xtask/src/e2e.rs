@@ -40,7 +40,16 @@ pub struct Args {
     /// Leave the aegis packages and prerequisites installed afterwards.
     #[arg(long)]
     keep: bool,
+    /// Run on a host without the /etc/aegis-e2e-host marker file. The
+    /// run reinstalls aegis-v2, deletes /var/lib/aegis-v2, installs and
+    /// removes packages and flips SELinux to enforcing: never point it
+    /// at a machine you care about.
+    #[arg(long)]
+    yes_wipe: bool,
 }
+
+/// A host that says it is a disposable test machine.
+const MARKER: &str = "/etc/aegis-e2e-host";
 
 #[derive(Deserialize)]
 struct Scenarios {
@@ -180,16 +189,28 @@ fn summarize(json: &str) -> Result<String> {
 }
 
 /// True if SELinux logged a denial mentioning aegis since `marker`
-/// (`date '+%x %T'` on the host). Fails closed: an ssh failure or a
-/// missing ausearch is an error, never a clean result.
+/// (`date '+%x %T'` on the host). Fails closed: an ssh failure, a
+/// missing ausearch or any ausearch failure other than "no matches" is
+/// an error, never a clean result.
 fn avc_since(remote: &Remote, marker: &str) -> Result<bool> {
-    // ausearch exits 1 on "no matches", so its status says nothing; the
-    // guard's exit 2 does.
-    let out = remote.check(&format!(
+    let (ok, out, err) = remote.try_run(&format!(
         "command -v ausearch >/dev/null || {{ echo 'ausearch not found' >&2; exit 2; }}; \
-         ausearch -m AVC,USER_AVC,SELINUX_ERR -ts {marker} 2>/dev/null | grep -i aegis; exit 0"
+         ausearch -m AVC,USER_AVC,SELINUX_ERR -ts {marker}"
     ))?;
-    Ok(!out.trim().is_empty())
+    judge_ausearch(ok, &out, &err)
+}
+
+/// ausearch exits 1 both for "no matches" and for real failures (a bad
+/// time, an unreadable log), so only its own `<no matches>` line makes a
+/// non-zero exit clean.
+fn judge_ausearch(ok: bool, out: &str, err: &str) -> Result<bool> {
+    if ok {
+        return Ok(out.to_lowercase().contains("aegis"));
+    }
+    if err.lines().any(|l| l.trim() == "<no matches>") {
+        return Ok(false);
+    }
+    bail!("ausearch failed: {}", err.trim())
 }
 
 fn marker(remote: &Remote) -> Result<String> {
@@ -199,10 +220,11 @@ fn marker(remote: &Remote) -> Result<String> {
 const SHA_ETC: &str = "find /etc -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum";
 const PREREQS: [&str; 4] = ["gdb", "podman", "python3-pip", "strace"];
 const INCIDENTS: &str = "/var/lib/aegis-v2/incidents";
-/// How long "no incident" must hold before it counts.
-const SETTLE: Duration = Duration::from_secs(3);
+/// How long "no incident" must hold before it counts: past aegisd's 6 s
+/// verification hold, so a signal still waiting on a verdict is scored.
+const SETTLE: Duration = Duration::from_secs(8);
 /// How long to wait for an expected incident to appear.
-const DEADLINE: Duration = Duration::from_secs(10);
+const DEADLINE: Duration = Duration::from_secs(15);
 
 struct Row {
     name: String,
@@ -216,6 +238,7 @@ struct Row {
 
 pub fn run(args: Args) -> Result<()> {
     let remote = Remote::new(&args);
+    check_disposable(&remote, args.yes_wipe)?;
 
     // Which architecture the host wants, and build for it (never on the host).
     let machine = remote.check("uname -m")?.trim().to_string();
@@ -307,6 +330,25 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a host that hasn't been marked as a test machine, unless the
+/// caller said `--yes-wipe`.
+fn check_disposable(remote: &Remote, yes_wipe: bool) -> Result<()> {
+    if yes_wipe {
+        return Ok(());
+    }
+    let (marked, _, _) = remote.try_run(&format!("test -f {MARKER}"))?;
+    if !marked {
+        bail!(
+            "{host} has no {MARKER}, so it isn't marked as a disposable test host.\n\
+             The e2e run reinstalls aegis-v2, deletes /var/lib/aegis-v2, installs \
+             and removes packages and sets SELinux enforcing.\n\
+             If that's fine, mark the host (ssh {host} touch {MARKER}) or pass --yes-wipe.",
+            host = remote.host
+        );
+    }
+    Ok(())
+}
+
 fn build_sim(engine: &str, arch: Arch) -> Result<()> {
     in_container(
         engine,
@@ -373,7 +415,7 @@ fn run_scenario(remote: &Remote, s: &Scenario) -> Result<Row> {
 
     // Poll until the expected result shows up or the deadline passes.
     // An absence can't be seen early, so "none" is only taken once the
-    // settle time (probe drain plus the 2 s verification hold) is up.
+    // settle time (probe drain plus the verification hold) is up.
     let start = Instant::now();
     let got = loop {
         let got = summarize(&remote.check("aegisctl incidents list --json")?)?;
@@ -451,5 +493,21 @@ fn print_table(rows: &[Row]) {
             if r.ran { "ok" } else { "err" },
             if r.pass { "PASS" } else { "FAIL" },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ausearch_outcomes() {
+        assert!(!judge_ausearch(false, "", "<no matches>\n").unwrap());
+        assert!(judge_ausearch(true, "type=AVC ... comm=\"aegisd\"", "").unwrap());
+        assert!(!judge_ausearch(true, "type=AVC ... comm=\"sshd\"", "").unwrap());
+        // Any other failure fails the check rather than reading clean.
+        assert!(judge_ausearch(false, "", "Invalid start time\n").is_err());
+        assert!(judge_ausearch(false, "", "ausearch not found\n").is_err());
+        assert!(judge_ausearch(false, "", "").is_err());
     }
 }
