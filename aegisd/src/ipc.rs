@@ -334,7 +334,11 @@ mod tests {
     #[tokio::test]
     async fn ipc_replaces_stale_socket() {
         let p = sock("stale");
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let d = p.parent().unwrap();
+        std::fs::create_dir_all(d).unwrap();
+        // The incident tests set umask 0 while they run, so don't trust
+        // the mode create_dir_all gave us.
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
         drop(std::os::unix::net::UnixListener::bind(&p).unwrap());
         assert!(p.exists());
         start(&p, me());
