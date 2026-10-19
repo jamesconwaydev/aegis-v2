@@ -38,8 +38,12 @@ static OFFSETS: KernelOffsets = KernelOffsets {
     task_start_time: 0,
     task_signal: 0,
     signal_tty: 0,
+    signal_live: 0,
     bprm_file: 0,
     file_f_path: 0,
+    file_f_inode: 0,
+    inode_i_sb: 0,
+    super_block_s_magic: 0,
     sock_sk_err: 0,
 };
 
@@ -57,13 +61,18 @@ pub(crate) fn read<T: Default>(base: *const u8, off: usize) -> T {
     unsafe { bpf_probe_read_kernel(base.wrapping_add(off) as *const T) }.unwrap_or_default()
 }
 
+#[inline(always)]
+fn count_drop() {
+    if let Some(n) = DROPPED.get_ptr_mut(0) {
+        unsafe { *n += 1 };
+    }
+}
+
 /// Reserves a zeroed event, lets `fill` write it, and submits it.
 #[inline(always)]
 pub(crate) fn emit(kind: EventKind, fill: impl FnOnce(&mut Event)) {
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
-        if let Some(n) = DROPPED.get_ptr_mut(0) {
-            unsafe { *n += 1 };
-        }
+        count_drop();
         return;
     };
     let ev = unsafe {
@@ -73,6 +82,16 @@ pub(crate) fn emit(kind: EventKind, fill: impl FnOnce(&mut Event)) {
     ev.kind = kind as u32;
     fill(ev);
     entry.submit(0);
+}
+
+/// Copies an already-built event onto the ring, counting a drop on a
+/// full buffer. Used where the event must also be stored elsewhere, so
+/// building it can't be tied to a successful reserve.
+#[inline(always)]
+pub(crate) fn emit_val(ev: &Event) {
+    if EVENTS.output::<Event>(ev, 0).is_err() {
+        count_drop();
+    }
 }
 
 /// Fills the subject fields from the current task.

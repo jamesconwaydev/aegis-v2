@@ -54,8 +54,12 @@ fn kernel_offsets(btf: &btf::Btf) -> Result<KernelOffsets> {
         task_start_time: btf.offset("task_struct", "start_time")?,
         task_signal: btf.offset("task_struct", "signal")?,
         signal_tty: btf.offset("signal_struct", "tty")?,
+        signal_live: btf.offset("signal_struct", "live")?,
         bprm_file: btf.offset("linux_binprm", "file")?,
         file_f_path: btf.offset("file", "f_path")?,
+        file_f_inode: btf.offset("file", "f_inode")?,
+        inode_i_sb: btf.offset("inode", "i_sb")?,
+        super_block_s_magic: btf.offset("super_block", "s_magic")?,
         sock_sk_err: btf.offset("sock", "sk_err")?,
     })
 }
@@ -76,7 +80,7 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
         .context("loading eBPF object")?;
 
     let lsm: &mut Lsm = prog(&mut ebpf, "aegis_exec")?;
-    lsm.load("bprm_check_security", &kernel_btf)?;
+    lsm.load("bprm_committed_creds", &kernel_btf)?;
     lsm.attach()?;
 
     let fork: &mut BtfTracePoint = prog(&mut ebpf, "aegis_fork")?;
@@ -104,16 +108,30 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
 
     let (tx, rx) = mpsc::channel(cfg.channel_capacity);
     tokio::spawn(async move {
+        let mut short: u64 = 0;
         loop {
             let Ok(mut guard) = ring.readable_mut().await else {
                 return;
             };
-            while let Some(ev) = guard.get_inner_mut().next().map(|item| {
-                assert!(item.len() >= size_of::<Event>(), "short ring buffer record");
-                // SAFETY: the kernel side writes whole `Event`s, and every
-                // bit pattern is a valid `Event`.
-                unsafe { item.as_ptr().cast::<Event>().read_unaligned() }
-            }) {
+            loop {
+                // Copy the event out and drop the borrow before awaiting,
+                // so the item doesn't cross the send.
+                let ev = {
+                    let Some(item) = guard.get_inner_mut().next() else {
+                        break;
+                    };
+                    if item.len() < size_of::<Event>() {
+                        short += 1;
+                        eprintln!(
+                            "aegisd: skipping short ring buffer record ({} bytes, {short} so far)",
+                            item.len()
+                        );
+                        continue;
+                    }
+                    // SAFETY: the kernel side writes whole `Event`s, and every
+                    // bit pattern is a valid `Event`.
+                    unsafe { item.as_ptr().cast::<Event>().read_unaligned() }
+                };
                 if tx.send(ev).await.is_err() {
                     return;
                 }

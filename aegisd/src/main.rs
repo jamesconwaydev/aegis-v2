@@ -72,7 +72,13 @@ fn event_json(ev: &Event) -> Value {
     let path = || text(&ev.path[..ev.path.len().min(ev.path_len as usize)]);
     let (kind, extra) = match EventKind::try_from(ev.kind) {
         Ok(EventKind::Exec) => ("exec", json!({ "path": path() })),
-        Ok(EventKind::Fork) => ("fork", json!({ "child_tgid": ev.child_tgid })),
+        Ok(EventKind::Fork) => (
+            "fork",
+            json!({
+                "child_tgid": ev.child_tgid,
+                "child_start_time_ns": ev.child_start_time_ns,
+            }),
+        ),
         Ok(EventKind::Exit) => ("exit", json!({})),
         Ok(EventKind::Ptrace) => (
             "ptrace",

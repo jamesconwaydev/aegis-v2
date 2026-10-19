@@ -40,6 +40,14 @@ pub const HAS_TTY: u32 = 8;
 
 /// One record on the `EVENTS` ring buffer. Fields after `flags` are only
 /// meaningful for the kind named beside them; the rest are zero.
+///
+/// Padding is spelled out as `_pad*` so there are no uninitialised holes:
+/// the eBPF side zeroes the whole record, and that soundness is what lets
+/// userspace treat it as `aya::Pod`.
+///
+/// The `daddr` IPv6 bytes aren't normalised: an IPv4-mapped v6 address
+/// arrives as-is, and ptrace `target_tgid` is a pid in the tracer's pid
+/// namespace. Both are translated in userspace (Task 7), not here.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Event {
@@ -48,7 +56,9 @@ pub struct Event {
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
-    /// Thread-group leader's start time, CLOCK_MONOTONIC.
+    pub _pad0: u32,
+    /// Thread-group leader's start time, CLOCK_MONOTONIC. With `tgid` this
+    /// is the process identity that survives pid reuse.
     pub start_time_ns: u64,
     /// CLOCK_MONOTONIC.
     pub ts_ns: u64,
@@ -68,6 +78,10 @@ pub struct Event {
     pub dport: u16,
     pub daddr: [u8; 16],
     pub ret: i32,
+    pub _pad1: u32,
+    /// Fork: the child's own start time, so the child's `(tgid,
+    /// start_time_ns)` identity can be formed from the fork event alone.
+    pub child_start_time_ns: u64,
 }
 
 /// Kernel struct member offsets, in bytes. Rust has no CO-RE, so
@@ -82,8 +96,12 @@ pub struct KernelOffsets {
     pub task_start_time: u32,
     pub task_signal: u32,
     pub signal_tty: u32,
+    pub signal_live: u32,
     pub bprm_file: u32,
     pub file_f_path: u32,
+    pub file_f_inode: u32,
+    pub inode_i_sb: u32,
+    pub super_block_s_magic: u32,
     pub sock_sk_err: u32,
 }
 
@@ -94,6 +112,8 @@ unsafe impl aya::Pod for KernelOffsets {}
 
 // The eBPF side and userspace must agree on this layout byte for byte.
 const _: () = assert!(core::mem::offset_of!(Event, cgroup_id) == 40);
+const _: () = assert!(core::mem::offset_of!(Event, child_start_time_ns) == 368);
+const _: () = assert!(core::mem::size_of::<Event>() == 376);
 
 #[cfg(test)]
 mod tests {

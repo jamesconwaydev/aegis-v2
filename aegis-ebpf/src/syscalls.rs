@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! ptrace and memfd_create, from their syscall-entry tracepoints. The
 //! arguments sit at 16 + 8n, past the common header and `__syscall_nr`.
+//!
+//! `target_tgid` is the raw pid argument, a pid in the tracer's pid
+//! namespace; userspace translates it to the host namespace (Task 7).
 
 use aegis_common::EventKind;
 use aya_ebpf::{

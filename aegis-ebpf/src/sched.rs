@@ -22,14 +22,22 @@ pub fn aegis_fork(ctx: BtfTracePointContext) -> i32 {
     emit(EventKind::Fork, |ev| {
         current(ev);
         ev.child_tgid = child_tgid;
+        // The child is its own group leader, so its own start time is the
+        // one that pairs with child_tgid to identify the new process.
+        ev.child_start_time_ns = read(child, off!(task_start_time));
     });
     0
 }
 
 #[tracepoint(category = "sched", name = "sched_process_exit")]
 pub fn aegis_exit(_ctx: TracePointContext) -> u32 {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    if pid_tgid >> 32 == pid_tgid & 0xffff_ffff {
+    // Emit once per process, when the last thread goes. signal->live is
+    // already decremented by the time this tracepoint fires, so it reads
+    // zero on the final thread's exit.
+    let task = unsafe { aya_ebpf::helpers::bpf_get_current_task() } as *const u8;
+    let signal: u64 = read(task, off!(task_signal));
+    let live: i32 = read(signal as *const u8, off!(signal_live));
+    if live == 0 {
         emit(EventKind::Exit, current);
     }
     0
