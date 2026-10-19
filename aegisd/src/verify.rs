@@ -2,10 +2,10 @@
 //! Executable verification against the RPM database.
 
 use std::collections::HashMap;
-use std::fs::{File, Metadata};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Mutex};
@@ -22,9 +22,20 @@ pub enum Verification {
     Unverified,
 }
 
+/// What `rpm -qf` said about a path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Owner {
+    Owned(String),
+    /// rpm ran and said so: exit 1 and "is not owned by any package".
+    NotOwned,
+    /// Anything else: a timeout, a spawn failure, another exit or
+    /// message. Never cached.
+    Indeterminate,
+}
+
 pub trait RpmDb {
-    /// Name of the package that owns `p`, if any.
-    fn owner(&self, p: &Path) -> Option<String>;
+    /// Which package owns `p`.
+    fn owner(&self, p: &Path) -> Owner;
     /// Whether the file still matches the database (digest, size and
     /// mode). `p` is only for the database lookup; `f` and `md` are the
     /// one handle the Verifier opened, and must be what gets hashed and
@@ -100,10 +111,17 @@ impl<D: RpmDb> Verifier<D> {
         Some(((md.dev(), md.ino()), self.judge(exe, &f, &md, pinned)))
     }
 
+    /// Opens without following a final symlink and without blocking: a
+    /// FIFO or a device at a trusted path must never stall a verifier
+    /// thread. Only a regular file is worth asking rpm about or hashing.
     fn open_on_host(&self, exe: &Path) -> Option<(File, Metadata)> {
-        let f = File::open(on_host(&self.host_root, exe)).ok()?;
+        let f = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(on_host(&self.host_root, exe))
+            .ok()?;
         let md = f.metadata().ok()?;
-        Some((f, md))
+        md.file_type().is_file().then_some((f, md))
     }
 
     /// The key, the size/mode and the hash all come from the one handle
@@ -152,12 +170,13 @@ impl<D: RpmDb> Verifier<D> {
             };
         }
         match self.db.owner(exe) {
-            Some(package) => match self.db.verify(exe, f, md) {
+            Owner::Owned(package) => match self.db.verify(exe, f, md) {
                 Some(true) => (Verification::RpmOwned { package }, true),
                 Some(false) => (Verification::Modified, true),
                 None => (Verification::Unverified, false),
             },
-            None => (Verification::Unverified, true),
+            Owner::NotOwned => (Verification::Unverified, true),
+            Owner::Indeterminate => (Verification::Unverified, false),
         }
     }
 }
@@ -174,15 +193,17 @@ fn sha256_file(mut f: &File) -> Option<[u8; 32]> {
     }
 }
 
-/// The real thing: shells out to `rpm`, 2 s per call.
+/// The real thing: shells out to `/usr/bin/rpm`, 2 s per call.
 pub struct Rpm;
 
-const RPM_TIMEOUT: Duration = Duration::from_secs(2);
+/// By absolute path, so `PATH` never picks the binary we trust.
+const RPM: &str = "/usr/bin/rpm";
+pub const RPM_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Runs `rpm args`, returning (exit ok, stdout bytes), or None on spawn
-/// failure or timeout.
-fn rpm(args: &[&std::ffi::OsStr]) -> Option<(bool, Vec<u8>)> {
-    let mut child = Command::new("rpm")
+/// Runs `rpm args`, returning (exit code, stdout bytes), or None on spawn
+/// failure or timeout. The code is None when rpm died on a signal.
+fn rpm(args: &[&std::ffi::OsStr]) -> Option<(Option<i32>, Vec<u8>)> {
+    let mut child = Command::new(RPM)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -201,7 +222,7 @@ fn rpm(args: &[&std::ffi::OsStr]) -> Option<(bool, Vec<u8>)> {
         // EOF doesn't mean exited; don't block on wait() forever.
         while Instant::now() < deadline {
             if let Ok(Some(st)) = child.try_wait() {
-                return Some((st.success(), s));
+                return Some((st.code(), s));
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -212,32 +233,63 @@ fn rpm(args: &[&std::ffi::OsStr]) -> Option<(bool, Vec<u8>)> {
 }
 
 impl RpmDb for Rpm {
-    fn owner(&self, p: &Path) -> Option<String> {
-        let (ok, out) = rpm(&[
+    fn owner(&self, p: &Path) -> Owner {
+        let r = rpm(&[
             "-qf".as_ref(),
             "--qf".as_ref(),
             "%{NAME}\n".as_ref(),
             "--".as_ref(),
             p.as_os_str(),
-        ])?;
-        // A file shared by several packages prints several names; take the first.
-        let name = String::from_utf8_lossy(out.split(|&b| b == b'\n').next()?)
-            .trim()
-            .to_string();
-        (ok && !name.is_empty()).then_some(name)
+        ]);
+        classify_owner(p, r)
     }
 
     fn verify(&self, p: &Path, f: &File, md: &Metadata) -> Option<bool> {
-        let (ok, out) = rpm(&[
+        let (code, out) = rpm(&[
             "-qf".as_ref(),
             "--dump".as_ref(),
             "--".as_ref(),
             p.as_os_str(),
         ])?;
-        if !ok {
+        if code != Some(0) {
             return None;
         }
         dump_matches(&out, p, md.len(), md.mode(), || sha256_file(f))
+    }
+}
+
+/// Reads `rpm -qf --qf '%{NAME}\n' -- p`'s outcome. Only exit 0 with a
+/// name is owned, and only exit 1 with rpm's own "not owned" line for
+/// `p` is not owned; everything else is indeterminate.
+fn classify_owner(p: &Path, r: Option<(Option<i32>, Vec<u8>)>) -> Owner {
+    let Some((code, out)) = r else {
+        return Owner::Indeterminate;
+    };
+    let mut lines = out.split(|&b| b == b'\n');
+    match code {
+        Some(0) => {
+            // A file shared by several packages prints several names; take
+            // the first.
+            let name = String::from_utf8_lossy(lines.next().unwrap_or_default())
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                Owner::Indeterminate
+            } else {
+                Owner::Owned(name)
+            }
+        }
+        Some(1) => {
+            let mut want = b"file ".to_vec();
+            want.extend_from_slice(p.as_os_str().as_bytes());
+            want.extend_from_slice(b" is not owned by any package");
+            if lines.any(|l| l == want) {
+                Owner::NotOwned
+            } else {
+                Owner::Indeterminate
+            }
+        }
+        _ => Owner::Indeterminate,
     }
 }
 
@@ -282,8 +334,9 @@ mod tests {
         ok: Option<bool>,
     }
     impl RpmDb for Fake {
-        fn owner(&self, _: &Path) -> Option<String> {
-            self.owner.map(String::from)
+        fn owner(&self, _: &Path) -> Owner {
+            self.owner
+                .map_or(Owner::NotOwned, |o| Owner::Owned(o.into()))
         }
         fn verify(&self, _: &Path, _: &File, _: &Metadata) -> Option<bool> {
             self.ok
@@ -407,6 +460,102 @@ mod tests {
     }
 
     #[test]
+    fn rpm_owner_outcomes() {
+        let p = Path::new("/tmp/x");
+        let r = |code: Option<i32>, out: &[u8]| classify_owner(p, Some((code, out.to_vec())));
+        assert_eq!(
+            r(Some(0), b"coreutils-single\nother\n"),
+            Owner::Owned("coreutils-single".into())
+        );
+        assert_eq!(
+            r(Some(1), b"file /tmp/x is not owned by any package\n"),
+            Owner::NotOwned
+        );
+        // Exit 1 for any other reason: a missing file, a broken database.
+        assert_eq!(
+            r(Some(1), b"error: file /tmp/x: No such file or directory\n"),
+            Owner::Indeterminate
+        );
+        // Another path's "not owned" line doesn't count for this one.
+        assert_eq!(
+            r(Some(1), b"file /tmp/xy is not owned by any package\n"),
+            Owner::Indeterminate
+        );
+        assert_eq!(r(Some(0), b"\n"), Owner::Indeterminate);
+        assert_eq!(r(Some(2), b""), Owner::Indeterminate);
+        assert_eq!(r(None, b""), Owner::Indeterminate, "killed by a signal");
+        assert_eq!(
+            classify_owner(p, None),
+            Owner::Indeterminate,
+            "timeout or spawn failure"
+        );
+    }
+
+    struct Owners(Owner);
+    impl RpmDb for Owners {
+        fn owner(&self, _: &Path) -> Owner {
+            self.0.clone()
+        }
+        fn verify(&self, _: &Path, _: &File, _: &Metadata) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    #[test]
+    fn indeterminate_owner_is_unverified_and_not_cached() {
+        let t = Tmp::new("ind-owner", b"x");
+        let ind = ver(Owners(Owner::Indeterminate));
+        assert_eq!(check(&ind, &t.0, &[]), Verification::Unverified);
+        assert!(ind.cache.lock().unwrap().is_empty());
+        // Not owned is a real answer, so it is cached.
+        let not = ver(Owners(Owner::NotOwned));
+        assert_eq!(check(&not, &t.0, &[]), Verification::Unverified);
+        assert_eq!(not.cache.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_at_a_trusted_path_does_not_block() {
+        let p = std::env::temp_dir().join(format!("aegis-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = mpsc::channel();
+        let q = p.clone();
+        std::thread::spawn(move || {
+            let ver = ver(Fake {
+                owner: Some("bash"),
+                ok: Some(true),
+            });
+            let pin = [(q.clone(), [0u8; 32])];
+            let host = ver.verify_host(&q, &pin);
+            let exec = ver.verify(&q, ino(&q), &pin);
+            let _ = tx.send((host, exec));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        let _ = std::fs::remove_file(&p);
+        let (host, exec) = got.expect("verifying a FIFO blocked");
+        assert!(host.is_none());
+        assert_eq!(exec, Verification::Unverified);
+    }
+
+    #[test]
+    fn a_symlink_at_a_trusted_path_is_unverified() {
+        let t = Tmp::new("link-target", b"x");
+        let l = std::env::temp_dir().join(format!("aegis-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&l);
+        std::os::unix::fs::symlink(&t.0, &l).unwrap();
+        let ver = ver(Fake {
+            owner: Some("bash"),
+            ok: Some(true),
+        });
+        let got = ver.verify(&l, ino(&t.0), &[]);
+        let _ = std::fs::remove_file(&l);
+        assert_eq!(got, Verification::Unverified);
+    }
+
+    #[test]
     fn indeterminate_verify_is_unverified_and_not_cached() {
         let t = Tmp::new("ind", b"x");
         let p = t.0.clone();
@@ -491,11 +640,11 @@ mod tests {
         seen_ino: std::sync::Mutex<Option<u64>>,
     }
     impl RpmDb for Swap {
-        fn owner(&self, _: &Path) -> Option<String> {
+        fn owner(&self, _: &Path) -> Owner {
             let genuine = self.path.with_extension("genuine");
             std::fs::write(&genuine, b"genuine").unwrap();
             std::fs::rename(&genuine, &self.path).unwrap();
-            Some("bash".into())
+            Owner::Owned("bash".into())
         }
         fn verify(&self, _: &Path, mut f: &File, md: &Metadata) -> Option<bool> {
             *self.seen_ino.lock().unwrap() = Some(md.ino());
