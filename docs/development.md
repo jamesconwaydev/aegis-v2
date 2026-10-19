@@ -17,8 +17,8 @@ The binaries land in `dist/<arch>/aegisd` and `dist/<arch>/aegisctl`. Drop
 
 The first run builds the image, which takes a few minutes. After that a clean
 build is about 15 seconds on aarch64 and a minute on emulated x86_64. When you
-want a fresh image, say because nightly moved or the Containerfile changed,
-rebuild it:
+want a fresh image, say because you bumped a pinned version in the
+Containerfile, rebuild it:
 
 ```sh
 cargo xtask container --arch aarch64
@@ -26,7 +26,8 @@ cargo xtask container --arch aarch64
 
 ## Choosing podman or docker
 
-xtask uses podman if it can find it, then docker. To pick one yourself:
+xtask uses podman if it can find it, then docker. The one exception is
+building the other architecture on a Mac, covered below. To pick one yourself:
 
 ```sh
 export AEGIS_CONTAINER_ENGINE=docker
@@ -49,25 +50,37 @@ in the image and a linker setup to match. Emulation needs none of that.
 
 There's one catch. Podman's machine emulates with qemu, and rustc segfaults
 under it (`qemu: uncaught target signal 11`). Docker Desktop runs x86_64
-through Rosetta instead, and rustc is fine there. So on a Mac, build x86_64
-with docker:
+through Rosetta instead, and rustc is fine there.
 
-```sh
-AEGIS_CONTAINER_ENGINE=docker cargo xtask build --arch x86_64 --release
-```
+So on a Mac, xtask picks docker first whenever `--arch` isn't your own
+architecture. Force podman with `AEGIS_CONTAINER_ENGINE` and it warns you
+before the crash.
 
 On an x86_64 Linux host it's the other way round: x86_64 builds natively, and
 aarch64 is the emulated one.
 
 ## What's in the image
 
-`build/Containerfile` starts from `rockylinux/rockylinux:10` and adds:
+`build/Containerfile` starts from Rocky 10.2, pinned by digest, and adds:
 
 - gcc, clang and llvm, plus the RPM tooling (`rpm-build`,
   `selinux-policy-devel`, `systemd-rpm-macros`)
-- Rust stable with `rust-src`, clippy and rustfmt, for userspace
-- Rust nightly with `rust-src`, for the eBPF crate
-- `bpf-linker`, taken from upstream's release binaries
+- Rust 1.99.1 with `rust-src`, clippy and rustfmt, for userspace
+- Rust `nightly-2026-10-19` with `rust-src`, for the eBPF crate
+- `bpf-linker` v0.12.0 from upstream's release binaries, checked against
+  a sha256 committed in the Containerfile
+
+Everything is pinned, so the image you build next month matches today's.
+Moving a version is a deliberate edit:
+
+- **Stable:** change `RUST_STABLE` and `rust-toolchain.toml` together.
+- **Nightly:** change `AEGIS_EBPF_TOOLCHAIN`. `aegisd/build.rs` reads it and
+  hands it to aya-build, and the build fails if it's unset.
+- **bpf-linker:** change `BPF_LINKER` and both hashes. The release page lists
+  each asset's sha256.
+
+The nightly and bpf-linker have to agree on LLVM, so bump them together and
+build both architectures before you push.
 
 That last one comes as a binary because building it from source needs a system
 LLVM matching the one inside rustc nightly, and Rocky doesn't ship it. The
@@ -113,3 +126,14 @@ podman volume rm aegis-cargo-aarch64 aegis-target-aarch64
 
 The workspace pins `rust-version = "1.98"`, because `aya-build` 0.2.1 won't
 build on anything older. Raise it when a dependency does.
+
+## Who owns dist/
+
+The container runs as root. With podman, or Docker Desktop on a Mac, that root
+maps back to you and `dist/` is yours. Rootful docker on Linux maps nothing, so
+`dist/<arch>/` comes out owned by root. Use podman there, or take it back
+after a build:
+
+```sh
+sudo chown -R "$(id -u):$(id -g)" dist
+```
