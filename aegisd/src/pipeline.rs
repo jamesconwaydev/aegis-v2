@@ -303,8 +303,14 @@ impl Pipeline {
     /// waiting process that still runs the exe it asked about, then any
     /// signal that was waiting on this key is scored.
     pub fn verified(&mut self, path: &ExeKey, v: Verification) {
-        for (k, exe) in self.pending.remove(path).unwrap_or_default() {
-            if self.table.get(&k).and_then(|p| p.exe.as_ref()) == Some(&exe) {
+        for (k, _) in self.pending.remove(path).unwrap_or_default() {
+            // Only if it still runs this very file: same path is not
+            // enough, a chroot can show another inode under it.
+            let runs = self
+                .table
+                .get(&k)
+                .is_some_and(|p| p.exe.as_ref() == Some(&path.0) && p.exe_id == Some(path.1));
+            if runs {
                 self.table.set_verification(&k, v.clone());
             }
         }
@@ -1030,5 +1036,36 @@ mod tests {
             p.table.get(&key(81)).unwrap().verification,
             Verification::Unverified
         );
+    }
+
+    #[test]
+    fn a_verdict_lands_only_on_the_inode_it_was_for() {
+        // Pid 90 runs the host's x (inode 1), then a chroot's x (inode 2).
+        // Whichever verdict lands last, the host's must not stick to it.
+        for host_last in [true, false] {
+            let (mut p, _d) = pipeline(if host_last { "inode-a" } else { "inode-b" });
+            let mut a = exec(90, "/usr/bin/x", 0);
+            a.exe_ino = 1;
+            p.handle(&a);
+            let mut b = exec(90, "/usr/bin/x", 0);
+            b.exe_ino = 2;
+            p.handle(&b);
+            let (ka, kb) = (
+                (PathBuf::from("/usr/bin/x"), (0, 1)),
+                (PathBuf::from("/usr/bin/x"), (0, 2)),
+            );
+            if host_last {
+                p.verified(&kb, Verification::Unverified);
+                p.verified(&ka, rpm("x"));
+            } else {
+                p.verified(&ka, rpm("x"));
+                p.verified(&kb, Verification::Unverified);
+            }
+            assert_eq!(
+                p.table.get(&key(90)).unwrap().verification,
+                Verification::Unverified,
+                "host_last={host_last}"
+            );
+        }
     }
 }
