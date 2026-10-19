@@ -8,7 +8,7 @@
 use std::fs::File;
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,9 +40,20 @@ pub fn bind(path: &Path) -> Result<(UnixListener, File)> {
             .create(dir)
             .with_context(|| format!("creating {}", dir.display()))?;
     }
+    if let Some(dir) = path.parent() {
+        check_private_dir(dir)?;
+    }
     let lock_path = path.with_file_name("aegisd.lock");
-    let lock =
-        File::create(&lock_path).with_context(|| format!("opening {}", lock_path.display()))?;
+    // No truncate, and no following a symlink planted at the path.
+    // std opens with O_CLOEXEC already.
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
     // SAFETY: flock on a valid fd; LOCK_NB makes it return instead of block.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!(
@@ -64,6 +75,31 @@ pub fn bind(path: &Path) -> Result<(UnixListener, File)> {
     // harmless: every peer is checked by uid before it is served.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok((l, lock))
+}
+
+/// The socket's directory must belong to us (root, for the daemon) and
+/// be writable by no one else; otherwise another user could swap the
+/// lock file or the socket under us. Checked on the opened directory,
+/// not the path, and without following a symlink.
+fn check_private_dir(dir: &Path) -> Result<()> {
+    let d = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .with_context(|| format!("opening {}", dir.display()))?;
+    let md = d.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    if md.uid() != me || md.mode() & 0o022 != 0 {
+        bail!(
+            "{} must be owned by uid {me} and not group or world writable \
+             (uid {}, mode {:o})",
+            dir.display(),
+            md.uid(),
+            md.mode() & 0o7777
+        );
+    }
+    Ok(())
 }
 
 /// Serves until the listener fails. Only peers with uid `allowed_uid`
@@ -278,6 +314,21 @@ mod tests {
         let r: Response = serde_json::from_str(&l.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(r, status());
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn ipc_refuses_a_world_writable_socket_dir() {
+        let p = sock("wdir");
+        let d = p.parent().unwrap();
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let e = bind(&p).unwrap_err().to_string();
+        assert!(e.contains("not group or world writable"), "{e}");
+        // A symlink planted where the lock goes is not followed.
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", d.join("aegisd.lock")).unwrap();
+        assert!(bind(&p).is_err());
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[tokio::test]
