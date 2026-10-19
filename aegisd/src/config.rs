@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use serde::de::{self, DeserializeOwned, Deserializer};
 use serde::Deserialize;
+use toml::Spanned;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -43,6 +44,17 @@ fn non_negative<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
         Err(de::Error::custom(format!(
             "must be a finite number >= 0, got {v}"
         )))
+    }
+}
+
+fn at_least_one<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default + PartialEq>(
+    d: D,
+) -> Result<T, D::Error> {
+    let v = T::deserialize(d)?;
+    if v == T::default() {
+        Err(de::Error::custom("must be at least 1"))
+    } else {
+        Ok(v)
     }
 }
 
@@ -89,7 +101,9 @@ impl Default for Weights {
 pub struct ScanConfig {
     #[serde(deserialize_with = "positive")]
     pub window_secs: f64,
+    #[serde(deserialize_with = "at_least_one")]
     pub distinct_targets: u32,
+    #[serde(deserialize_with = "at_least_one")]
     pub failed_connects: u32,
 }
 
@@ -134,8 +148,8 @@ impl TryFrom<String> for AbsPath {
             Ok(Self(PathBuf::from(s)))
         } else {
             Err(format!(
-                "{s:?} is not an absolute path; use the full path of the executable \
-                 (for example /usr/bin/{s}), because process names can be spoofed"
+                "{s:?} is not an absolute path; use the full path of the executable, \
+                 because process names can be spoofed"
             ))
         }
     }
@@ -184,7 +198,9 @@ pub struct Allowlist {
     #[serde(deserialize_with = "abs_paths")]
     pub excluded_parent_processes: Vec<PathBuf>,
     pub excluded_selinux_domains: Vec<String>,
-    /// Path and SHA-256, as `Verifier::verify` takes them.
+    /// Path and SHA-256, as `Verifier::verify` takes them. When files
+    /// disagree, the last one read wins, and drop-ins are read after the
+    /// main file, so a drop-in can re-pin a path the main file pinned.
     #[serde(deserialize_with = "pins")]
     pub pinned: Vec<(PathBuf, [u8; 32])>,
 }
@@ -192,7 +208,9 @@ pub struct Allowlist {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuarantineConfig {
+    #[serde(deserialize_with = "at_least_one")]
     pub overlay_max_size_mb: u32,
+    #[serde(deserialize_with = "at_least_one")]
     pub auto_expire_seconds: u64,
 }
 
@@ -287,21 +305,6 @@ impl ConfigError {
             message: message.into(),
         }
     }
-
-    /// Points at the first line that sets `key`, for checks that span fields.
-    fn at_key(path: &Path, src: &str, key: &str, message: impl Into<String>) -> Self {
-        let mut off = 0;
-        let mut hit = None;
-        for line in src.split_inclusive('\n') {
-            let t = line.trim_start();
-            if t.starts_with(key) && t[key.len()..].trim_start().starts_with('=') {
-                hit = Some(off + line.len() - t.len());
-                break;
-            }
-            off += line.len();
-        }
-        Self::at(path, src, hit, message)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -329,6 +332,34 @@ fn parse<T: DeserializeOwned>(path: &Path, src: &str) -> Result<T, ConfigError> 
         .map_err(|e| ConfigError::at(path, src, e.span().map(|s| s.start), e.message()))
 }
 
+/// A second look at the main file, only to get exact spans for the
+/// checks that need more than one field.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Spans {
+    general: SpanGeneral,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SpanGeneral {
+    mode: Option<Spanned<Mode>>,
+    score_threshold_throttle: Option<Spanned<u32>>,
+    score_threshold_quarantine: Option<Spanned<u32>>,
+}
+
+fn unconfined_warning(path: &Path, a: &Allowlist) -> Option<Warning> {
+    a.excluded_selinux_domains
+        .iter()
+        .any(|d| d == "unconfined_t")
+        .then(|| Warning {
+            path: path.to_owned(),
+            message: "unconfined_t is in excluded_selinux_domains; every root shell and \
+                      many services run in it, so this lets an attacker skip scoring"
+                .into(),
+        })
+}
+
 impl Config {
     pub fn load(main: &Path, dropin_dir: &Path) -> Result<Config, ConfigError> {
         Self::load_checked(main, dropin_dir).map(|(c, _)| c)
@@ -336,7 +367,8 @@ impl Config {
 
     /// Like `load`, plus warnings for settings that are legal but unwise.
     /// Drop-ins (`*.toml` in `dropin_dir`, lexical order) add to the
-    /// allowlist lists; a later pin for the same path replaces the earlier.
+    /// allowlist lists. A pin in a later file replaces an earlier pin for
+    /// the same path, including one from the main file.
     pub fn load_checked(
         main: &Path,
         dropin_dir: &Path,
@@ -344,11 +376,13 @@ impl Config {
         let src = read(main)?;
         let mut cfg: Config = parse(main, &src)?;
 
+        let spans: Spans = parse(main, &src)?;
+        let start = |o: &Option<Spanned<_>>| o.as_ref().map(|v| v.span().start);
         if cfg.general.mode == Mode::Enforce {
-            return Err(ConfigError::at_key(
+            return Err(ConfigError::at(
                 main,
                 &src,
-                "mode",
+                spans.general.mode.as_ref().map(|v| v.span().start),
                 "enforce mode is not available in this release (planned for v0.2.0)",
             ));
         }
@@ -357,21 +391,32 @@ impl Config {
             cfg.general.score_threshold_quarantine,
         );
         if thr >= quar {
-            return Err(ConfigError::at_key(
+            let at = start(&spans.general.score_threshold_throttle)
+                .or(start(&spans.general.score_threshold_quarantine));
+            return Err(ConfigError::at(
                 main,
                 &src,
-                "score_threshold_throttle",
+                at,
                 format!(
                     "score_threshold_throttle ({thr}) must be below \
                      score_threshold_quarantine ({quar})"
                 ),
             ));
         }
+        let mut warnings: Vec<Warning> = unconfined_warning(main, &cfg.allowlist)
+            .into_iter()
+            .collect();
 
         let mut files: Vec<PathBuf> = match std::fs::read_dir(dropin_dir) {
             Ok(rd) => rd
                 .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+                .filter(|p| {
+                    p.extension().is_some_and(|x| x == "toml")
+                        && !p
+                            .file_name()
+                            .is_some_and(|n| n.as_encoded_bytes()[0] == b'.')
+                        && p.metadata().is_ok_and(|m| m.is_file())
+                })
                 .collect(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
@@ -385,6 +430,7 @@ impl Config {
         files.sort();
         for f in files {
             let d: DropIn = parse(&f, &read(&f)?)?;
+            warnings.extend(unconfined_warning(&f, &d.allowlist));
             let a = &mut cfg.allowlist;
             a.excluded_parent_processes
                 .extend(d.allowlist.excluded_parent_processes);
@@ -396,21 +442,6 @@ impl Config {
             }
         }
 
-        let warnings = if cfg
-            .allowlist
-            .excluded_selinux_domains
-            .iter()
-            .any(|d| d == "unconfined_t")
-        {
-            vec![Warning {
-                path: main.to_owned(),
-                message: "unconfined_t is in excluded_selinux_domains; every root shell and \
-                          many services run in it, so this lets an attacker skip scoring"
-                    .into(),
-            }]
-        } else {
-            Vec::new()
-        };
         Ok((cfg, warnings))
     }
 }
@@ -423,13 +454,14 @@ pub struct ConfigHandle {
 }
 
 impl ConfigHandle {
-    pub fn new(main: PathBuf, dropin_dir: PathBuf) -> Result<Self, ConfigError> {
-        let cfg = Config::load(&main, &dropin_dir)?;
-        Ok(Self {
+    pub fn new(main: PathBuf, dropin_dir: PathBuf) -> Result<(Self, Vec<Warning>), ConfigError> {
+        let (cfg, warnings) = Config::load_checked(&main, &dropin_dir)?;
+        let h = Self {
             main,
             dropin_dir,
             cur: RwLock::new(Arc::new(cfg)),
-        })
+        };
+        Ok((h, warnings))
     }
 
     pub fn current(&self) -> Arc<Config> {
@@ -488,7 +520,34 @@ mod tests {
         assert_eq!(c.quarantine.auto_expire_seconds, 3600);
         assert_eq!(c.scoring.half_life_secs, 30.0);
         assert_eq!(c.scoring.weights.tmp_exec, 25.0);
-        assert_eq!(c.scoring.scan.distinct_targets, 20);
+        let w = &c.scoring.weights;
+        assert_eq!(
+            (
+                w.tmp_exec,
+                w.memfd_create,
+                w.memfd_exec,
+                w.ptrace_system_daemon,
+                w.egress_scan
+            ),
+            (25.0, 20.0, 60.0, 45.0, 40.0)
+        );
+        let sc = &c.scoring.scan;
+        assert_eq!(
+            (sc.window_secs, sc.distinct_targets, sc.failed_connects),
+            (2.0, 20, 10)
+        );
+        assert_eq!(
+            c.incidents.dir,
+            PathBuf::from("/var/lib/aegis-v2/incidents")
+        );
+        assert_eq!(
+            c.telemetry,
+            TelemetryConfig {
+                jsonl: None,
+                otlp: None
+            }
+        );
+        assert_eq!(c.allowlist, Allowlist::default());
         assert_eq!(c, Config::default());
     }
 
@@ -608,7 +667,7 @@ mod tests {
     fn reload_failure_keeps_previous() {
         let t = Dir::new("reload");
         let m = t.main("[quarantine]\noverlay_max_size_mb = 100\n");
-        let h = ConfigHandle::new(m.clone(), t.dir()).unwrap();
+        let h = ConfigHandle::new(m.clone(), t.dir()).unwrap().0;
         assert_eq!(h.current().quarantine.overlay_max_size_mb, 100);
 
         t.main("[quarantine]\noverlay_max_size_mb = 200\n");
@@ -625,6 +684,93 @@ mod tests {
         let t = Dir::new("shipped");
         let c = load(&t, include_str!("../../packaging/config.toml")).unwrap();
         assert_eq!(c, Config::default());
+
+        // Serde fills missing keys, so equality alone would pass on a
+        // file that left one out. Every key must be written down.
+        let table: toml::Table = include_str!("../../packaging/config.toml").parse().unwrap();
+        for key in [
+            "general.mode",
+            "general.score_threshold_throttle",
+            "general.score_threshold_quarantine",
+            "scoring.half_life_secs",
+            "scoring.weights.tmp_exec",
+            "scoring.weights.memfd_create",
+            "scoring.weights.memfd_exec",
+            "scoring.weights.ptrace_system_daemon",
+            "scoring.weights.egress_scan",
+            "scoring.scan.window_secs",
+            "scoring.scan.distinct_targets",
+            "scoring.scan.failed_connects",
+            "quarantine.overlay_max_size_mb",
+            "quarantine.auto_expire_seconds",
+            "incidents.dir",
+        ] {
+            let mut v = Some(&table);
+            let mut leaf = None;
+            for part in key.split('.') {
+                leaf = v.and_then(|t| t.get(part));
+                v = leaf.and_then(|x| x.as_table());
+            }
+            assert!(leaf.is_some(), "packaging/config.toml is missing {key}");
+        }
+    }
+
+    #[test]
+    fn dropin_unconfined_t_warns_with_its_own_path() {
+        let t = Dir::new("dropin-unconfined");
+        t.dropin(
+            "00.toml",
+            "[allowlist]\nexcluded_selinux_domains = [\"unconfined_t\"]\n",
+        );
+        let m = t.main("");
+        let (_, w) = Config::load_checked(&m, &t.dir()).unwrap();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].path.ends_with("allowlist.d/00.toml"), "{}", w[0]);
+    }
+
+    #[test]
+    fn handle_new_returns_startup_warnings() {
+        let t = Dir::new("handle-warn");
+        let m = t.main("[allowlist]\nexcluded_selinux_domains = [\"unconfined_t\"]\n");
+        let (_, w) = ConfigHandle::new(m, t.dir()).unwrap();
+        assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn spans_are_exact_for_inline_tables() {
+        let t = Dir::new("spans");
+        let e = load(
+            &t,
+            "[general]\nscore_threshold_quarantine = 60\n\"score_threshold_throttle\" = 70\n",
+        )
+        .unwrap_err();
+        assert_eq!(e.line_col.unwrap().0, 3, "{e}");
+        let e = load(&t, "x = 1\n[scoring]\n[general]\nmode = \"enforce\"\n").unwrap_err();
+        assert!(e.line_col.is_some());
+        let e = load(&t, "general = { mode = \"enforce\" }\n").unwrap_err();
+        assert_eq!(e.line_col.unwrap().0, 1);
+    }
+
+    #[test]
+    fn dotfiles_and_directories_are_not_dropins() {
+        let t = Dir::new("skip");
+        t.dropin(".hidden.toml", "garbage ][");
+        std::fs::create_dir(t.dir().join("dir.toml")).unwrap();
+        assert!(load(&t, "").is_ok());
+    }
+
+    #[test]
+    fn zero_counts_rejected() {
+        let t = Dir::new("zero");
+        for body in [
+            "[scoring.scan]\ndistinct_targets = 0\n",
+            "[scoring.scan]\nfailed_connects = 0\n",
+            "[quarantine]\noverlay_max_size_mb = 0\n",
+            "[quarantine]\nauto_expire_seconds = 0\n",
+        ] {
+            let e = load(&t, body).unwrap_err();
+            assert!(e.message.contains("at least 1"), "{e}");
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 # Default allowlist, shipped with the package. Your own rules belong in a
 # later file (say 50-site.toml): drop-ins are read in lexical order and their
-# lists add to these.
+# lists add to these. Drop-ins may contain only an [allowlist] table; thresholds,
+# scoring and the rest belong in config.toml.
 
 [allowlist]
 # Parents whose children skip the "exec from a temp directory" score. Paths
