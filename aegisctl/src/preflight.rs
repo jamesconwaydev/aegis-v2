@@ -204,9 +204,9 @@ impl Preflight {
         out.push(mk(
             "nft",
             on_path(path, "nft"),
-            Status::Fail,
+            Status::Warn,
             "nft found".into(),
-            "nft not found".into(),
+            "nft not found (needed from v0.2.0)".into(),
             "dnf install nftables",
         ));
         out.push(mk(
@@ -365,9 +365,13 @@ mod tests {
     fn warns_alone_exit_2() {
         let f = fixture("warn");
         fs::remove_file(f.root.join("usr/bin/criu")).unwrap();
+        fs::remove_file(f.root.join("usr/bin/nft")).unwrap();
         put(&f.root, "sys/fs/selinux/enforce", "0");
         let c = Preflight::run(&f.root);
         assert!(get(&c, "criu").detail.contains("needed from v0.4.0"));
+        // v0.1 never touches nftables: missing it is only a warning.
+        assert_eq!(get(&c, "nft").status, Status::Warn);
+        assert!(get(&c, "nft").detail.contains("needed from v0.2.0"));
         assert_eq!(exit_code(&c), 2);
     }
 }
