@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in Aegis isn't working the way it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: input
+    id: rocky
+    attributes:
+      label: Rocky Linux version
+      placeholder: "10.0"
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel
+      description: Output of `uname -r`.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Aegis version
+    validations:
+      required: true
+  - type: input
+    id: mode
+    attributes:
+      label: Mode
+      description: The mode Aegis was running in.
+    validations:
+      required: true
+  - type: textarea
+    id: preflight
+    attributes:
+      label: "`aegisctl preflight` output"
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: incident
+    attributes:
+      label: Relevant incident JSON
+      description: Remove anything sensitive first.
+      render: json

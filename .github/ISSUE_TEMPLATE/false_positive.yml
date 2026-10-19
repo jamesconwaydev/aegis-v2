@@ -1,0 +1,51 @@
+name: False positive
+description: Aegis quarantined or flagged something it shouldn't have.
+labels: [false-positive]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What was flagged?
+      description: The process, file or connection, and why you believe it was legitimate.
+    validations:
+      required: true
+  - type: input
+    id: rocky
+    attributes:
+      label: Rocky Linux version
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel
+      description: Output of `uname -r`.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Aegis version
+    validations:
+      required: true
+  - type: input
+    id: mode
+    attributes:
+      label: Mode
+    validations:
+      required: true
+  - type: textarea
+    id: preflight
+    attributes:
+      label: "`aegisctl preflight` output"
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: incident
+    attributes:
+      label: Incident JSON
+      description: The incident record for the false positive. Remove anything sensitive first.
+      render: json
+    validations:
+      required: true
