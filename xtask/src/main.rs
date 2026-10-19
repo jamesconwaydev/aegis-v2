@@ -30,7 +30,7 @@ enum Cmd {
     },
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
 #[value(rename_all = "snake_case")]
 enum Arch {
     X86_64,
@@ -72,24 +72,39 @@ impl std::fmt::Display for Arch {
 }
 
 fn main() -> Result<()> {
-    let engine = engine()?;
     match Cli::parse().command {
-        Cmd::Container { arch } => container(&engine, arch),
-        Cmd::Build { arch, release } => build(&engine, arch, release),
+        Cmd::Container { arch } => container(&engine(arch)?, arch),
+        Cmd::Build { arch, release } => build(&engine(arch)?, arch, release),
     }
 }
 
-/// `AEGIS_CONTAINER_ENGINE` if set, otherwise podman, then docker.
-fn engine() -> Result<String> {
-    if let Ok(engine) = env::var("AEGIS_CONTAINER_ENGINE") {
-        return Ok(engine);
-    }
-    for engine in ["podman", "docker"] {
-        if Command::new(engine).arg("--version").output().is_ok() {
-            return Ok(engine.into());
+/// `AEGIS_CONTAINER_ENGINE` if set, otherwise podman, then docker. The
+/// exception is a cross-arch build on macOS: podman's qemu crashes rustc
+/// there, so docker (Rosetta) goes first.
+fn engine(arch: Arch) -> Result<String> {
+    let cross_on_mac = cfg!(target_os = "macos") && arch != Arch::host();
+    let engine = match env::var("AEGIS_CONTAINER_ENGINE") {
+        Ok(engine) => engine,
+        Err(_) => {
+            let order = if cross_on_mac {
+                ["docker", "podman"]
+            } else {
+                ["podman", "docker"]
+            };
+            order
+                .into_iter()
+                .find(|e| Command::new(e).arg("--version").output().is_ok())
+                .context("neither podman nor docker found; set AEGIS_CONTAINER_ENGINE")?
+                .into()
         }
+    };
+    if cross_on_mac && engine == "podman" {
+        eprintln!(
+            "warning: podman on macOS crashes rustc under emulation; \
+             use AEGIS_CONTAINER_ENGINE=docker for {arch}"
+        );
     }
-    bail!("neither podman nor docker found; set AEGIS_CONTAINER_ENGINE")
+    Ok(engine)
 }
 
 fn root() -> PathBuf {
