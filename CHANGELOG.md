@@ -25,12 +25,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Nothing acts on the score yet.
 - aegisd now runs as a daemon. Every probe event is scored, and a process
   that crosses the throttle line gets an incident on disk and a record in
-  journald, plus JSON lines or OTLP if you've turned those on. It's still
-  audit only, so nothing is stopped. Root can ask how it's doing over
-  `/run/aegis-v2/aegisd.sock`: events seen, events the ring buffer lost,
-  telemetry dropped, incidents open. It's still audit only, so nothing is
-  stopped yet. SIGHUP reloads the config, and a bad file leaves the
-  running one in place.
+  journald, plus JSON lines or OTLP if you've turned those on. Root can
+  ask how it's doing over `/run/aegis-v2/aegisd.sock`: events seen,
+  events the ring buffer lost, telemetry dropped, incidents open. It's
+  still audit only, so nothing is stopped yet. SIGHUP reloads the config,
+  and a bad file leaves the running one in place.
 - systemd and cockpit-tls can create memfds without scoring. On Rocky 10,
   systemd makes one for every unit it starts, and that alone pushed pid 1
   past the quarantine threshold seconds after startup.
