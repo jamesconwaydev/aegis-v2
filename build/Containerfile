@@ -1,0 +1,25 @@
+# Rocky Linux 10 build environment for Aegis. `cargo xtask container`
+# builds it; `cargo xtask build` runs every compile inside it.
+FROM rockylinux/rockylinux:10
+
+RUN dnf -y install gcc clang llvm rpm-build selinux-policy-devel \
+        systemd-rpm-macros git zstd \
+    && dnf clean all
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+# Stable builds and lints userspace; nightly with rust-src builds the eBPF crate
+# (aya-build runs it with -Z build-std=core).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable \
+    && rustup component add rust-src clippy rustfmt \
+    && rustup toolchain install nightly --profile minimal --component rust-src
+
+# A source build of bpf-linker needs a system LLVM matching the one in
+# rustc nightly, which Rocky does not ship. Upstream's static release
+# binary bundles the right LLVM.
+RUN curl -sSfL "https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-$(uname -m)-unknown-linux-musl.tar.zst" \
+        | tar --zstd -xpf - -C /usr/local/cargo/bin \
+    && bpf-linker --version
