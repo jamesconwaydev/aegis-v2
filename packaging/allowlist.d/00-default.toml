@@ -1,0 +1,21 @@
+# Default allowlist, shipped with the package. Your own rules belong in a
+# later file (say 50-site.toml): drop-ins are read in lexical order and their
+# lists add to these.
+
+[allowlist]
+# Parents whose children skip the "exec from a temp directory" score. Paths
+# only, because a process name is whatever the process says it is. They apply
+# only when the binary verifies against the RPM database (or a pin below).
+excluded_parent_processes = [
+    "/usr/bin/ansible-playbook",
+    "/usr/bin/dnf",
+    "/usr/bin/rpm",
+    "/usr/bin/podman",
+    "/usr/bin/cargo",
+    "/usr/bin/pip3",
+]
+
+# Confined SELinux domains to trust. Empty on purpose; for example:
+#   excluded_selinux_domains = ["rpm_t"]
+# Never add unconfined_t: every root shell runs in it.
+excluded_selinux_domains = []

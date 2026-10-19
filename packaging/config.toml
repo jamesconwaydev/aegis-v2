@@ -1,0 +1,48 @@
+# Aegis v2 main configuration: /etc/aegis-v2/config.toml
+# Every value below is the built-in default. Change what you need and
+# leave the rest. Reload with SIGHUP; a bad file keeps the old config.
+# Allowlist rules live in /etc/aegis-v2/allowlist.d/*.toml.
+
+[general]
+# "audit" scores and logs but never acts. "enforce" arrives in v0.2.0.
+mode = "audit"
+# Scores at or above these trigger the action. throttle must be lower.
+score_threshold_throttle = 50
+score_threshold_quarantine = 80
+
+[scoring]
+# Seconds for a score to halve when nothing new happens.
+half_life_secs = 30.0
+
+[scoring.weights]
+tmp_exec = 25.0
+memfd_create = 20.0
+memfd_exec = 60.0
+ptrace_system_daemon = 45.0
+egress_scan = 40.0
+
+# An egress scan is this many distinct targets or failed connects inside
+# the window.
+[scoring.scan]
+window_secs = 2.0
+distinct_targets = 20
+failed_connects = 10
+
+[quarantine]
+overlay_max_size_mb = 512
+auto_expire_seconds = 3600
+
+[incidents]
+dir = "/var/lib/aegis-v2/incidents"
+
+# journald is always on. Optional extra sinks:
+# [telemetry]
+# jsonl = "/var/log/aegis-v2/events.jsonl"
+#
+# [telemetry.otlp]
+# endpoint = "http://localhost:4318"
+
+# [allowlist] is optional here and usually lives in allowlist.d/.
+# Pin a binary that isn't in the RPM database by its SHA-256:
+# [allowlist.pinned]
+# "/opt/tools/runner" = "<64 hex characters>"

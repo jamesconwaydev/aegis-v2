@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// Wired into the daemon in a later task.
+#[allow(dead_code)]
+mod config;
 mod ebpf;
 // Wired into the pipeline in a later task.
 #[allow(dead_code)]
