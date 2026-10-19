@@ -2,7 +2,9 @@
 # Runs a command in the x86_64 build image, with the checkout at /src and
 # the runner's cargo registry and target dir mounted so rust-cache can
 # keep them. The container runs as root, so it hands target/ and the
-# registry back to the runner user before exiting.
+# registry back to the runner user before exiting. The chown runs
+# whether the command passed or failed, and the script exits with the
+# command's status, not chown's, so a failing check still fails the step.
 set -eu
 mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git" target
 exec docker run --rm -v "$PWD:/src" -w /src \

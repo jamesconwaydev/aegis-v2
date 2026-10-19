@@ -16,7 +16,9 @@ permissions:
 
 jobs:
   # Docs-only changes skip the Rust jobs. A job skipped by `if` still
-  # counts as passing for a required check, so those PRs can merge.
+  # counts as passing for a required check, so those PRs can merge. The
+  # Rust jobs fail closed: if this job breaks, its output is empty, not
+  # 'false', and they all run.
   changes:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -43,7 +45,7 @@ jobs:
   # the image and use the runner's rustup with rust-toolchain.toml.
   fmt:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -55,7 +57,7 @@ jobs:
 
   deny:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
@@ -79,7 +81,7 @@ jobs:
   # nightly and bpf-linker, so everything that builds runs in the image.
   clippy:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -97,7 +99,7 @@ jobs:
 
   test:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -117,7 +119,7 @@ jobs:
   # a BPF object.
   ebpf-build:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -142,7 +144,7 @@ jobs:
 
   rpm:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
