@@ -25,7 +25,8 @@ expect = "none"
 [[scenario]]
 name = "memfd-exec"
 run = "/usr/local/bin/aegis-sim memfd-exec"
-# memfd_create (20) + exec of a memfd (60) = 80 on one process.
+# memfd_create (20) + exec of a memfd (65) = 85 on one process, a
+# margin over 80 that the few ms of decay between the two cannot erase.
 expect = "would_quarantine"
 
 [[scenario]]

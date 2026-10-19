@@ -17,7 +17,7 @@ half_life_secs = 30.0
 [scoring.weights]
 tmp_exec = 25.0
 memfd_create = 20.0
-memfd_exec = 60.0
+memfd_exec = 65.0
 ptrace_system_daemon = 45.0
 egress_scan = 40.0
 

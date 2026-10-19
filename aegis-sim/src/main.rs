@@ -27,7 +27,7 @@ enum Cmd {
     /// the "exec from a temp directory" signal (25).
     TmpDropper,
     /// Copy this binary into an in-memory file and execute that. Exercises
-    /// memfd_create (20) and exec-of-a-memfd (60).
+    /// memfd_create (20) and exec-of-a-memfd (65).
     MemfdExec,
     /// Attach to a system daemon with PTRACE_SEIZE and immediately detach,
     /// without reading or writing its memory. Exercises the

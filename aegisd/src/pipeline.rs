@@ -764,7 +764,7 @@ mod tests {
         let l = p.store().list();
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].verdict, "would_quarantine");
-        assert_eq!((l[0].max_score, l[0].root_tgid), (80.0, 60));
+        assert_eq!((l[0].max_score, l[0].root_tgid), (85.0, 60));
     }
 
     #[test]
@@ -784,7 +784,7 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(
             (l[0].verdict.as_str(), l[0].max_score),
-            ("would_quarantine", 80.0)
+            ("would_quarantine", 85.0)
         );
         // Scored, then forgotten: no state is left behind for the dead key.
         assert!(p.exited.is_empty());

@@ -89,7 +89,7 @@ impl Default for Weights {
         Self {
             tmp_exec: 25.0,
             memfd_create: 20.0,
-            memfd_exec: 60.0,
+            memfd_exec: 65.0,
             ptrace_system_daemon: 45.0,
             egress_scan: 40.0,
         }
@@ -629,7 +629,7 @@ mod tests {
                 w.ptrace_system_daemon,
                 w.egress_scan
             ),
-            (25.0, 20.0, 60.0, 45.0, 40.0)
+            (25.0, 20.0, 65.0, 45.0, 40.0)
         );
         let sc = &c.scoring.scan;
         assert_eq!(
