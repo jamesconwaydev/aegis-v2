@@ -26,6 +26,11 @@ memfd_callers = [
     "/usr/bin/gnome-shell",
     "/usr/bin/runc",
     "/usr/bin/crun",
+    # systemd 255 and later pass each unit's settings to systemd-executor
+    # in a memfd, so pid 1 and every user manager create one per start.
+    "/usr/lib/systemd/systemd",
+    # Creates memfds as it serves; Rocky 10 cloud images ship it enabled.
+    "/usr/libexec/cockpit-tls",
 ]
 
 # Debuggers that may attach to a system daemon without scoring.

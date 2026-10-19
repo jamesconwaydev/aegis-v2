@@ -913,7 +913,9 @@ mod tests {
                 "/usr/bin/pipewire",
                 "/usr/bin/gnome-shell",
                 "/usr/bin/runc",
-                "/usr/bin/crun"
+                "/usr/bin/crun",
+                "/usr/lib/systemd/systemd",
+                "/usr/libexec/cockpit-tls"
             ]
         );
         assert_eq!(
