@@ -1,0 +1,19 @@
+[package]
+name = "aegis-ebpf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-2.0-only"
+repository.workspace = true
+
+[dependencies]
+aegis-common = { path = "../aegis-common" }
+
+aya-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "aegis"
+path = "src/main.rs"
