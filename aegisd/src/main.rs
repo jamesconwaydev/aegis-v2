@@ -12,6 +12,8 @@ mod verify;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,11 +27,18 @@ use serde_json::{json, Value};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
-use crate::config::ConfigHandle;
+use crate::config::{Config, ConfigHandle};
 use crate::incident::{IncidentId, IncidentStore};
-use crate::pipeline::Pipeline;
+use crate::pipeline::{Incidents, Pipeline};
 use crate::telemetry::{mode_str, Sinks};
 use crate::verify::{Rpm, Verification, Verifier};
+
+/// Incident writes queued to the writer thread at once.
+const INCIDENT_QUEUE: usize = 256;
+/// How often the loop flushes expired deferred signals.
+const TICK: Duration = Duration::from_millis(500);
+/// Every this many ticks, sweep the process table (so ~60 s).
+const SWEEP_TICKS: u64 = 120;
 
 /// sysexits.h EX_CONFIG.
 const EX_CONFIG: u8 = 78;
@@ -148,16 +157,65 @@ impl Verifying {
             let _ = done.send((path, r));
         });
     }
+
+    /// Verifies every allowlisted path in the background so its verdict
+    /// is a warm cache hit by the time a process execs it. Without this,
+    /// the first container start after boot (or after a package update)
+    /// races its own verdict and scores its memfd as unverified.
+    fn warm(&self, cfg: &Config) {
+        let a = &cfg.allowlist;
+        let mut paths: Vec<PathBuf> = [
+            &a.excluded_parent_processes,
+            &a.memfd_callers,
+            &a.ptrace_tracers,
+            &a.scan_binaries,
+        ]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .chain(a.pinned.iter().map(|(p, _)| p.clone()))
+        .collect();
+        paths.sort();
+        paths.dedup();
+        for p in paths {
+            self.spawn(p);
+        }
+    }
 }
 
 async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     let started = Instant::now();
     let c = cfg.current();
-    let incidents = IncidentStore::open(&c.incidents.dir)
-        .with_context(|| format!("opening incident store {}", c.incidents.dir.display()))?;
+    let store = Arc::new(
+        IncidentStore::open(&c.incidents.dir)
+            .with_context(|| format!("opening incident store {}", c.incidents.dir.display()))?,
+    );
+    // Incident writes fsync, so they go to a thread: the event loop
+    // never blocks on the disk, and a decision is dropped (and counted)
+    // only if the writer falls far enough behind to fill the queue.
+    let errors = Arc::new(AtomicU64::new(0));
+    let (inc_tx, inc_rx) = sync_channel::<pipeline::RecordJob>(INCIDENT_QUEUE);
+    let writer = {
+        let (store, errors) = (store.clone(), errors.clone());
+        std::thread::spawn(move || {
+            while let Ok((d, tree, mode)) = inc_rx.recv() {
+                if let Err(e) = store.record(&d, &tree, mode) {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "aegisd: recording incident for tgid {} failed: {e:#}",
+                        d.key.tgid
+                    );
+                }
+            }
+        })
+    };
     let mut pipe = Pipeline::new(
         &c,
-        incidents,
+        Incidents {
+            store: store.clone(),
+            tx: Some(inc_tx),
+            errors,
+        },
         Sinks::new(&c.telemetry),
         Box::new(scoring::ProcDaemons),
         pipeline::resolve_exe,
@@ -174,7 +232,8 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     let mut int = signal(SignalKind::interrupt())?;
 
     // Socket first: a second aegisd stops here, before loading probes.
-    let listener = ipc::bind(&cli.socket)?;
+    // The lock is held for the daemon's life; dropping it frees the path.
+    let (listener, _lock) = ipc::bind(&cli.socket)?;
     let (handle, mut events) = match ebpf::start(&ebpf::Config {
         channel_capacity: 4096,
     }) {
@@ -186,6 +245,7 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     };
     let (call_tx, mut calls) = mpsc::channel::<ipc::Call>(16);
     let server = tokio::spawn(ipc::serve(listener, call_tx, 0));
+    verifying.warm(&c);
     sd_notify("READY=1");
     eprintln!(
         "aegisd {} running: mode {}, {} probes, socket {}",
@@ -196,6 +256,8 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     );
     drop(c);
 
+    let mut ticker = tokio::time::interval(TICK);
+    let mut ticks: u64 = 0;
     loop {
         tokio::select! {
             ev = events.recv() => {
@@ -209,9 +271,24 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                 }
             }
             Some((path, v)) = done.recv() => pipe.verified(&path, v),
-            Some((req, reply)) = calls.recv() => {
-                let r = answer(req, &pipe, &handle, &cfg, started);
-                let _ = reply.send(r);
+            Some((req, reply)) = calls.recv() => match req {
+                // Disk reads: answer off the loop.
+                Request::IncidentShow { .. } | Request::IncidentTimeline { .. } => {
+                    let store = store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = reply.send(answer_disk(req, &store));
+                    });
+                }
+                _ => {
+                    let _ = reply.send(answer(req, &pipe, &handle, &cfg, started));
+                }
+            },
+            _ = ticker.tick() => {
+                pipe.flush_expired(Instant::now());
+                ticks += 1;
+                if ticks.is_multiple_of(SWEEP_TICKS) {
+                    pipe.sweep();
+                }
             }
             _ = hup.recv() => {
                 let old = cfg.current();
@@ -227,6 +304,11 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                         // flight still lands with its old-pin verdict.
                         verifying.verifier = Arc::new(Verifier::new(Rpm));
                         verifying.pinned = Arc::new(c.allowlist.pinned.clone());
+                        verifying.warm(&c);
+                        pipe.reverify_pinned();
+                        for p in pipe.to_verify.drain(..) {
+                            verifying.spawn(p);
+                        }
                         if c.telemetry != old.telemetry || c.incidents != old.incidents {
                             eprintln!(
                                 "aegisd: telemetry and incident settings take effect at restart"
@@ -247,6 +329,9 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     server.abort();
     // Detaches every probe.
     drop(handle);
+    // Closes the writer's channel so it drains and exits.
+    drop(pipe);
+    let _ = writer.join();
     let _ = std::fs::remove_file(&cli.socket);
     Ok(())
 }
@@ -258,7 +343,6 @@ fn answer(
     cfg: &ConfigHandle,
     started: Instant,
 ) -> Response {
-    let missing = || Response::Error("no such incident".into());
     match req {
         Request::Status => Response::Status {
             version: env!("CARGO_PKG_VERSION").into(),
@@ -267,20 +351,31 @@ fn answer(
             events_total: pipe.events_total,
             dropped_events: probes.dropped_events(),
             probes: probes.probes().to_vec(),
-            incidents_open: pipe.incidents.open_count() as u64,
-            incident_errors: pipe.incident_errors,
+            incidents_open: pipe.store().open_count() as u64,
+            incident_errors: pipe.incident_errors(),
+            incident_dropped: pipe.incident_dropped,
+            verify_skipped: pipe.verify_skipped,
+            deferred_overflow: pipe.deferred_overflow,
             telemetry_dropped: pipe.sinks.dropped(),
         },
-        Request::IncidentsList => Response::Incidents(pipe.incidents.list()),
-        Request::IncidentShow { id } => pipe
-            .incidents
+        Request::IncidentsList => Response::Incidents(pipe.store().list()),
+        // Handled off the loop in `answer_disk`.
+        _ => Response::Error("internal: wrong handler".into()),
+    }
+}
+
+/// The incident requests that read from disk.
+fn answer_disk(req: Request, store: &IncidentStore) -> Response {
+    let missing = || Response::Error("no such incident".into());
+    match req {
+        Request::IncidentShow { id } => store
             .get(&IncidentId(id))
             .and_then(|i| serde_json::to_value(i).ok())
             .map_or_else(missing, Response::Incident),
-        Request::IncidentTimeline { id } => pipe
-            .incidents
+        Request::IncidentTimeline { id } => store
             .timeline(&IncidentId(id))
             .map_or_else(missing, Response::Timeline),
+        _ => Response::Error("internal: wrong handler".into()),
     }
 }
 

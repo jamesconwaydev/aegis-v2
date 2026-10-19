@@ -11,6 +11,7 @@ aegis-common = { path = "../aegis-common", features = ["user"] }
 aegis-proto = { path = "../aegis-proto" }
 
 anyhow = { workspace = true, features = ["std"] }
+libc = "0.2"
 aya = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

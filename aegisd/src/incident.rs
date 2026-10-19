@@ -403,6 +403,14 @@ impl IncidentStore {
             .collect()
     }
 
+    /// The incident this process already belongs to, if any. A cheap
+    /// lookup so telemetry on the event loop can name the incident the
+    /// writer thread is recording.
+    pub fn incident_for(&self, k: &ProcKey) -> Option<String> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.index.get(k).cloned()
+    }
+
     /// Every incident in memory is open: there is no close yet.
     pub fn open_count(&self) -> usize {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());

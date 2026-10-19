@@ -74,6 +74,32 @@ impl ProcTable {
         }
     }
 
+    /// Every process whose exe currently verifies as `Pinned`. After a
+    /// reload the pins may differ, so these need re-checking.
+    pub fn pinned_keys(&self) -> Vec<ProcKey> {
+        self.procs
+            .values()
+            .filter(|p| p.verification == Verification::Pinned)
+            .map(|p| p.key)
+            .collect()
+    }
+
+    /// Drops processes the kernel has reaped that we missed the exit for
+    /// (a dropped Exit event), and returns their keys. A process is gone
+    /// when /proc no longer shows it, or shows a different start time.
+    pub fn sweep(&mut self) -> Vec<ProcKey> {
+        let dead: Vec<ProcKey> = self
+            .procs
+            .keys()
+            .copied()
+            .filter(|k| !crate::pipeline::proc_start_matches(k.tgid, k.start_time_ns))
+            .collect();
+        for k in &dead {
+            self.procs.remove(k);
+        }
+        dead
+    }
+
     /// Ancestors of `k`, nearest first, not including `k`. Stops at the
     /// first parent that is no longer in the table.
     pub fn parent_chain(&self, k: &ProcKey) -> Vec<&ProcInfo> {
@@ -149,7 +175,10 @@ impl ProcTable {
         if self.procs.contains_key(&key) {
             return false;
         }
-        let live = ev.kind != EventKind::Exec as u32;
+        // Read /proc only for a late-found live process, and only once
+        // its start time confirms the pid hasn't been reused since.
+        let live = ev.kind != EventKind::Exec as u32
+            && crate::pipeline::proc_start_matches(ev.tgid, ev.start_time_ns);
         let parent = (ev.ppid != 0)
             .then(|| self.by_tgid(ev.ppid).map(|p| p.key))
             .flatten();
@@ -158,7 +187,6 @@ impl ProcTable {
             ProcInfo {
                 key,
                 parent,
-                // Same pid-reuse limit as `selinux_domain`.
                 exe: live
                     .then(|| std::fs::read_link(format!("/proc/{}/exe", ev.tgid)).ok())
                     .flatten(),
