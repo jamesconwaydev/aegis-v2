@@ -6,55 +6,64 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
+## [0.1.0] - 2026-10-19
 
-- Relicensed: userspace code is `MIT OR Apache-2.0`, and the future
-  `aegis-ebpf` crate is `GPL-2.0-only`.
+The first release, and it watches without touching. Install it, run it in
+audit mode for a few days, and read what it would have done. Nothing on
+the host is stopped, moved or rewritten yet; that starts in v0.2.0.
 
 ### Added
 
-- Cargo workspace (`aegis-common`, `aegis-ebpf`, `aegisd`, `aegisctl`) and
-  a Rocky Linux 10 build container driven by `cargo xtask build`.
-- eBPF probes for exec, fork, exit, ptrace attach, memfd_create and
-  outbound TCP connects, streamed to aegisd over a ring buffer. A hidden
-  `aegisd --dump-events` flag prints them as JSON lines.
-- A risk score for every process, halving every 30 seconds of quiet. A
-  run from a temp directory, a memfd, a ptrace attach to a system daemon
-  or a burst of outbound connects each adds to it. When dnf, gdb or nmap
-  does what they're for, and the binary verifies, it adds nothing.
-  Nothing acts on the score yet.
-- aegisd now runs as a daemon. Every probe event is scored, and a process
-  that crosses the throttle line gets an incident on disk and a record in
-  journald, plus JSON lines or OTLP if you've turned those on. Root can
-  ask how it's doing over `/run/aegis-v2/aegisd.sock`: events seen,
-  events the ring buffer lost, telemetry dropped, incidents open. It's
-  still audit only, so nothing is stopped yet. SIGHUP reloads the config,
-  and a bad file leaves the running one in place.
-- systemd and cockpit-tls can create memfds without scoring. On Rocky 10,
-  systemd makes one for every unit it starts, and that alone pushed pid 1
-  past the quarantine threshold seconds after startup.
-- RPMs. `cargo xtask rpm` builds `aegis-v2` and a noarch
-  `aegis-v2-selinux`, and `dnf install ./*.rpm` gives you a systemd unit
-  and a daemon confined to its own SELinux domain, `aegisd_t`. It runs in
-  enforcing mode without a single denial in the audit log. The unit
-  keeps five capabilities out of root's forty-one and sees the filesystem
-  read-only, apart from its state, socket and log directories.
-- A process can't borrow a trusted binary's verdict any more by running a
-  lookalike under the same name. Before this, a chroot with its own
-  `/usr/bin/python3` got the real one's `rpm_owned`. aegisd now takes the
-  inode the kernel actually executed and verifies the host's file only if
-  it's that same inode.
-- OTLP export now needs one more step on an SELinux host:
-  `setsebool -P aegisd_can_network_connect 1`. Until you run it, aegisd
-  can't open a socket to anything.
-- CI on every pull request: formatting, clippy, tests, a licence and
-  advisory audit, the eBPF build, an x86_64 RPM and a docs lint. A `v*`
-  tag publishes x86_64 and aarch64 RPMs as a GitHub release.
-- The RPM ships the licence text of every crate compiled into it, and
-  its `License:` tag now names all of them.
-- A README with an animated header, and a full set of docs under
-  `docs/`: installation, preflight, configuration, scoring, incidents,
-  telemetry, `aegisctl`, SELinux, the threat model, troubleshooting, an
-  FAQ, releasing and the roadmap.
-- Contributor scaffolding: issue forms, pull request template, security
-  policy, code of conduct and contributing guide.
+- eBPF probes for every committed exec, fork and exit, successful ptrace
+  attaches, memfd_create and outbound TCP connects. The exec probe reports
+  the file the kernel actually ran, so a script in `/tmp` shows up as the
+  script, not as `/bin/sh`, and a memfd or tmpfs binary is flagged however
+  it was reached.
+- A risk score for every process that halves after 30 seconds of quiet.
+  Running from a temp directory adds 25, creating a memfd 20, running one
+  65, attaching to a system daemon 45, and a burst of outbound connects 40.
+  Repeats of the same kind don't stack. Cross 50 and you get a
+  `would_throttle` incident; cross 80 and it's `would_quarantine`.
+- Incidents that follow the attack, not the PID. Once one process crosses
+  the line, its children join the same incident, and the incident is
+  judged on everything they did between them.
+- Allowlists that can't be satisfied by a name. dnf, gdb, nmap, runc and
+  friends are forgiven only when the binary is owned by an installed
+  package, matches the package's SHA-256, and is the same inode the kernel
+  executed. A process loaded with `LD_PRELOAD`, `LD_AUDIT` or
+  `LD_LIBRARY_PATH`, or one that has been ptrace-attached, gets no
+  forgiveness at all.
+- Incidents on disk under `/var/lib/aegis-v2/incidents`, written
+  atomically, with a timeline of each decision and every process involved.
+- Telemetry to journald, a JSON-lines file and OTLP logs over http or
+  https with auth headers. A slow collector costs you records, never
+  detection.
+- `aegisctl status`, `preflight` and `incidents list | show | timeline`,
+  all with `--json`. Text pulled from an incident is escaped before it
+  reaches your terminal.
+- RPMs for x86_64 and aarch64: a hardened systemd unit with five
+  capabilities, and an SELinux module that confines aegisd to its own
+  `aegisd_t` domain. It runs in enforcing mode with no denials across the
+  end-to-end suite. OTLP needs `setsebool -P aegisd_can_network_connect 1`.
+- `cargo xtask e2e`, which installs the RPMs on a disposable test host and
+  runs twelve attack and everyday-admin scenarios, including a container
+  start and an ssh login that must stay quiet.
+- CI on every pull request, a licence and advisory audit, and a tag-driven
+  release that builds both architectures and publishes checksums.
+- A README and a full set of docs, including a threat model that says
+  plainly what v0.1.0 can and can't see.
+
+### Known limits
+
+- Audit mode only. `mode = "enforce"` is refused at startup.
+- The injection checks are best effort: a library can scrub its own
+  environment, and a tracer that attaches before exec isn't seen. Capture
+  in the kernel is planned for v0.2.0.
+- UDP, and scans spread one connection per process, aren't detected.
+- Binaries on btrfs subvolumes, overlay roots and inside containers stay
+  unverified, so their allowlist entries don't apply.
+
+The [threat model](docs/threat-model.md) has the full list.
+
+[Unreleased]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jamesconwaydev/aegis-v2/releases/tag/v0.1.0
