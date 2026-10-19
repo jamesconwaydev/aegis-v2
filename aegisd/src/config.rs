@@ -197,7 +197,18 @@ pub struct Allowlist {
     /// Verified executables whose children are not scored for tmp exec.
     #[serde(deserialize_with = "abs_paths")]
     pub excluded_parent_processes: Vec<PathBuf>,
+    /// Confined domains whose processes skip the tmp exec and
+    /// memfd_create scores. unconfined_t is ignored here.
     pub excluded_selinux_domains: Vec<String>,
+    /// Verified executables allowed to call memfd_create.
+    #[serde(deserialize_with = "abs_paths")]
+    pub memfd_callers: Vec<PathBuf>,
+    /// Verified debuggers allowed to attach to system daemons.
+    #[serde(deserialize_with = "abs_paths")]
+    pub ptrace_tracers: Vec<PathBuf>,
+    /// Verified scanners, forgiven when run by root from a terminal.
+    #[serde(deserialize_with = "abs_paths")]
+    pub scan_binaries: Vec<PathBuf>,
     /// Path and SHA-256, as `Verifier::verify` takes them. When files
     /// disagree, the last one read wins, and drop-ins are read after the
     /// main file, so a drop-in can re-pin a path the main file pinned.
@@ -436,6 +447,9 @@ impl Config {
                 .extend(d.allowlist.excluded_parent_processes);
             a.excluded_selinux_domains
                 .extend(d.allowlist.excluded_selinux_domains);
+            a.memfd_callers.extend(d.allowlist.memfd_callers);
+            a.ptrace_tracers.extend(d.allowlist.ptrace_tracers);
+            a.scan_binaries.extend(d.allowlist.scan_binaries);
             for (p, h) in d.allowlist.pinned {
                 a.pinned.retain(|(q, _)| *q != p);
                 a.pinned.push((p, h));
@@ -801,5 +815,64 @@ mod tests {
             ]
         );
         assert!(c.allowlist.excluded_selinux_domains.is_empty());
+        let paths = |v: &[PathBuf]| {
+            v.iter()
+                .map(|p| p.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(&c.allowlist.memfd_callers),
+            [
+                "/usr/bin/podman",
+                "/usr/bin/pipewire",
+                "/usr/bin/gnome-shell"
+            ]
+        );
+        assert_eq!(
+            paths(&c.allowlist.ptrace_tracers),
+            ["/usr/bin/gdb", "/usr/bin/strace", "/usr/bin/perf"]
+        );
+        assert_eq!(paths(&c.allowlist.scan_binaries), ["/usr/bin/nmap"]);
+
+        // Every allowlist key is written down, as for config.toml.
+        let table: toml::Table = include_str!("../../packaging/allowlist.d/00-default.toml")
+            .parse()
+            .unwrap();
+        for key in [
+            "excluded_parent_processes",
+            "excluded_selinux_domains",
+            "memfd_callers",
+            "ptrace_tracers",
+            "scan_binaries",
+        ] {
+            assert!(
+                table["allowlist"].get(key).is_some(),
+                "00-default.toml is missing allowlist.{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn modifier_lists_merge_and_refuse_bare_names() {
+        let t = Dir::new("modlists");
+        t.dropin(
+            "00.toml",
+            "[allowlist]\nmemfd_callers = [\"/a\"]\nptrace_tracers = [\"/b\"]\nscan_binaries = [\"/c\"]\n",
+        );
+        t.dropin("10.toml", "[allowlist]\nmemfd_callers = [\"/d\"]\n");
+        let c = load(&t, "[allowlist]\nscan_binaries = [\"/e\"]\n").unwrap();
+        assert_eq!(
+            c.allowlist.memfd_callers,
+            [PathBuf::from("/a"), PathBuf::from("/d")]
+        );
+        assert_eq!(c.allowlist.ptrace_tracers, [PathBuf::from("/b")]);
+        assert_eq!(
+            c.allowlist.scan_binaries,
+            [PathBuf::from("/e"), PathBuf::from("/c")]
+        );
+        for k in ["memfd_callers", "ptrace_tracers", "scan_binaries"] {
+            let e = load(&t, &format!("[allowlist]\n{k} = [\"gdb\"]\n")).unwrap_err();
+            assert!(e.message.contains("absolute path"), "{e}");
+        }
     }
 }
