@@ -40,6 +40,11 @@ fn comm_str(c: &[u8; 16]) -> String {
 }
 
 /// Best effort: the process may already be gone, or SELinux may be off.
+// Known limit: `tgid` may have been reused since the event, and we cannot
+// check. Our start time is CLOCK_MONOTONIC ns; /proc/<pid>/stat field 22
+// is in clock ticks since boot (CLOCK_BOOTTIME), and the two clocks differ
+// by the time spent suspended, so they cannot be compared reliably. The
+// read follows the Exec event immediately, which keeps the window small.
 fn selinux_domain(tgid: u32) -> Option<String> {
     let s = std::fs::read(format!("/proc/{tgid}/attr/current")).ok()?;
     let s = String::from_utf8_lossy(&s);
@@ -97,6 +102,8 @@ impl ProcTable {
                 p.exe = Some(PathBuf::from(OsStr::from_bytes(&ev.path[..n])));
                 p.comm = comm_str(&ev.comm);
                 p.has_tty = ev.flags & HAS_TTY != 0;
+                p.uid = ev.uid;
+                p.cgroup_id = ev.cgroup_id;
                 p.selinux_domain = selinux_domain(ev.tgid);
                 // The old image's verdict no longer applies.
                 p.verification = Verification::Unverified;
