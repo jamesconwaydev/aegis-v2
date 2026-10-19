@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aegis_common::{Event, EventKind, EXEC_FROM_TMP, EXEC_MEMFD, PATH_TRUNCATED};
 
@@ -122,9 +122,40 @@ pub fn signals_for(ev: &Event, table: &ProcTable, daemon: &dyn DaemonClassifier)
 // ponytail: newest 32 kept per process; raise it if incidents need more.
 const MAX_EVIDENCE: usize = 32;
 
-struct Entry {
+/// A signal counts by kind, not by instance: ten memfd_creates from one
+/// process are one kind. Repeats keep the kind topped up, they don't
+/// stack (ruling: per-(process, kind) contribution = max(decayed, base)).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SignalKind {
+    TmpExec,
+    MemfdCreate,
+    MemfdExec,
+    Ptrace,
+    EgressScan,
+}
+
+impl SignalKind {
+    fn of(s: &Signal) -> Self {
+        match s {
+            Signal::TmpExec => Self::TmpExec,
+            Signal::MemfdCreate => Self::MemfdCreate,
+            Signal::MemfdExec => Self::MemfdExec,
+            Signal::PtraceSystemDaemon { .. } => Self::Ptrace,
+            Signal::EgressScan { .. } => Self::EgressScan,
+        }
+    }
+}
+
+/// One kind's live contribution and when it was last topped up.
+#[derive(Clone)]
+struct Component {
     score: f64,
     at_ns: u64,
+}
+
+#[derive(Clone, Default)]
+struct Entry {
+    components: HashMap<SignalKind, Component>,
     evidence: Vec<Evidence>,
 }
 
@@ -169,19 +200,11 @@ impl Scorer {
         self.allow = cfg.allowlist.clone();
     }
 
-    fn decayed(&self, e: &Entry, now_ns: u64) -> f64 {
-        e.score * 0.5f64.powf(now_ns.saturating_sub(e.at_ns) as f64 / self.half_life_ns)
-    }
-
-    /// The child starts from the parent's score as it stands now.
-    pub fn on_fork(&mut self, parent: &ProcKey, child: &ProcKey, now_ns: u64) {
-        if let Some(p) = self.scores.get(parent) {
-            let e = Entry {
-                score: self.decayed(p, now_ns),
-                at_ns: now_ns,
-                evidence: p.evidence.clone(),
-            };
-            self.scores.insert(*child, e);
+    /// The child inherits the parent's kinds as they stand, each still
+    /// decaying from when it was last topped up.
+    pub fn on_fork(&mut self, parent: &ProcKey, child: &ProcKey, _now_ns: u64) {
+        if let Some(p) = self.scores.get(parent).cloned() {
+            self.scores.insert(*child, p);
         }
     }
 
@@ -261,22 +284,42 @@ impl Scorer {
     /// For an Exec event, call this before `ProcTable::apply` and pass the
     /// pre-exec `ProcInfo`: allowlists judge the binary that did the exec,
     /// not the one it started.
+    /// `target` is the exec'd file, recorded in the evidence for the
+    /// exec signals so the reader sees what ran, not just the binary that
+    /// launched it (which `proc` is).
     pub fn observe(
         &mut self,
         proc: &ProcInfo,
         ancestors: &[&ProcInfo],
         sig: Signal,
+        target: Option<&Path>,
         now_ns: u64,
     ) -> Decision {
-        let (base, modifier, reason) = self.weigh(proc, ancestors, &sig);
-        let mut e = self.scores.remove(&proc.key).unwrap_or(Entry {
-            score: 0.0,
-            at_ns: now_ns,
-            evidence: Vec::new(),
-        });
+        let (base, modifier, mut reason) = self.weigh(proc, ancestors, &sig);
+        if let (Some(t), Signal::TmpExec | Signal::MemfdExec) = (target, &sig) {
+            reason = format!("{reason} ({})", t.display());
+        }
         // A modifier cancels this event's contribution, never more.
-        e.score = self.decayed(&e, now_ns) + (base + modifier).max(0.0);
-        e.at_ns = e.at_ns.max(now_ns);
+        let contribution = (base + modifier).max(0.0);
+        let kind = SignalKind::of(&sig);
+        let hl = self.half_life_ns;
+        let decay =
+            |score: f64, at: u64| score * 0.5f64.powf(now_ns.saturating_sub(at) as f64 / hl);
+
+        let e = self.scores.entry(proc.key).or_default();
+        // Topping a kind up never lowers it: max of what it has decayed to
+        // and this event's contribution, so repeats don't stack.
+        let prev = e
+            .components
+            .get(&kind)
+            .map_or(0.0, |c| decay(c.score, c.at_ns));
+        e.components.insert(
+            kind,
+            Component {
+                score: prev.max(contribution),
+                at_ns: now_ns,
+            },
+        );
         if e.evidence.len() == MAX_EVIDENCE {
             e.evidence.remove(0);
         }
@@ -287,21 +330,21 @@ impl Scorer {
             reason,
             ts_ns: now_ns,
         });
-        let tier = if e.score >= self.quarantine {
+        let score = e.components.values().map(|c| decay(c.score, c.at_ns)).sum();
+        let evidence = e.evidence.clone();
+        let tier = if score >= self.quarantine {
             Tier::Quarantine
-        } else if e.score >= self.throttle {
+        } else if score >= self.throttle {
             Tier::Throttle
         } else {
             Tier::Log
         };
-        let d = Decision {
+        Decision {
             key: proc.key,
-            score: e.score,
+            score,
             tier,
-            evidence: e.evidence.clone(),
-        };
-        self.scores.insert(proc.key, e);
-        d
+            evidence,
+        }
     }
 }
 
@@ -465,7 +508,7 @@ mod tests {
 
     #[test]
     fn tmp_exec_unverified_scores_25_log() {
-        let d = Scorer::new(&cfg()).observe(&evil(), &[&bash()], Signal::TmpExec, S);
+        let d = Scorer::new(&cfg()).observe(&evil(), &[&bash()], Signal::TmpExec, None, S);
         assert_eq!((d.score, d.tier), (25.0, Tier::Log));
         assert_eq!(d.evidence.len(), 1);
         assert_eq!(d.evidence[0].base, 25.0);
@@ -475,8 +518,8 @@ mod tests {
     fn tmp_exec_then_ptrace_daemon_is_70_throttle() {
         let mut s = Scorer::new(&cfg());
         let (p, b) = (evil(), bash());
-        s.observe(&p, &[&b], Signal::TmpExec, S);
-        let d = s.observe(&p, &[&b], ptrace_daemon(), S);
+        s.observe(&p, &[&b], Signal::TmpExec, None, S);
+        let d = s.observe(&p, &[&b], ptrace_daemon(), None, S);
         assert_eq!((d.score, d.tier), (70.0, Tier::Throttle));
     }
 
@@ -484,9 +527,9 @@ mod tests {
     fn tmp_exec_ptrace_scan_is_110_quarantine() {
         let mut s = Scorer::new(&cfg());
         let (p, b) = (evil(), bash());
-        s.observe(&p, &[&b], Signal::TmpExec, S);
-        s.observe(&p, &[&b], ptrace_daemon(), S);
-        let d = s.observe(&p, &[&b], scan(), S);
+        s.observe(&p, &[&b], Signal::TmpExec, None, S);
+        s.observe(&p, &[&b], ptrace_daemon(), None, S);
+        let d = s.observe(&p, &[&b], scan(), None, S);
         assert_eq!((d.score, d.tier), (110.0, Tier::Quarantine));
         assert_eq!(d.evidence.len(), 3);
     }
@@ -495,8 +538,8 @@ mod tests {
     fn memfd_create_then_memfd_exec_is_80_quarantine() {
         let mut s = Scorer::new(&cfg());
         let (p, b) = (evil(), bash());
-        s.observe(&p, &[&b], Signal::MemfdCreate, S);
-        let d = s.observe(&p, &[&b], Signal::MemfdExec, S);
+        s.observe(&p, &[&b], Signal::MemfdCreate, None, S);
+        let d = s.observe(&p, &[&b], Signal::MemfdExec, None, S);
         assert_eq!((d.score, d.tier), (80.0, Tier::Quarantine));
     }
 
@@ -507,15 +550,15 @@ mod tests {
         c.scoring.weights.egress_scan = 0.0;
         let mut s = Scorer::new(&c);
         let (p, b) = (evil(), bash());
-        s.observe(&p, &[&b], Signal::TmpExec, S);
-        let d = s.observe(&p, &[&b], scan(), 31 * S);
+        s.observe(&p, &[&b], Signal::TmpExec, None, S);
+        let d = s.observe(&p, &[&b], scan(), None, 31 * S);
         assert!((d.score - 12.5).abs() < 0.01, "{}", d.score);
     }
 
     #[test]
     fn tmp_exec_by_verified_dnf_parent_scores_0() {
         let dnf = proc(50, "/usr/bin/dnf", "dnf", rpm("dnf"));
-        let d = Scorer::new(&cfg()).observe(&evil(), &[&dnf], Signal::TmpExec, S);
+        let d = Scorer::new(&cfg()).observe(&evil(), &[&dnf], Signal::TmpExec, None, S);
         assert_eq!(d.score, 0.0);
         assert_eq!(d.evidence[0].modifier, -25.0);
     }
@@ -523,11 +566,11 @@ mod tests {
     #[test]
     fn comm_dnf_unverified_parent_gets_no_modifier() {
         let fake = proc(50, "/usr/bin/dnf", "dnf", Verification::Unverified);
-        let d = Scorer::new(&cfg()).observe(&evil(), &[&fake], Signal::TmpExec, S);
+        let d = Scorer::new(&cfg()).observe(&evil(), &[&fake], Signal::TmpExec, None, S);
         assert_eq!(d.score, 25.0);
         // Nor does a verified binary at another path calling itself dnf.
         let other = proc(50, "/tmp/dnf", "dnf", rpm("dnf"));
-        let d = Scorer::new(&cfg()).observe(&evil(), &[&other], Signal::TmpExec, S);
+        let d = Scorer::new(&cfg()).observe(&evil(), &[&other], Signal::TmpExec, None, S);
         assert_eq!(d.score, 25.0);
     }
 
@@ -537,28 +580,28 @@ mod tests {
         c.allowlist.excluded_selinux_domains = vec!["unconfined_t".into(), "rpm_t".into()];
         let mut p = evil();
         p.selinux_domain = Some("unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023".into());
-        let d = Scorer::new(&c).observe(&p, &[&bash()], Signal::TmpExec, S);
+        let d = Scorer::new(&c).observe(&p, &[&bash()], Signal::TmpExec, None, S);
         assert_eq!(d.score, 25.0);
         // A listed confined domain does get the modifier.
         p.selinux_domain = Some("system_u:system_r:rpm_t:s0".into());
-        let d = Scorer::new(&c).observe(&p, &[&bash()], Signal::MemfdCreate, S);
+        let d = Scorer::new(&c).observe(&p, &[&bash()], Signal::MemfdCreate, None, S);
         assert_eq!(d.score, 0.0);
     }
 
     #[test]
     fn memfd_create_by_verified_java_scores_0() {
         let java = proc(70, JAVA, "java", rpm("java-21-openjdk-headless"));
-        let d = Scorer::new(&cfg()).observe(&java, &[&bash()], Signal::MemfdCreate, S);
+        let d = Scorer::new(&cfg()).observe(&java, &[&bash()], Signal::MemfdCreate, None, S);
         assert_eq!(d.score, 0.0);
         let java = proc(70, JAVA, "java", Verification::Modified);
-        let d = Scorer::new(&cfg()).observe(&java, &[&bash()], Signal::MemfdCreate, S);
+        let d = Scorer::new(&cfg()).observe(&java, &[&bash()], Signal::MemfdCreate, None, S);
         assert_eq!(d.score, 20.0);
     }
 
     #[test]
     fn verified_gdb_ptrace_of_daemon_scores_0() {
         let gdb = proc(80, "/usr/bin/gdb", "gdb", rpm("gdb"));
-        let d = Scorer::new(&cfg()).observe(&gdb, &[&bash()], ptrace_daemon(), S);
+        let d = Scorer::new(&cfg()).observe(&gdb, &[&bash()], ptrace_daemon(), None, S);
         assert_eq!(d.score, 0.0);
     }
 
@@ -571,17 +614,17 @@ mod tests {
 
     #[test]
     fn nmap_verified_root_tty_scan_scores_0() {
-        let d = Scorer::new(&cfg()).observe(&nmap(true), &[&bash()], scan(), S);
+        let d = Scorer::new(&cfg()).observe(&nmap(true), &[&bash()], scan(), None, S);
         assert_eq!(d.score, 0.0);
     }
 
     #[test]
     fn nmap_verified_root_no_tty_scan_scores_40() {
-        let d = Scorer::new(&cfg()).observe(&nmap(false), &[&bash()], scan(), S);
+        let d = Scorer::new(&cfg()).observe(&nmap(false), &[&bash()], scan(), None, S);
         assert_eq!(d.score, 40.0);
         let mut p = nmap(true);
         p.uid = 1000;
-        let d = Scorer::new(&cfg()).observe(&p, &[&bash()], scan(), S);
+        let d = Scorer::new(&cfg()).observe(&p, &[&bash()], scan(), None, S);
         assert_eq!(d.score, 40.0);
     }
 
@@ -589,12 +632,12 @@ mod tests {
     fn child_inherits_parent_score_at_fork() {
         let mut s = Scorer::new(&cfg());
         let p = evil();
-        s.observe(&p, &[&bash()], Signal::TmpExec, S);
+        s.observe(&p, &[&bash()], Signal::TmpExec, None, S);
         let ck = key(101, 5);
         s.on_fork(&p.key, &ck, 31 * S);
         let mut child = evil();
         child.key = ck;
-        let d = s.observe(&child, &[&p], ptrace_daemon(), 31 * S);
+        let d = s.observe(&child, &[&p], ptrace_daemon(), None, 31 * S);
         assert!((d.score - (12.5 + 45.0)).abs() < 0.01, "{}", d.score);
     }
 
@@ -602,13 +645,13 @@ mod tests {
     fn pid_reuse_does_not_inherit_score() {
         let mut s = Scorer::new(&cfg());
         let p = evil();
-        s.observe(&p, &[&bash()], Signal::TmpExec, S);
+        s.observe(&p, &[&bash()], Signal::TmpExec, None, S);
         let mut reused = evil();
         reused.key = key(p.key.tgid, 999);
-        let d = s.observe(&reused, &[&bash()], Signal::MemfdCreate, S);
+        let d = s.observe(&reused, &[&bash()], Signal::MemfdCreate, None, S);
         assert_eq!(d.score, 20.0);
         s.on_exit(&p.key);
-        let d = s.observe(&p, &[&bash()], Signal::MemfdCreate, S);
+        let d = s.observe(&p, &[&bash()], Signal::MemfdCreate, None, S);
         assert_eq!(d.score, 20.0);
     }
 
@@ -684,9 +727,48 @@ mod tests {
         let mut c = cfg();
         c.scoring.weights.tmp_exec = 40.0;
         let dnf = proc(50, "/usr/bin/dnf", "dnf", rpm("dnf"));
-        let d = Scorer::new(&c).observe(&evil(), &[&dnf], Signal::TmpExec, S);
+        let d = Scorer::new(&c).observe(&evil(), &[&dnf], Signal::TmpExec, None, S);
         assert_eq!(d.score, 0.0);
         assert_eq!(d.evidence[0].modifier, -40.0);
+    }
+
+    #[test]
+    fn repeated_same_signal_does_not_stack() {
+        let mut s = Scorer::new(&cfg());
+        let (p, b) = (evil(), bash());
+        assert_eq!(
+            s.observe(&p, &[&b], Signal::MemfdCreate, None, S).score,
+            20.0
+        );
+        // Same kind again, same instant: no change.
+        assert_eq!(
+            s.observe(&p, &[&b], Signal::MemfdCreate, None, S).score,
+            20.0
+        );
+        assert_eq!(
+            s.observe(&p, &[&b], Signal::MemfdCreate, None, S + 1).score,
+            20.0
+        );
+        // A different kind still adds.
+        assert_eq!(s.observe(&p, &[&b], Signal::TmpExec, None, S).score, 45.0);
+        // After the kind decays, a fresh one of it tops it back to base.
+        let mut s = Scorer::new(&cfg());
+        s.observe(&p, &[&b], Signal::MemfdCreate, None, S);
+        // 30 s on it has halved to 10; max(10, 20) = 20.
+        let d = s.observe(&p, &[&b], Signal::MemfdCreate, None, S + 30 * S);
+        assert!((d.score - 20.0).abs() < 0.01, "{}", d.score);
+    }
+
+    #[test]
+    fn exec_target_is_recorded_in_the_evidence() {
+        let d = Scorer::new(&cfg()).observe(
+            &evil(),
+            &[&bash()],
+            Signal::TmpExec,
+            Some(Path::new("/tmp/x")),
+            S,
+        );
+        assert_eq!(d.evidence[0].reason, "exec from a temp directory (/tmp/x)");
     }
 
     #[test]
@@ -696,12 +778,12 @@ mod tests {
         let mut s = Scorer::new(&c);
         // The pre-exec view: runc itself, about to exec its memfd copy.
         let runc = proc(60, "/usr/bin/runc", "runc", rpm("runc"));
-        s.observe(&runc, &[&bash()], Signal::MemfdCreate, S);
-        let d = s.observe(&runc, &[&bash()], Signal::MemfdExec, S);
+        s.observe(&runc, &[&bash()], Signal::MemfdCreate, None, S);
+        let d = s.observe(&runc, &[&bash()], Signal::MemfdExec, None, S);
         assert_eq!((d.score, d.tier), (0.0, Tier::Log));
         // An unverified runc gets nothing.
         let fake = proc(61, "/usr/bin/runc", "runc", Verification::Modified);
-        let d = Scorer::new(&c).observe(&fake, &[&bash()], Signal::MemfdExec, S);
+        let d = Scorer::new(&c).observe(&fake, &[&bash()], Signal::MemfdExec, None, S);
         assert_eq!(d.score, 60.0);
     }
 
@@ -709,12 +791,12 @@ mod tests {
     fn scores_survive_set_config() {
         let mut s = Scorer::new(&cfg());
         let (p, b) = (evil(), bash());
-        s.observe(&p, &[&b], Signal::TmpExec, S);
+        s.observe(&p, &[&b], Signal::TmpExec, None, S);
         let mut c = cfg();
         c.scoring.weights.memfd_create = 30.0;
         c.general.score_threshold_throttle = 40;
         s.set_config(&c);
-        let d = s.observe(&p, &[&b], Signal::MemfdCreate, S);
+        let d = s.observe(&p, &[&b], Signal::MemfdCreate, None, S);
         assert_eq!((d.score, d.tier), (55.0, Tier::Throttle));
 
         let mut det = ScanDetector::new(ScanConfig::default());
