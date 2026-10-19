@@ -203,6 +203,11 @@ impl Scorer {
         self.allow = cfg.allowlist.clone();
     }
 
+    // ponytail: scores are decayed before this `>=`, so signals whose
+    // weights sum exactly to a threshold never reach it (any gap between
+    // them decays the sum just under). Keep canonical bursts clear of the
+    // line, as memfd_exec 65 does, or add an epsilon here if that stops
+    // being enough.
     pub fn tier(&self, score: f64) -> Tier {
         if score >= self.quarantine {
             Tier::Quarantine
