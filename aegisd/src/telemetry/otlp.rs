@@ -91,6 +91,7 @@ impl Otlp {
     }
 
     /// Records lost to a full queue or a failed export.
+    #[cfg(test)]
     pub fn dropped_records(&self) -> u64 {
         self.dropped_queue_full()
             + self.dropped_disconnected()
@@ -103,6 +104,10 @@ impl Otlp {
 
     pub fn dropped_queue_full(&self) -> u64 {
         self.counters.queue_full.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped_export_failed(&self) -> u64 {
+        self.counters.export_failed.load(Ordering::Relaxed)
     }
 }
 

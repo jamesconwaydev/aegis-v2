@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 aegis-common = { path = "../aegis-common", features = ["user"] }
+aegis-proto = { path = "../aegis-proto" }
 
 anyhow = { workspace = true, features = ["std"] }
 aya = { workspace = true }
@@ -17,7 +18,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 toml = { workspace = true }
 ureq = { workspace = true }
-tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "sync"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 
 [build-dependencies]
 anyhow = { workspace = true }

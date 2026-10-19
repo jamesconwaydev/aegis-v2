@@ -21,6 +21,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use aegis_proto::IncidentSummary;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -126,16 +127,6 @@ pub struct Incident {
     /// Set once the evidence cap dropped something.
     #[serde(default)]
     pub evidence_truncated: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct IncidentSummary {
-    pub id: IncidentId,
-    pub created: String,
-    pub updated: String,
-    pub verdict: String,
-    pub max_score: f64,
-    pub root_tgid: u32,
 }
 
 pub fn verdict(t: Tier) -> Option<&'static str> {
@@ -402,7 +393,7 @@ impl IncidentStore {
         g.incidents
             .values()
             .map(|i| IncidentSummary {
-                id: IncidentId(i.id.clone()),
+                id: i.id.clone(),
                 created: i.created.clone(),
                 updated: i.updated.clone(),
                 verdict: i.verdict.clone(),
@@ -410,6 +401,26 @@ impl IncidentStore {
                 root_tgid: i.root.tgid,
             })
             .collect()
+    }
+
+    /// Every incident in memory is open: there is no close yet.
+    pub fn open_count(&self) -> usize {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.incidents.len()
+    }
+
+    /// The incident's timeline, one value per line; None if it has none.
+    /// A line that doesn't parse is skipped.
+    pub fn timeline(&self, id: &IncidentId) -> Option<Vec<serde_json::Value>> {
+        if !valid_id(&id.0) {
+            return None;
+        }
+        let raw = fs::read(self.dir.join(&id.0).join("timeline.jsonl")).ok()?;
+        Some(
+            raw.split(|&b| b == b'\n')
+                .filter_map(|l| serde_json::from_slice(l).ok())
+                .collect(),
+        )
     }
 
     /// Memory first, then disk (incidents older than the load window).

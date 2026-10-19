@@ -50,6 +50,7 @@ impl Journald {
     }
 
     /// A fixed socket that is never reconnected.
+    #[cfg(test)]
     pub fn with_socket(sock: Option<UnixDatagram>) -> Self {
         let sock = sock.filter(|s| s.set_nonblocking(true).is_ok());
         Self {

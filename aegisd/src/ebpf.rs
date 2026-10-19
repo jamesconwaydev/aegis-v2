@@ -10,6 +10,7 @@
 mod btf;
 
 use aegis_common::{Event, KernelOffsets};
+use aegis_proto::ProbeStatus;
 use anyhow::{anyhow, Context as _, Result};
 use aya::{
     maps::{MapData, PerCpuArray, RingBuf},
@@ -34,6 +35,7 @@ pub struct EbpfHandle {
     // Owns the loaded programs; dropping it detaches them.
     _ebpf: Ebpf,
     dropped: PerCpuArray<MapData, u64>,
+    probes: Vec<ProbeStatus>,
 }
 
 impl EbpfHandle {
@@ -43,6 +45,11 @@ impl EbpfHandle {
             .get(&0, 0)
             .map(|per_cpu| per_cpu.iter().sum())
             .unwrap_or(0)
+    }
+
+    /// Every probe; `start` fails unless all of them attach.
+    pub fn probes(&self) -> &[ProbeStatus] {
+        &self.probes
     }
 }
 
@@ -81,18 +88,29 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
         )))
         .context("loading eBPF object")?;
 
+    let mut probes = Vec::new();
+    let mut attached = |name: &str, hook: String| {
+        probes.push(ProbeStatus {
+            name: name.into(),
+            hook,
+        })
+    };
+
     // Records the original file at the first check; emits at commit.
     let check: &mut Lsm = prog(&mut ebpf, "aegis_exec_check")?;
     check.load("bprm_check_security", &kernel_btf)?;
     check.attach()?;
+    attached("aegis_exec_check", "lsm/bprm_check_security".into());
 
     let lsm: &mut Lsm = prog(&mut ebpf, "aegis_exec")?;
     lsm.load("bprm_committed_creds", &kernel_btf)?;
     lsm.attach()?;
+    attached("aegis_exec", "lsm/bprm_committed_creds".into());
 
     let fork: &mut BtfTracePoint = prog(&mut ebpf, "aegis_fork")?;
     fork.load("sched_process_fork", &kernel_btf)?;
     fork.attach()?;
+    attached("aegis_fork", "tp_btf/sched_process_fork".into());
 
     for (name, category, tracepoint) in [
         ("aegis_exit", "sched", "sched_process_exit"),
@@ -104,6 +122,7 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
         tp.load()?;
         tp.attach(category, tracepoint)
             .with_context(|| format!("attaching {category}/{tracepoint}"))?;
+        attached(name, format!("tracepoint/{category}/{tracepoint}"));
     }
 
     let dropped = PerCpuArray::try_from(ebpf.take_map("DROPPED").context("no DROPPED map")?)?;
@@ -151,6 +170,7 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
         EbpfHandle {
             _ebpf: ebpf,
             dropped,
+            probes,
         },
         rx,
     ))

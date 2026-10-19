@@ -66,19 +66,57 @@ pub trait Sink: Send + Sync {
     fn emit(&self, rec: &TelemetryRecord);
 }
 
-/// journald is always on; the others follow the config.
-pub fn build(cfg: &TelemetryConfig) -> Vec<Box<dyn Sink>> {
-    let mut v: Vec<Box<dyn Sink>> = vec![Box::new(journald::Journald::new())];
-    if let Some(p) = &cfg.jsonl {
-        match jsonl::JsonLines::open(p) {
-            Ok(s) => v.push(Box::new(s)),
-            Err(e) => eprintln!("aegisd: telemetry jsonl {}: {e}", p.display()),
+/// The configured sinks. journald is always on; the others follow the
+/// config.
+pub struct Sinks {
+    journald: journald::Journald,
+    jsonl: Option<jsonl::JsonLines>,
+    otlp: Option<otlp::Otlp>,
+}
+
+impl Sinks {
+    pub fn new(cfg: &TelemetryConfig) -> Self {
+        let jsonl = cfg.jsonl.as_ref().and_then(|p| {
+            jsonl::JsonLines::open(p)
+                .inspect_err(|e| eprintln!("aegisd: telemetry jsonl {}: {e}", p.display()))
+                .ok()
+        });
+        Self {
+            journald: journald::Journald::new(),
+            jsonl,
+            otlp: cfg.otlp.as_ref().map(otlp::Otlp::new),
         }
     }
-    if let Some(o) = &cfg.otlp {
-        v.push(Box::new(otlp::Otlp::new(o)));
+
+    /// No journal, no extras: for tests.
+    #[cfg(test)]
+    pub fn none() -> Self {
+        Self {
+            journald: journald::Journald::with_socket(None),
+            jsonl: None,
+            otlp: None,
+        }
     }
-    v
+
+    pub fn emit(&self, rec: &TelemetryRecord) {
+        self.journald.emit(rec);
+        if let Some(s) = &self.jsonl {
+            s.emit(rec);
+        }
+        if let Some(s) = &self.otlp {
+            s.emit(rec);
+        }
+    }
+
+    pub fn dropped(&self) -> aegis_proto::TelemetryDropped {
+        let o = self.otlp.as_ref();
+        aegis_proto::TelemetryDropped {
+            journald: self.journald.dropped_records(),
+            otlp_queue_full: o.map_or(0, |o| o.dropped_queue_full()),
+            otlp_export_failed: o.map_or(0, |o| o.dropped_export_failed()),
+            otlp_disconnected: o.map_or(0, |o| o.dropped_disconnected()),
+        }
+    }
 }
 
 pub fn mode_str(m: Mode) -> &'static str {

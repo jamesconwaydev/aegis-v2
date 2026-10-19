@@ -100,7 +100,7 @@ impl ProcTable {
             self.procs.remove(&key);
             return;
         }
-        self.ensure(ev, key);
+        self.ensure(ev);
         match kind {
             Some(EventKind::Exec) => {
                 let n = (ev.path_len as usize).min(ev.path.len());
@@ -133,11 +133,23 @@ impl ProcTable {
         }
     }
 
-    /// Creates the subject's entry if we missed its birth (it predates us).
-    fn ensure(&mut self, ev: &Event, key: ProcKey) {
+    /// Creates the subject's entry if we missed its birth (it predates
+    /// us), and says whether it did. `apply` does this itself; call it
+    /// first only to look at the process before the event is applied.
+    ///
+    /// A late-found process gets its exe and SELinux domain from /proc,
+    /// so pid 1 and other old daemons can match an allowlist once
+    /// verified. Not for an Exec: /proc already shows the new image, and
+    /// this entry is meant to be the old one.
+    pub fn ensure(&mut self, ev: &Event) -> bool {
+        let key = ProcKey {
+            tgid: ev.tgid,
+            start_time_ns: ev.start_time_ns,
+        };
         if self.procs.contains_key(&key) {
-            return;
+            return false;
         }
+        let live = ev.kind != EventKind::Exec as u32;
         let parent = (ev.ppid != 0)
             .then(|| self.by_tgid(ev.ppid).map(|p| p.key))
             .flatten();
@@ -146,15 +158,19 @@ impl ProcTable {
             ProcInfo {
                 key,
                 parent,
-                exe: None,
+                // Same pid-reuse limit as `selinux_domain`.
+                exe: live
+                    .then(|| std::fs::read_link(format!("/proc/{}/exe", ev.tgid)).ok())
+                    .flatten(),
                 comm: comm_str(&ev.comm),
                 uid: ev.uid,
                 has_tty: ev.flags & HAS_TTY != 0,
-                selinux_domain: None,
+                selinux_domain: live.then(|| selinux_domain(ev.tgid)).flatten(),
                 verification: Verification::Unverified,
                 cgroup_id: ev.cgroup_id,
             },
         );
+        true
     }
 }
 
