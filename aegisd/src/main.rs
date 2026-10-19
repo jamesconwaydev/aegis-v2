@@ -3,11 +3,15 @@
 #[allow(dead_code)]
 mod config;
 mod ebpf;
+#[allow(dead_code)]
+mod incident;
 // Wired into the pipeline in a later task.
 #[allow(dead_code)]
 mod proctable;
 #[allow(dead_code)]
 mod scoring;
+#[allow(dead_code)]
+mod telemetry;
 #[allow(dead_code)]
 mod verify;
 
