@@ -107,6 +107,55 @@ podman run --rm -v "$PWD:/src:z" -w /src \
   sh -c 'cargo clippy --all-targets -- -D warnings && cargo test'
 ```
 
+## Running it on aarch64
+
+aegisd only does anything on a kernel with BTF and the BPF LSM switched
+on, and your Mac has neither. For aarch64 there's a Rocky 10 VM under
+[Lima](https://lima-vm.io):
+
+```sh
+brew install lima
+limactl create --name aegis-rocky10 --cpus 2 --memory 4 template:rocky-10
+limactl start aegis-rocky10
+```
+
+Check the BPF LSM is active before you trust a result. `bpf` has to be in
+the list:
+
+```sh
+limactl shell aegis-rocky10 cat /sys/kernel/security/lsm
+```
+
+Then build, copy the binary in, and run it as root:
+
+```sh
+cargo xtask build --release
+limactl copy dist/aarch64/aegisd aegis-rocky10:/tmp/aegisd
+limactl shell aegis-rocky10 sudo /tmp/aegisd --dump-events
+```
+
+`--dump-events` is a hidden debug flag. It prints every probe event as a
+JSON line until you press Ctrl-C, then reports how many the ring buffer
+dropped.
+
+One difference from a real Rocky box: Lima's image boots with SELinux
+permissive, so a policy denial won't show up here. Test anything
+SELinux-sensitive on an enforcing x86_64 host as well.
+
+`limactl stop aegis-rocky10` when you're done; `limactl delete` throws
+it away.
+
+## How the probes find kernel fields
+
+The eBPF crate reads a handful of kernel struct fields, such as
+`task_struct.real_parent` and `linux_binprm.file`. Their offsets move
+between kernel builds and between architectures, and Rust has no CO-RE
+to relocate them. So nothing is baked in: at startup aegisd reads the
+offsets from `/sys/kernel/btf/vmlinux` and patches them into the
+object's `OFFSETS` global before loading it. Adding a field means adding
+it to `KernelOffsets` in `aegis-common` and looking it up in
+`aegisd/src/ebpf.rs`.
+
 ## Caches
 
 Two named volumes per architecture keep rebuilds quick:
