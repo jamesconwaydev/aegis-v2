@@ -30,7 +30,9 @@ dependencies = [
 name = "aegisctl"
 version = "0.1.0"
 dependencies = [
+ "aegis-proto",
  "clap",
+ "serde_json",
 ]
 
 [[package]]

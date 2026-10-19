@@ -8,3 +8,5 @@ repository.workspace = true
 
 [dependencies]
 clap = { workspace = true }
+aegis-proto = { path = "../aegis-proto" }
+serde_json = { workspace = true }
