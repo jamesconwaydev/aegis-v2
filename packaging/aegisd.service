@@ -16,12 +16,13 @@ RestartPreventExitStatus=78
 # Root, holding only what v0.1 uses:
 #   CAP_BPF, CAP_PERFMON  load the probes, open the tracepoints
 #   CAP_SYS_ADMIN         attach the BPF LSM programs
-#   CAP_SYS_RESOURCE      lift RLIMIT_MEMLOCK if the BPF loader asks
-#   CAP_SYS_PTRACE        read /proc/<pid>/exe, ns/mnt and root of any
-#                         process, other users' included
+#   CAP_SYS_PTRACE        read /proc/<pid>/exe of any process, other
+#                         users' included, and pid 1's root
 #   CAP_DAC_READ_SEARCH   open and hash any executable, whatever its mode
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
 NoNewPrivileges=yes
+# BPF memory is charged to the cgroup on 6.x; this covers older loaders
+# without handing out CAP_SYS_RESOURCE.
 LimitMEMLOCK=infinity
 UMask=0077
 
@@ -36,8 +37,8 @@ LogsDirectoryMode=0700
 
 # Hardening that still lets aegisd see every process: ProtectProc stays
 # at its default and there is no ProcSubset=pid. The private mount
-# namespace these imply is fine; aegisd compares exe paths against pid
-# 1's namespace, not its own.
+# namespace these imply is fine: aegisd checks the inode each process
+# executed against the file at that path under pid 1's root.
 ProtectHome=read-only
 PrivateTmp=yes
 PrivateDevices=yes

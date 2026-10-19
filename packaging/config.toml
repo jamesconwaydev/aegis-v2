@@ -37,6 +37,8 @@ dir = "/var/lib/aegis-v2/incidents"
 
 # journald is always on. Optional extra sinks:
 # [telemetry]
+# The JSONL file has to live under /var/log/aegis-v2: the unit makes the
+# rest of the filesystem read-only, and SELinux agrees.
 # jsonl = "/var/log/aegis-v2/events.jsonl"
 #
 # SELinux keeps aegisd off the network until you allow it:

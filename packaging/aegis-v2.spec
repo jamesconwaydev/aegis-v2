@@ -21,6 +21,7 @@ BuildRequires:  selinux-policy-devel
 BuildRequires:  systemd-rpm-macros
 Requires:       nftables
 Requires:       criu
+Requires:       (%{name}-selinux = %{version}-%{release} if selinux-policy-%{selinuxtype})
 %{?systemd_requires}
 
 %description
@@ -34,8 +35,11 @@ License:        MIT OR Apache-2.0
 BuildArch:      noarch
 Requires:       selinux-policy-%{selinuxtype}
 Requires(post): selinux-policy-%{selinuxtype}
+# What %%selinux_requires_min asks for, without its BuildRequires on
+# pkgconfig(systemd), which the build image doesn't carry.
+Requires(post): selinux-policy-base >= %{_selinux_policy_version}
+Requires(post): libselinux-utils
 Requires(post): policycoreutils
-Requires(postun): policycoreutils
 
 %description selinux
 Confines aegisd to the aegisd_t domain: the BPF and perf access its
@@ -61,9 +65,8 @@ install -Dpm 0644 %{_sourcedir}/packaging/allowlist.d/00-default.toml \
     %{buildroot}%{_sysconfdir}/aegis-v2/allowlist.d/00-default.toml
 install -dm 0700 %{buildroot}%{_sharedstatedir}/aegis-v2
 install -dm 0700 %{buildroot}%{_localstatedir}/log/aegis-v2
-install -Dpm 0644 aegis.pp %{buildroot}%{_datadir}/selinux/packages/aegis.pp
-install -Dpm 0644 aegis.if \
-    %{buildroot}%{_datadir}/selinux/devel/include/distributed/aegis.if
+install -Dpm 0644 aegis.pp \
+    %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/aegis.pp
 install -Dpm 0644 -t %{buildroot}%{_licensedir}/%{name} \
     %{_sourcedir}/LICENSE-APACHE %{_sourcedir}/LICENSE-MIT \
     %{_sourcedir}/LICENSE-GPL-2.0
@@ -79,37 +82,37 @@ install -Dpm 0644 -t %{buildroot}%{_licensedir}/%{name} \
 %postun
 %systemd_postun_with_restart aegisd.service
 
+# The selinux-policy macros: install or remove the module, then relabel
+# whatever its file contexts changed.
+%pre selinux
+%selinux_relabel_pre -s %{selinuxtype}
+
 %post selinux
-semodule -s %{selinuxtype} -i %{_datadir}/selinux/packages/aegis.pp
-restorecon -R %{_sbindir}/aegisd %{_sysconfdir}/aegis-v2 \
-    %{_sharedstatedir}/aegis-v2 %{_localstatedir}/log/aegis-v2 \
-    /run/aegis-v2 2>/dev/null || :
-# A running aegisd only enters aegisd_t on its next start.
-systemctl try-restart aegisd.service 2>/dev/null || :
+%selinux_modules_install -s %{selinuxtype} %{_datadir}/selinux/packages/%{selinuxtype}/aegis.pp
 
 %postun selinux
-if [ $1 -eq 0 ]; then
-    semodule -s %{selinuxtype} -r aegis 2>/dev/null || :
-    restorecon -R %{_sbindir}/aegisd %{_sysconfdir}/aegis-v2 \
-        %{_sharedstatedir}/aegis-v2 %{_localstatedir}/log/aegis-v2 \
-        /run/aegis-v2 2>/dev/null || :
-fi
+%selinux_modules_uninstall -s %{selinuxtype} aegis
+
+%posttrans selinux
+%selinux_relabel_post -s %{selinuxtype}
+# A running aegisd only enters aegisd_t on its next start.
+systemctl try-restart aegisd.service 2>/dev/null || :
 
 %files
 %license %{_licensedir}/%{name}
 %{_sbindir}/aegisd
 %{_bindir}/aegisctl
 %{_unitdir}/aegisd.service
-%dir %{_sysconfdir}/aegis-v2
+# config.toml may hold an OTLP bearer token.
+%dir %attr(0750,root,root) %{_sysconfdir}/aegis-v2
 %dir %{_sysconfdir}/aegis-v2/allowlist.d
-%config(noreplace) %{_sysconfdir}/aegis-v2/config.toml
+%config(noreplace) %attr(0600,root,root) %{_sysconfdir}/aegis-v2/config.toml
 %config(noreplace) %{_sysconfdir}/aegis-v2/allowlist.d/00-default.toml
 %dir %attr(0700,root,root) %{_sharedstatedir}/aegis-v2
 %dir %attr(0700,root,root) %{_localstatedir}/log/aegis-v2
 
 %files selinux
-%{_datadir}/selinux/packages/aegis.pp
-%{_datadir}/selinux/devel/include/distributed/aegis.if
+%{_datadir}/selinux/packages/%{selinuxtype}/aegis.pp
 
 %changelog
 * Mon Oct 19 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.1.0-1

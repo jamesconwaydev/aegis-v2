@@ -37,8 +37,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `aegis-v2-selinux`, and `dnf install ./*.rpm` gives you a systemd unit
   and a daemon confined to its own SELinux domain, `aegisd_t`. It runs in
   enforcing mode without a single denial in the audit log. The unit
-  keeps six capabilities out of root's forty-one and sees the filesystem
+  keeps five capabilities out of root's forty-one and sees the filesystem
   read-only, apart from its state, socket and log directories.
+- A process can't borrow a trusted binary's verdict any more by running a
+  lookalike under the same name. Before this, a chroot with its own
+  `/usr/bin/python3` got the real one's `rpm_owned`. aegisd now takes the
+  inode the kernel actually executed and verifies the host's file only if
+  it's that same inode.
 - OTLP export now needs one more step on an SELinux host:
   `setsebool -P aegisd_can_network_connect 1`. Until you run it, aegisd
   can't open a socket to anything.

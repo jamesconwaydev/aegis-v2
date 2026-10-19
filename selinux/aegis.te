@@ -44,7 +44,7 @@ logging_log_file(aegis_log_t)
 
 # Root with the unit's bounding set. dac_read_search opens executables
 # of any mode; sys_ptrace reads other users' /proc/<pid>/exe and root.
-allow aegisd_t self:capability { dac_read_search sys_admin sys_ptrace sys_resource };
+allow aegisd_t self:capability { dac_read_search sys_admin sys_ptrace };
 allow aegisd_t self:capability2 { bpf perfmon };
 # The same, for processes inside a user namespace (rootless containers).
 allow aegisd_t self:cap_userns sys_ptrace;
