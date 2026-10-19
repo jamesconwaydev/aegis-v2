@@ -1,0 +1,37 @@
+# cargo-deny policy, run by the `deny` CI job: `cargo deny check`.
+
+[graph]
+# Only the targets Aegis ships to; Windows and macOS crates drop out.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+# Permissive only. Taken from `cargo deny list`, not guessed: anything new
+# fails the check until someone reads its licence and adds it here.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",       # subtle
+    "CDLA-Permissive-2.0", # webpki-roots, webpki-root-certs
+    "ISC",                # ring, rustls-webpki, untrusted
+    "MIT",
+    "Unicode-3.0",        # unicode-ident
+    "Zlib",               # foldhash
+]
+confidence-threshold = 0.93
+exceptions = [
+    # The eBPF object has to be GPL for the kernel to load its helpers.
+    # It runs in the kernel and is never linked into a userspace binary.
+    { crate = "aegis-ebpf", allow = ["GPL-2.0-only"] },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

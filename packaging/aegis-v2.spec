@@ -12,8 +12,12 @@ Name:           aegis-v2
 Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Runtime threat detection for Rocky Linux, built on eBPF
-# aegisd embeds the GPL-2.0-only eBPF object.
-License:        (MIT OR Apache-2.0) AND GPL-2.0-only
+# Aegis itself, the GPL-2.0-only eBPF object aegisd embeds, then every
+# licence of the crates statically linked in (THIRD-PARTY-LICENSES has
+# their texts). Refresh it when Cargo.lock changes:
+#   cargo tree -p aegisd -p aegisctl -e normal,no-proc-macro \
+#     --target x86_64-unknown-linux-gnu --prefix none -f '{l}' | sort -u
+License:        (MIT OR Apache-2.0) AND GPL-2.0-only AND Apache-2.0 AND BSD-3-Clause AND CDLA-Permissive-2.0 AND ISC AND MIT AND (Apache-2.0 OR ISC OR MIT) AND (MIT OR Unlicense) AND Zlib
 URL:            https://github.com/jamesconwaydev/aegis-v2
 ExclusiveArch:  x86_64 aarch64
 
@@ -69,7 +73,7 @@ install -Dpm 0644 aegis.pp \
     %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/aegis.pp
 install -Dpm 0644 -t %{buildroot}%{_licensedir}/%{name} \
     %{_sourcedir}/LICENSE-APACHE %{_sourcedir}/LICENSE-MIT \
-    %{_sourcedir}/LICENSE-GPL-2.0
+    %{_sourcedir}/LICENSE-GPL-2.0 %{aegis_bindir}/THIRD-PARTY-LICENSES
 
 %post
 %systemd_post aegisd.service

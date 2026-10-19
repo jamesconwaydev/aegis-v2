@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license = "GPL-2.0-only"
 repository.workspace = true
+publish = false
 
 [dependencies]
 aegis-common = { path = "../aegis-common" }

@@ -1,0 +1,16 @@
+Third-party licences for aegisd and aegisctl
+============================================
+
+These crates are compiled into the aegis-v2 binaries.
+{{#each licenses}}
+
+------------------------------------------------------------------------
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}
+  {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

@@ -1,0 +1,17 @@
+# cargo-about config for THIRD-PARTY-LICENSES, the licence texts of every
+# crate linked into aegisd and aegisctl. `cargo xtask rpm` generates it
+# in the build image and the spec ships it under %license. Keep
+# `accepted` in step with deny.toml.
+accepted = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+private = { ignore = true }
