@@ -198,8 +198,8 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     let writer = {
         let (store, errors) = (store.clone(), errors.clone());
         std::thread::spawn(move || {
-            while let Ok((d, tree, mode)) = inc_rx.recv() {
-                if let Err(e) = store.record(&d, &tree, mode) {
+            while let Ok((d, tree, mode, id)) = inc_rx.recv() {
+                if let Err(e) = store.record_as(&d, &tree, mode, Some(&id)) {
                     errors.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
                         "aegisd: recording incident for tgid {} failed: {e:#}",

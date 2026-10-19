@@ -98,6 +98,16 @@ impl Sinks {
         }
     }
 
+    /// Only a JSON lines file at `p`: for tests that read the records.
+    #[cfg(test)]
+    pub fn jsonl_at(p: &std::path::Path) -> Self {
+        Self {
+            journald: journald::Journald::with_socket(None),
+            jsonl: Some(jsonl::JsonLines::open(p).unwrap()),
+            otlp: None,
+        }
+    }
+
     pub fn emit(&self, rec: &TelemetryRecord) {
         self.journald.emit(rec);
         if let Some(s) = &self.jsonl {

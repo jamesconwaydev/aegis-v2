@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use aegis_common::{Event, EventKind, EXEC_MEMFD, PATH_TRUNCATED};
 
 use crate::config::{Config, Mode};
-use crate::incident::{verdict, IncidentStore};
+use crate::incident::{new_incident_id, verdict, IncidentStore};
 use crate::proctable::{ProcInfo, ProcKey, ProcTable};
 use crate::scoring::{
     signals_for, DaemonClassifier, Decision, ScanDetector, Scorer, Signal, KINDS,
@@ -42,7 +42,8 @@ use crate::verify::Verification;
 pub type Resolve = fn(u32, u64, &Path) -> Option<PathBuf>;
 
 /// A decision and the tree to record it against, sent to the writer.
-pub type RecordJob = (Decision, Vec<ProcInfo>, Mode);
+/// The id is the one the loop assigned when it opened the incident.
+pub type RecordJob = (Decision, Vec<ProcInfo>, Mode, String);
 
 /// How long a signal waits for its verdict before it scores Unverified.
 const DEFER_DEADLINE: Duration = Duration::from_secs(2);
@@ -103,8 +104,7 @@ pub struct Pipeline {
     /// Incident membership on the loop, by a local group number: the
     /// same grouping rule the store applies, kept here so the incident
     /// score can be computed without waiting on the writer thread.
-    groups: HashMap<ProcKey, u64>,
-    next_group: u64,
+    groups: HashMap<ProcKey, String>,
     /// Paths for the caller to verify. Each is queued once while in flight.
     pub to_verify: Vec<PathBuf>,
     pub events_total: u64,
@@ -135,7 +135,6 @@ impl Pipeline {
             pending: HashMap::new(),
             deferred: Vec::new(),
             groups: HashMap::new(),
-            next_group: 0,
             to_verify: Vec::new(),
             events_total: 0,
             incident_dropped: 0,
@@ -387,25 +386,32 @@ impl Pipeline {
         // ancestor's. An incident is opened only by a process that reaches
         // Throttle on its own score (inherited kinds included); a tree in
         // which no single process does opens none.
-        let group = self.groups.get(&subject.key).copied().or_else(|| {
-            ancestors
-                .iter()
-                .find_map(|a| self.groups.get(&a.key).copied())
+        // The store is asked too, for incidents opened before a restart.
+        let store = &self.incidents.store;
+        let group = std::iter::once(subject).chain(ancestors).find_map(|p| {
+            self.groups
+                .get(&p.key)
+                .cloned()
+                .or_else(|| store.incident_for(&p.key))
         });
         if group.is_none() && verdict(d.tier).is_none() {
             self.debug_log(subject, &d);
             return;
         }
-        let g = group.unwrap_or_else(|| {
-            self.next_group += 1;
-            self.next_group
+        // The loop names a new incident itself, so the first telemetry
+        // record already carries the id the writer will create.
+        let g = group.unwrap_or_else(|| loop {
+            let id = new_incident_id();
+            if !self.groups.values().any(|v| *v == id) {
+                break id;
+            }
         });
-        self.groups.insert(subject.key, g);
+        self.groups.insert(subject.key, g.clone());
         // Once an incident exists its tier follows the incident score: per
         // kind, the strongest live member's component, summed. A chain
         // split across processes (scan in the shell, ptrace in a child)
         // is judged as one. Evidence stays per process.
-        let inc = self.incident_score(g, ts_ns);
+        let inc = self.incident_score(&g, ts_ns);
         if inc > d.score {
             d.score = inc;
             d.tier = self.scorer.tier(inc);
@@ -418,14 +424,8 @@ impl Pipeline {
             .chain(ancestors.iter().cloned())
             .filter(|p| !matches!(p.key.tgid, 1 | 2))
             .collect();
-        self.record(&d, tree);
-        // Best effort: on the first decision of a new incident the writer
-        // may not have assigned the id yet, so this can be empty.
-        let incident = self
-            .incidents
-            .store
-            .incident_for(&subject.key)
-            .unwrap_or_default();
+        self.record(&d, tree, &g);
+        let incident = g;
         self.sinks.emit(&TelemetryRecord {
             ts_unix_ns: now_ns(),
             incident,
@@ -447,9 +447,9 @@ impl Pipeline {
     /// members of group `g`.
     // ponytail: scans every member of every group; index by group if
     // incidents ever hold thousands of processes.
-    fn incident_score(&self, g: u64, now_ns: u64) -> f64 {
+    fn incident_score(&self, g: &str, now_ns: u64) -> f64 {
         let mut best = [0.0f64; KINDS];
-        for (k, _) in self.groups.iter().filter(|(_, &v)| v == g) {
+        for (k, _) in self.groups.iter().filter(|(_, v)| *v == g) {
             for (b, c) in best.iter_mut().zip(self.scorer.components(k, now_ns)) {
                 *b = b.max(c);
             }
@@ -467,17 +467,21 @@ impl Pipeline {
         }
     }
 
-    fn record(&mut self, d: &Decision, tree: Vec<ProcInfo>) {
+    fn record(&mut self, d: &Decision, tree: Vec<ProcInfo>, id: &str) {
         match &self.incidents.tx {
             Some(tx) => {
                 if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
-                    tx.try_send((d.clone(), tree, self.mode))
+                    tx.try_send((d.clone(), tree, self.mode, id.to_string()))
                 {
                     self.incident_dropped += 1;
                 }
             }
             None => {
-                if let Err(e) = self.incidents.store.record(d, &tree, self.mode) {
+                if let Err(e) = self
+                    .incidents
+                    .store
+                    .record_as(d, &tree, self.mode, Some(id))
+                {
                     self.incidents.errors.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
                         "aegisd: recording incident for tgid {} failed: {e:#}",
@@ -586,8 +590,13 @@ mod tests {
     }
 
     fn pipeline(name: &str) -> (Pipeline, Dir) {
+        pipeline_with(name, |_| Sinks::none())
+    }
+
+    fn pipeline_with(name: &str, sinks: impl FnOnce(&Path) -> Sinks) -> (Pipeline, Dir) {
         let d = std::env::temp_dir().join(format!("aegis-pipe-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
+        let sinks = sinks(&d.with_extension("jsonl"));
         let store =
             IncidentStore::open_at(&d, Some("boot".into()), now_ns() / 1_000_000_000).unwrap();
         let mut cfg = Config::default();
@@ -595,7 +604,7 @@ mod tests {
         let p = Pipeline::new(
             &cfg,
             Incidents::inline(store),
-            Sinks::none(),
+            sinks,
             Box::new(Pid1),
             same_ns,
             false,
@@ -776,6 +785,31 @@ mod tests {
             .unwrap();
         let tgids: Vec<u32> = inc.process_tree.iter().map(|m| m.tgid).collect();
         assert_eq!(tgids, [80, 81]);
+    }
+
+    #[test]
+    fn first_telemetry_record_names_the_incident_dir() {
+        // A real writer channel, drained only after the events: telemetry
+        // is emitted before any incident directory exists, as in the daemon.
+        let (mut p, d) = pipeline_with("tel", Sinks::jsonl_at);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RecordJob>(256);
+        p.incidents.tx = Some(tx);
+        split_chain(&mut p, 80, 81, 80);
+        for (dec, tree, mode, id) in rx.try_iter() {
+            p.store().record_as(&dec, &tree, mode, Some(&id)).unwrap();
+        }
+        let log = d.0.with_extension("jsonl");
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        let id = first["incident"].as_str().unwrap();
+        assert!(!id.is_empty(), "{first}");
+        assert!(d.0.join(id).join("incident.json").exists(), "{id}");
+        // Every record of this one incident carries the same id.
+        for l in text.lines() {
+            let r: serde_json::Value = serde_json::from_str(l).unwrap();
+            assert_eq!(r["incident"], id);
+        }
     }
 
     #[test]

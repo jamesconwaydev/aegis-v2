@@ -195,13 +195,25 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 /// Create a fresh incident dir under `root`, retrying on an id clash.
-fn create_incident_dir(root: &Path, taken: &BTreeMap<String, Incident>) -> Result<String> {
+/// A fresh id: `AEG-<UTC date>-<time>-<16 random bits>`.
+pub fn new_incident_id() -> String {
     let (y, mo, d, h, mi, s) = civil(now_ns() / 1_000_000_000);
+    let r = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish() as u16;
+    format!("AEG-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}-{r:04x}")
+}
+
+/// Create a fresh incident dir under `root`: `want` first when given,
+/// then random ids, retrying on a clash.
+fn create_incident_dir(
+    root: &Path,
+    taken: &BTreeMap<String, Incident>,
+    want: Option<&str>,
+) -> Result<String> {
+    let mut want = want.filter(|w| valid_id(w)).map(String::from);
     for _ in 0..32 {
-        let r = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish() as u16;
-        let id = format!("AEG-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}-{r:04x}");
+        let id = want.take().unwrap_or_else(new_incident_id);
         if taken.contains_key(&id) {
             continue;
         }
@@ -299,7 +311,22 @@ impl IncidentStore {
     /// Order on failure: `incident.json` is written first, then the
     /// timeline line, and memory is updated last. A failed call leaves
     /// disk at worst one step ahead; the next record rewrites it.
+    #[cfg(test)]
     pub fn record(&self, d: &Decision, tree: &[ProcInfo], mode: Mode) -> Result<IncidentId> {
+        self.record_as(d, tree, mode, None)
+    }
+
+    /// `record`, with the id a new incident should get. The event loop
+    /// picks it so telemetry can name the incident before the write is
+    /// done. Ignored when the process already belongs to an incident; on
+    /// the rare clash with an old directory a random id is used instead.
+    pub fn record_as(
+        &self,
+        d: &Decision,
+        tree: &[ProcInfo],
+        mode: Mode,
+        want: Option<&str>,
+    ) -> Result<IncidentId> {
         let Some(verdict) = verdict(d.tier) else {
             bail!("tier log is not an incident");
         };
@@ -323,7 +350,7 @@ impl IncidentStore {
             None => {
                 let root = ProcSummary::new(me);
                 Incident {
-                    id: create_incident_dir(&self.dir, &g.incidents)?,
+                    id: create_incident_dir(&self.dir, &g.incidents, want)?,
                     created: ts.clone(),
                     updated: ts.clone(),
                     updated_ns: now,
