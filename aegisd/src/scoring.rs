@@ -16,8 +16,15 @@ pub enum Signal {
     TmpExec,
     MemfdCreate,
     MemfdExec,
-    PtraceSystemDaemon { target: ProcKey },
-    EgressScan { distinct_targets: u32 },
+    /// `target` is advisory: the tgid is looked up in the process table,
+    /// so it may name a process we never saw (start time 0) or, after pid
+    /// reuse or across pid namespaces, the wrong one.
+    PtraceSystemDaemon {
+        target: ProcKey,
+    },
+    EgressScan {
+        distinct_targets: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,11 +119,6 @@ pub fn signals_for(ev: &Event, table: &ProcTable, daemon: &dyn DaemonClassifier)
     vec![sig]
 }
 
-/// Modifiers, as the spec sets them.
-const TMP_EXEC_MOD: f64 = -25.0;
-const MEMFD_CREATE_MOD: f64 = -20.0;
-const PTRACE_MOD: f64 = -45.0;
-const SCAN_MOD: f64 = -40.0;
 // ponytail: newest 32 kept per process; raise it if incidents need more.
 const MAX_EVIDENCE: usize = 32;
 
@@ -145,14 +147,26 @@ fn trusted(p: &ProcInfo, list: &[PathBuf]) -> bool {
 
 impl Scorer {
     pub fn new(cfg: &Config) -> Self {
-        Self {
-            weights: cfg.scoring.weights.clone(),
-            half_life_ns: cfg.scoring.half_life_secs * 1e9,
-            throttle: cfg.general.score_threshold_throttle.into(),
-            quarantine: cfg.general.score_threshold_quarantine.into(),
-            allow: cfg.allowlist.clone(),
+        let mut s = Self {
+            weights: Weights::default(),
+            half_life_ns: 0.0,
+            throttle: 0.0,
+            quarantine: 0.0,
+            allow: Allowlist::default(),
             scores: HashMap::new(),
-        }
+        };
+        s.set_config(cfg);
+        s
+    }
+
+    /// Takes a reloaded config. Live scores carry over; they decay at the
+    /// new half-life from here on.
+    pub fn set_config(&mut self, cfg: &Config) {
+        self.weights = cfg.scoring.weights.clone();
+        self.half_life_ns = cfg.scoring.half_life_secs * 1e9;
+        self.throttle = cfg.general.score_threshold_throttle.into();
+        self.quarantine = cfg.general.score_threshold_quarantine.into();
+        self.allow = cfg.allowlist.clone();
     }
 
     fn decayed(&self, e: &Entry, now_ns: u64) -> f64 {
@@ -197,7 +211,7 @@ impl Scorer {
                 )
             })
         };
-        let (base, what, m, why) = match sig {
+        let (base, what, why) = match sig {
             Signal::TmpExec => {
                 let parent = ancestors
                     .first()
@@ -211,40 +225,42 @@ impl Scorer {
                 (
                     w.tmp_exec,
                     "exec from a temp directory",
-                    TMP_EXEC_MOD,
                     parent.or_else(selinux),
                 )
             }
             Signal::MemfdCreate => {
                 let caller = trusted(p, &a.memfd_callers).then(|| "caller is allowlisted".into());
-                (
-                    w.memfd_create,
-                    "memfd_create",
-                    MEMFD_CREATE_MOD,
-                    caller.or_else(selinux),
-                )
+                (w.memfd_create, "memfd_create", caller.or_else(selinux))
             }
-            Signal::MemfdExec => (w.memfd_exec, "exec of a memfd", 0.0, None),
+            // `p` is the process as it was before the exec: the binary that
+            // ran the memfd. runc and crun clone themselves this way.
+            Signal::MemfdExec => (
+                w.memfd_exec,
+                "exec of a memfd",
+                trusted(p, &a.memfd_callers).then(|| "executing binary is allowlisted".into()),
+            ),
             Signal::PtraceSystemDaemon { .. } => (
                 w.ptrace_system_daemon,
                 "ptrace attach to a system daemon",
-                PTRACE_MOD,
                 trusted(p, &a.ptrace_tracers).then(|| "tracer is allowlisted".into()),
             ),
             Signal::EgressScan { .. } => (
                 w.egress_scan,
                 "egress scan",
-                SCAN_MOD,
                 (trusted(p, &a.scan_binaries) && p.uid == 0 && p.has_tty)
                     .then(|| "allowlisted scanner run by root from a terminal".into()),
             ),
         };
         match why {
-            Some(why) => (base, m, format!("{what}; {why}")),
+            // An allowlisted event is forgiven in full, whatever its weight.
+            Some(why) => (base, -base, format!("{what}; {why}")),
             None => (base, 0.0, what.into()),
         }
     }
 
+    /// For an Exec event, call this before `ProcTable::apply` and pass the
+    /// pre-exec `ProcInfo`: allowlists judge the binary that did the exec,
+    /// not the one it started.
     pub fn observe(
         &mut self,
         proc: &ProcInfo,
@@ -294,6 +310,8 @@ type Target = (IpAddr, u16);
 #[derive(Default)]
 struct Window {
     /// (ts_ns, target, failed), oldest first.
+    // ponytail: one entry per connect inside the window, so a process
+    // connecting very fast holds that many; cap the deque if that bites.
     conns: VecDeque<(u64, Target, bool)>,
     targets: HashMap<Target, u32>,
     failed: u32,
@@ -301,8 +319,8 @@ struct Window {
 }
 
 /// Per process: distinct (daddr, dport) and failed connects inside the
-/// window. Fires once when either crosses its threshold, then stays
-/// quiet until the window has fully drained.
+/// window. Fires when either crosses its threshold, then stays quiet
+/// until both have dropped back below.
 pub struct ScanDetector {
     cfg: ScanConfig,
     procs: HashMap<ProcKey, Window>,
@@ -337,8 +355,10 @@ impl ScanDetector {
         };
         let window_ns = (self.cfg.window_secs * 1e9) as u64;
         let w = self.procs.entry(key).or_default();
+        // A late event counts as arriving now, which keeps the deque sorted.
+        let now = w.conns.back().map_or(ev.ts_ns, |c| c.0.max(ev.ts_ns));
         while let Some(&(ts, t, failed)) = w.conns.front() {
-            if ev.ts_ns.saturating_sub(ts) <= window_ns {
+            if now - ts <= window_ns {
                 break;
             }
             w.conns.pop_front();
@@ -350,23 +370,28 @@ impl ScanDetector {
                 }
             }
         }
-        if w.conns.is_empty() {
+        let (dt, fc) = (self.cfg.distinct_targets, self.cfg.failed_connects);
+        if (w.targets.len() as u32) < dt && w.failed < fc {
             w.fired = false;
         }
         let t = (addr, ev.dport);
         let failed = ev.ret < 0 && ev.ret != -EINPROGRESS;
-        w.conns.push_back((ev.ts_ns, t, failed));
+        w.conns.push_back((now, t, failed));
         *w.targets.entry(t).or_default() += 1;
         w.failed += failed as u32;
         let distinct = w.targets.len() as u32;
-        if w.fired || (distinct < self.cfg.distinct_targets && w.failed < self.cfg.failed_connects)
-        {
+        if w.fired || (distinct < dt && w.failed < fc) {
             return None;
         }
         w.fired = true;
         Some(Signal::EgressScan {
             distinct_targets: distinct,
         })
+    }
+
+    /// Takes a reloaded config; windows in progress carry over.
+    pub fn set_config(&mut self, cfg: ScanConfig) {
+        self.cfg = cfg;
     }
 
     pub fn on_exit(&mut self, key: &ProcKey) {
@@ -651,6 +676,84 @@ mod tests {
         // ...but after the window drains, a new crossing does.
         let later = 10 * S;
         let fired = (0..10).any(|i| d.on_connect(&connect(0, -111, later + i)).is_some());
+        assert!(fired);
+    }
+
+    #[test]
+    fn raised_weight_is_still_fully_forgiven() {
+        let mut c = cfg();
+        c.scoring.weights.tmp_exec = 40.0;
+        let dnf = proc(50, "/usr/bin/dnf", "dnf", rpm("dnf"));
+        let d = Scorer::new(&c).observe(&evil(), &[&dnf], Signal::TmpExec, S);
+        assert_eq!(d.score, 0.0);
+        assert_eq!(d.evidence[0].modifier, -40.0);
+    }
+
+    #[test]
+    fn verified_runc_memfd_self_clone_scores_0() {
+        let mut c = cfg();
+        c.allowlist.memfd_callers = vec!["/usr/bin/runc".into()];
+        let mut s = Scorer::new(&c);
+        // The pre-exec view: runc itself, about to exec its memfd copy.
+        let runc = proc(60, "/usr/bin/runc", "runc", rpm("runc"));
+        s.observe(&runc, &[&bash()], Signal::MemfdCreate, S);
+        let d = s.observe(&runc, &[&bash()], Signal::MemfdExec, S);
+        assert_eq!((d.score, d.tier), (0.0, Tier::Log));
+        // An unverified runc gets nothing.
+        let fake = proc(61, "/usr/bin/runc", "runc", Verification::Modified);
+        let d = Scorer::new(&c).observe(&fake, &[&bash()], Signal::MemfdExec, S);
+        assert_eq!(d.score, 60.0);
+    }
+
+    #[test]
+    fn scores_survive_set_config() {
+        let mut s = Scorer::new(&cfg());
+        let (p, b) = (evil(), bash());
+        s.observe(&p, &[&b], Signal::TmpExec, S);
+        let mut c = cfg();
+        c.scoring.weights.memfd_create = 30.0;
+        c.general.score_threshold_throttle = 40;
+        s.set_config(&c);
+        let d = s.observe(&p, &[&b], Signal::MemfdCreate, S);
+        assert_eq!((d.score, d.tier), (55.0, Tier::Throttle));
+
+        let mut det = ScanDetector::new(ScanConfig::default());
+        for i in 0..5 {
+            assert!(det
+                .on_connect(&connect(i, -111, S + u64::from(i)))
+                .is_none());
+        }
+        det.set_config(ScanConfig {
+            failed_connects: 6,
+            ..ScanConfig::default()
+        });
+        assert!(det.on_connect(&connect(9, -111, S + 9)).is_some());
+    }
+
+    #[test]
+    fn scan_detector_rearms_when_counts_dip_below_thresholds() {
+        let mut d = ScanDetector::new(ScanConfig::default());
+        let burst = |d: &mut ScanDetector, base: u32, ts: u64| {
+            (0..20).any(|i| {
+                d.on_connect(&connect(base + i, -115, ts + u64::from(i)))
+                    .is_some()
+            })
+        };
+        assert!(burst(&mut d, 0, S));
+        // One connect at 1.5 s keeps the window from ever emptying.
+        assert!(d.on_connect(&connect(500, -115, S + S / 2 * 3)).is_none());
+        // Just after 3 s the first burst has aged out and the 1.5 s one is
+        // left: below both thresholds, so the next burst fires again.
+        assert!(burst(&mut d, 100, 3 * S + 1000));
+    }
+
+    #[test]
+    fn scan_detector_tolerates_out_of_order_timestamps() {
+        let mut d = ScanDetector::new(ScanConfig::default());
+        d.on_connect(&connect(0, -115, 10 * S));
+        // Arrives late, stamped long before the window: it counts as now.
+        d.on_connect(&connect(1, -115, S));
+        let fired = (2..20).any(|i| d.on_connect(&connect(i, -115, 11 * S)).is_some());
         assert!(fired);
     }
 

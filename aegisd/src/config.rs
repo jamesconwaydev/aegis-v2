@@ -200,7 +200,7 @@ pub struct Allowlist {
     /// Confined domains whose processes skip the tmp exec and
     /// memfd_create scores. unconfined_t is ignored here.
     pub excluded_selinux_domains: Vec<String>,
-    /// Verified executables allowed to call memfd_create.
+    /// Verified executables allowed to call memfd_create and exec a memfd.
     #[serde(deserialize_with = "abs_paths")]
     pub memfd_callers: Vec<PathBuf>,
     /// Verified debuggers allowed to attach to system daemons.
@@ -825,7 +825,9 @@ mod tests {
             [
                 "/usr/bin/podman",
                 "/usr/bin/pipewire",
-                "/usr/bin/gnome-shell"
+                "/usr/bin/gnome-shell",
+                "/usr/bin/runc",
+                "/usr/bin/crun"
             ]
         );
         assert_eq!(

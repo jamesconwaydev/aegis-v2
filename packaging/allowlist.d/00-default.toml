@@ -16,12 +16,16 @@ excluded_parent_processes = [
     "/usr/bin/pip3",
 ]
 
-# Callers of memfd_create that don't score for it. Like the parents above,
-# this list and the two below apply only to binaries that verify.
+# Binaries that don't score for calling memfd_create or for executing a
+# memfd. runc and crun copy themselves into a memfd and run that on every
+# container start. Like the parents above, this list and the two below
+# apply only to binaries that verify.
 memfd_callers = [
     "/usr/bin/podman",
     "/usr/bin/pipewire",
     "/usr/bin/gnome-shell",
+    "/usr/bin/runc",
+    "/usr/bin/crun",
 ]
 
 # Debuggers that may attach to a system daemon without scoring.
