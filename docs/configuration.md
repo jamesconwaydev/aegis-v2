@@ -37,7 +37,8 @@ reload applies:
 | `[telemetry]`, `[incidents]`                       | next restart |
 
 Scores already built up carry over a reload, and decay at the new
-half-life from then on. After a reload that changes pins, every process
+half-life from then on. A reload empties the verification cache, so
+every allowlisted and pinned path is checked again, and every process
 running a pinned binary is verified again.
 
 ## Errors
@@ -120,7 +121,17 @@ Every list defaults to empty in the code. The package fills them in
 
 Paths must be absolute. A bare name such as `"dnf"` is an error, since a
 process can call itself anything. An entry only counts for a binary that
-verifies: RPM-owned and unchanged, or matching a pin.
+verifies: RPM-owned and unchanged, or matching a pin. Name the real
+file: a symlink, FIFO or device at a listed path never verifies.
+
+The paths on these lists and in `pinned` are also the only executables
+aegisd verifies at all. Every other binary shows as `unverified` in
+incidents, which changes nothing about its score.
+
+Even a verified binary gets no credit when the process was started with
+`LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH`, when its environment
+can't be read, or after a debugger attached to it. See
+[scoring](scoring.md#when-an-allowlist-is-withheld).
 
 | Key                                 | Forgives                     |
 | ----------------------------------- | ---------------------------- |

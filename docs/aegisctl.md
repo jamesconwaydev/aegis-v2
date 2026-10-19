@@ -44,14 +44,15 @@ incident write errors                  0
 incidents dropped                      0
 verifications skipped                  0
 defer queue overflows                  0
+incident repeats not recorded          0
 telemetry dropped: journald            0
 telemetry dropped: otlp queue full     0
 telemetry dropped: otlp export failed  0
 telemetry dropped: otlp disconnected   0
 
 probes
-  aegis_exec_check  lsm/bprm_check_security
-  aegis_exec        lsm/bprm_committed_creds
+  aegis_exec_check   lsm/bprm_check_security
+  aegis_exec         lsm/bprm_committed_creds
   ...
 ```
 
@@ -71,13 +72,17 @@ What each row means, with its key in `--json` output:
   because 1,024 verifications were already in flight.
 - **defer queue overflows** (`deferred_overflow`): signals scored
   without waiting for verification, because the process already had 64
-  waiting.
+  waiting or 8,192 were waiting in all.
+- **incident repeats not recorded** (`incident_suppressed`): decisions
+  inside an open incident that weren't recorded or sent to telemetry,
+  because they added nothing new. This one grows in normal use.
 - **telemetry dropped: ...** (`telemetry_dropped`): records each sink
   lost.
 - **probes** (`probes`): each probe's name and hook.
 
-Every counter counts from when aegisd started. Anything other than 0
-in the drop and error rows means some events or records were lost; see
+Every counter counts from when aegisd started. Apart from `events` and
+`incident repeats not recorded`, anything other than 0 means some events
+or records were lost; see
 [troubleshooting](troubleshooting.md#counters-in-aegisctl-status).
 
 ## `preflight`
@@ -99,7 +104,7 @@ aegisctl incidents list
 <!-- markdownlint-disable MD013 -->
 ```text
 ID                        VERDICT           SCORE  ROOT PID  CREATED               UPDATED
-AEG-20261019-093000-a1b2  would_quarantine  85.0   4242      2026-10-19T09:30:00Z  2026-10-19T09:30:02Z
+AEG-20261019-093000-0123456789abcdef  would_quarantine  85.0   4242      2026-10-19T09:30:00Z  2026-10-19T09:30:02Z
 ```
 <!-- markdownlint-enable MD013 -->
 
@@ -107,17 +112,27 @@ AEG-20261019-093000-a1b2  would_quarantine  85.0   4242      2026-10-19T09:30:00
 incidents updated in the last 30 days; older ones are still on disk.
 With nothing to show it prints `No incidents.`
 
+## Incident ids
+
+`show` and `timeline` take an id in the exact form
+`AEG-YYYYMMDD-HHMMSS-` plus 16 lowercase hex digits. Anything else is
+refused before the daemon is asked:
+
+```text
+aegisctl: AEG-1 is not an incident id (AEG-YYYYMMDD-HHMMSS- and 16 hex digits)
+```
+
 ## `incidents show <id>`
 
 ```sh
-aegisctl incidents show AEG-20261019-093000-a1b2
+aegisctl incidents show AEG-20261019-093000-0123456789abcdef
 ```
 
 Prints the summary, the member processes, and the evidence:
 
 <!-- markdownlint-disable MD013 -->
 ```text
-id            AEG-20261019-093000-a1b2
+id            AEG-20261019-093000-0123456789abcdef
 verdict       would_quarantine
 mode          audit
 score         85.0 (peak 85.0)
@@ -146,7 +161,7 @@ even when it's too old for `list`.
 ## `incidents timeline <id>`
 
 ```sh
-aegisctl incidents timeline AEG-20261019-093000-a1b2
+aegisctl incidents timeline AEG-20261019-093000-0123456789abcdef
 ```
 
 One line per recorded decision: time, process, the signals in its
@@ -155,6 +170,9 @@ evidence, score, and tier.
 ```text
 2026-10-19T09:30:02Z  aegis-sim (4242)  MemfdCreate,MemfdExec  85.0  quarantine
 ```
+
+A timeline that reached its 10,000-line cap ends with a row saying
+`timeline truncated at 10000 lines`.
 
 With `--json`, you get the lines of `timeline.jsonl` as a JSON array;
 see [incidents](incidents.md#timelinejsonl).

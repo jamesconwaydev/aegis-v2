@@ -30,6 +30,8 @@ x86_64 and aarch64 with a systemd unit and SELinux module.
   shouldn't.
 - **Webhooks** for throttle and quarantine events.
 - **OTLP metrics**, alongside the OTLP logs v0.1 already sends.
+- **In-kernel environment capture** at exec, replacing v0.1's
+  best-effort `/proc/<pid>/environ` read for the injection checks.
 
 ## v0.3.0: the honeypot (planned)
 

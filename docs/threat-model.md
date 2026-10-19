@@ -36,10 +36,17 @@ that `/etc` is byte-for-byte unchanged across every scenario.
 - **A lookalike in a chroot or container.** A process that runs its own
   `/usr/bin/dnf` inside a chroot doesn't get the host's verdict: aegisd
   checks the executed inode against the host's file.
+- **A verified binary that may be running foreign code.** A process
+  started with `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH`, one whose
+  environment can't be read, and one a host-side debugger attached to
+  get no allowlist credit, however well their binary verifies. These
+  checks are best effort; see
+  [below](#the-injection-checks-are-best-effort).
 - **Text from processes.** Paths and names may contain anything.
   Incidents store exact bytes in base64 beside a lossy UTF-8 copy,
-  journald fields use the binary-safe encoding, and `aegisctl` escapes
-  control characters before printing.
+  journald fields use the binary-safe encoding, and the journald
+  message and `aegisctl` escape control, line-separator and
+  bidirectional characters before they're shown.
 
 ## Self-protection
 
@@ -70,10 +77,50 @@ kernel executed the shell, which then read the file. Aegis sees the
 shell, not the script, and scores no temp-directory exec. A script with
 a `#!` line run directly is caught.
 
-### Only TCP connects count towards scans
+### The injection checks are best effort
 
-The egress scan signal comes from TCP state changes. UDP traffic,
-including UDP scans, isn't observed in v0.1.
+Allowlist credit is withheld from a process that shows `LD_PRELOAD`,
+`LD_AUDIT` or `LD_LIBRARY_PATH`, or that a debugger attached to. In
+v0.1 those checks can be beaten:
+
+- aegisd reads the environment from `/proc/<pid>/environ` a few
+  milliseconds after the exec. That's the process's own memory, and a
+  preloaded library can scrub its `LD_PRELOAD` entry before aegisd reads
+  it.
+- A process can exec onward with a clean environment, and the next
+  image starts out trusted.
+- A ptrace attach is only seen when another process attaches to the
+  target. `PTRACE_TRACEME`, or a seize set up before the exec, isn't
+  seen.
+- A process can re-exec the same file without the loader variable in
+  the moment before aegisd reads its environment, and the read then
+  sees the clean one.
+
+They stop careless injection and inherited environments, not an
+attacker who knows about them. Capturing the environment in the kernel
+at exec is planned for v0.2.0.
+
+### Environment reads can get stuck
+
+A read of `/proc/<pid>/environ` can block for good, for example when a
+process's memory is backed by a hung FUSE filesystem. aegisd runs at
+most 16 reads at once. Once 16 are stuck, every later read is refused,
+and every allowlisted process counts as untrusted until aegisd
+restarts. That causes false positives, not missed detections.
+
+### A broken RPM database sticks
+
+If the RPM database is broken when aegisd checks a binary, rpm can
+answer "not owned", and aegisd caches that. Allowlisted binaries stay
+`unverified`, and lose their allowlist credit, until a reload
+(`systemctl reload aegisd`) or a restart empties the cache.
+
+### Some scans aren't detected
+
+The egress scan signal counts connects per process. A scan spread
+across many processes, one connection each, never crosses the
+threshold in any of them. It also comes from TCP state changes only, so
+UDP traffic, UDP scans included, isn't observed in v0.1.
 
 ### btrfs subvolumes and overlayfs stay unverified
 
@@ -116,11 +163,13 @@ ring buffer can fill. Events that don't fit are counted, not queued, and
 show in `aegisctl status` as `dropped events`. A signal in a dropped
 event is missed.
 
-### Verification is held for 2 seconds
+### Signals are held for up to 6 seconds
 
-A signal waiting on its binary's verification is held for up to
-2 seconds. An `rpm` query slower than that scores the signal as
-`unverified`, which errs towards scoring, never towards forgiving.
+A signal waiting on its binary's verification or its environment read
+is held for up to 6 seconds. Anything still unknown then scores as
+`unverified` or untrusted, which errs towards scoring, never towards
+forgiving. On a busy host, an allowlisted process that exits before its
+environment is read loses its allowlist credit the same way.
 
 ### Paths are capped at 256 bytes
 

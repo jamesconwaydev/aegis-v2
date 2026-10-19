@@ -33,14 +33,15 @@ refuses to start, saying it's planned for v0.2.0.
 Here's what you get:
 
 - **Kernel probes** for every committed exec (the real path, not
-  `argv[0]`), fork, exit, `ptrace` attach, `memfd_create`, and outbound
+  `argv[0]`), fork, exit, successful `ptrace` attach, `memfd_create`, and outbound
   TCP connects with their outcome.
 - **A risk score per process** that halves every 30 seconds of quiet.
   An exec from `/tmp` adds 25, a memfd exec adds 65, an attach to a
   system daemon adds 45, a burst of outbound connects adds 40.
 - **Allowlists that can't be fooled by a name.** `dnf`, `gdb` or
   `podman` only get a pass when the binary on disk is RPM-owned and
-  unmodified, or matches a SHA-256 you pinned.
+  unmodified, or matches a SHA-256 you pinned, and the process shows no
+  sign of `LD_PRELOAD` or an attached debugger.
 - **Incidents, not alerts.** A process whose score reaches 50 opens a
   `would_throttle` incident, and its children's signals count towards
   the same one. At 80 it becomes `would_quarantine`. Each incident is a

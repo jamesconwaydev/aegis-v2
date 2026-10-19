@@ -93,11 +93,11 @@ the policy module only confines it when SELinux is enforcing.
 
 Looks for an `nft` executable on `PATH`.
 
-- **On failure:** `FAIL`
+- **On failure:** `WARN` (`nft not found (needed from v0.2.0)`)
 - **Fix:** `dnf install nftables`
 
-v0.1 doesn't call `nft`. The package requires `nftables` because egress
-control is planned for v0.2.0, and the check matches that requirement.
+v0.1 never calls `nft`. Egress control in v0.2.0 will, which is why the
+package already requires `nftables`.
 
 ### criu
 

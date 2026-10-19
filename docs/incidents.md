@@ -12,8 +12,13 @@ every field in them.
 2. Later decisions about that process, or about any process with an
    ancestor that is already a member, go to the same incident. When
    several ancestors are members, the nearest one decides.
-3. Each decision at throttle or above is appended to the incident's
-   timeline, and the summary is rewritten.
+3. A decision at throttle or above is recorded, appended to the
+   timeline and sent to telemetry, only when it adds something: the
+   incident's tier rose, this process showed this signal kind for the
+   first time, or 60 seconds have passed since the incident last
+   recorded anything. Repeats are counted in `aegisctl status` as
+   `incident repeats not recorded`, and nothing else. When a member
+   exits, the signal kinds it showed are forgotten.
 4. The verdict only moves up: once an incident is `would_quarantine`, it
    stays that way.
 
@@ -27,9 +32,9 @@ Incidents never close in v0.1. Every incident counts as open, and
 
 ```text
 /var/lib/aegis-v2/incidents/
-└── AEG-20261019-093000-a1b2/
-    ├── incident.json     the summary, rewritten on every update
-    └── timeline.jsonl    one line per decision, append-only
+└── AEG-20261019-093000-0123456789abcdef/
+    ├── incident.json     the summary, rewritten on every record
+    └── timeline.jsonl    one line per record, append-only
 ```
 
 The directory is set by `[incidents] dir`. Directories are mode 0700
@@ -39,9 +44,11 @@ never leaves a half-written summary.
 
 ### Incident ids
 
-`AEG-<date>-<time>-<4 hex digits>`, with the date and time in UTC when
-the incident opened, plus 16 random bits. For example,
-`AEG-20261019-093000-a1b2` opened at 09:30:00 UTC on 19 October 2026.
+`AEG-<date>-<time>-<16 hex digits>`: the date and time in UTC when the
+incident opened, then 64 random bits in lowercase hex. For example,
+`AEG-20261019-093000-0123456789abcdef` opened at 09:30:00 UTC on
+19 October 2026. aegisd and `aegisctl` accept only that exact shape,
+and `aegisctl` turns anything else away before asking the daemon.
 
 ### What aegisd loads at startup
 
@@ -59,7 +66,7 @@ no longer need them.
 
 ```json
 {
-  "id": "AEG-20261019-093000-a1b2",
+  "id": "AEG-20261019-093000-0123456789abcdef",
   "created": "2026-10-19T09:30:00Z",
   "updated": "2026-10-19T09:30:02Z",
   "updated_ns": 1792402202000000000,
@@ -70,25 +77,29 @@ no longer need them.
   "score": 85.0,
   "root": { "tgid": 4242, "…": "…" },
   "process_tree": [ { "tgid": 4242, "…": "…" } ],
+  "process_tree_truncated": false,
   "evidence": [ { "signal": "MemfdExec", "…": "…" } ],
-  "evidence_truncated": false
+  "evidence_truncated": false,
+  "timeline_lines": 2
 }
 ```
 
-| Field                | Meaning                                     |
-| -------------------- | ------------------------------------------- |
-| `id`                 | the incident id, same as the directory name |
-| `created`, `updated` | UTC, RFC 3339, to the second                |
-| `updated_ns`         | `updated` in Unix nanoseconds               |
-| `boot_id`            | the boot the process ids belong to          |
-| `mode`               | `audit` in v0.1                             |
-| `verdict`            | `would_throttle` or `would_quarantine`      |
-| `max_score`          | the highest score recorded                  |
-| `score`              | the score at the last update                |
-| `root`               | the process that opened the incident        |
-| `process_tree`       | every member, root first                    |
-| `evidence`           | every distinct piece of evidence, up to 256 |
-| `evidence_truncated` | `true` once the 256 cap dropped something   |
+| Field                    | Meaning                                     |
+| ------------------------ | ------------------------------------------- |
+| `id`                     | the incident id, same as the directory name |
+| `created`, `updated`     | UTC, RFC 3339, to the second                |
+| `updated_ns`             | `updated` in Unix nanoseconds               |
+| `boot_id`                | the boot the process ids belong to          |
+| `mode`                   | `audit` in v0.1                             |
+| `verdict`                | `would_throttle` or `would_quarantine`      |
+| `max_score`              | the highest score recorded                  |
+| `score`                  | the score at the last update                |
+| `root`                   | the process that opened the incident        |
+| `process_tree`           | the members, root first, up to 4096         |
+| `process_tree_truncated` | `true` once the 4096 cap kept a member out  |
+| `evidence`               | every distinct piece of evidence, up to 256 |
+| `evidence_truncated`     | `true` once the 256 cap dropped something   |
+| `timeline_lines`         | lines in `timeline.jsonl`, marker included  |
 
 ### Process entries
 
@@ -112,7 +123,17 @@ no longer need them.
 | `rpm_owned:<package>` | owned by that package and unchanged          |
 | `pinned`              | matches the SHA-256 pinned in the config     |
 | `modified`            | RPM-owned or pinned, but the content differs |
-| `unverified`          | anything else, including not checked yet     |
+| `unverified`          | anything else; see below                     |
+
+`unverified` covers a binary no allowlist entry or pin names (aegisd
+never checks those), one rpm doesn't own, one rpm couldn't answer for,
+a symlink, FIFO or device at the path, and a file other than the one the
+kernel executed. It's also what a process shows while its check is
+still running.
+
+Members past the 4096 cap still join the incident while aegisd runs,
+but they aren't listed, so after a restart aegisd doesn't know they
+belong to it.
 
 A path can hold any byte, including newlines and terminal escapes. Use
 `exe_b64` when you need the exact bytes. `aegisctl` escapes control and
@@ -137,9 +158,10 @@ bidirectional characters before printing either.
   <ns> } }`: `start_time_ns` is 0 if aegisd never saw the target start
 - `EgressScan { distinct_targets: <n> }`
 
-`reason` reads like `exec of a memfd (/memfd:x (deleted))` or
-`memfd_create; caller is allowlisted`. For the two exec signals, the
-path in brackets is the file that was executed.
+`reason` reads like `exec of a memfd (/memfd:x (deleted))`,
+`memfd_create; caller is allowlisted`, or
+`memfd_create; allowlist withheld: LD_PRELOAD is set`. For the two
+exec signals, the path in brackets is the file that was executed.
 
 `ts_ns` counts from boot, so it only converts to a wall-clock time
 within the same boot. `aegisctl incidents show` does that conversion
@@ -148,28 +170,39 @@ when `boot_id` matches the running boot, and otherwise prints
 
 ## `timeline.jsonl`
 
-One JSON object per line, one line per decision at throttle or above:
+One JSON object per line, one line per recorded decision:
 
 ```json
 {"ts":"2026-10-19T09:30:02Z","tgid":4242,"start_time_ns":81234567890,"tier":"quarantine","verdict":"would_quarantine","score":85.0,"evidence":[…]}
 ```
 
-| Field           | Meaning                                        |
-| --------------- | ---------------------------------------------- |
-| `ts`            | when it was recorded, UTC                      |
-| `tgid`          | the process the decision was about             |
-| `start_time_ns` | that process's start time                      |
-| `tier`          | `throttle` or `quarantine`                     |
-| `verdict`       | `would_throttle` or `would_quarantine`         |
-| `score`         | the decision's score                           |
-| `evidence`      | that process's evidence at the time, newest 32 |
+| Field           | Meaning                                    |
+| --------------- | ------------------------------------------ |
+| `ts`            | when it was recorded, UTC                  |
+| `tgid`          | the process the decision was about         |
+| `start_time_ns` | that process's start time                  |
+| `tier`          | `throttle` or `quarantine`                 |
+| `verdict`       | `would_throttle` or `would_quarantine`     |
+| `score`         | the decision's score                       |
+| `evidence`      | the one evidence entry this decision added |
+
+Earlier evidence is on earlier lines. A timeline stops at 10,000 lines.
+One marker line follows (shown wrapped here), and then nothing more is
+appended, though `incident.json` keeps updating:
+
+```json
+{"ts": "2026-10-19T11:02:41Z", "truncated": true,
+ "note": "timeline truncated at 10000 lines"}
+```
+
+`aegisctl incidents timeline` prints the marker as a row.
 
 ## Reading incidents
 
 ```sh
 aegisctl incidents list
-aegisctl incidents show AEG-20261019-093000-a1b2
-aegisctl incidents timeline AEG-20261019-093000-a1b2
+aegisctl incidents show AEG-20261019-093000-0123456789abcdef
+aegisctl incidents timeline AEG-20261019-093000-0123456789abcdef
 ```
 
 Add `--json` to any of them for the raw data. See
@@ -179,6 +212,8 @@ Add `--json` to any of them for the raw data. See
 
 Incident writes happen on their own thread, so a slow disk never holds
 up scoring. If the thread's 256-entry queue fills, the decision is
-dropped and counted as `incidents dropped` in `aegisctl status`. A write
-that fails is logged and counted as `incident write errors`. Telemetry
-is sent either way, so journald still gets the record.
+dropped and counted as `incidents dropped` in `aegisctl status`, and its
+telemetry isn't sent either. Nothing counts as said, so the next
+decision in that incident is recorded and sent in its place. A write
+that fails on disk is logged and counted as `incident write errors`;
+its telemetry has already gone out.

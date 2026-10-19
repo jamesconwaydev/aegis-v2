@@ -69,7 +69,7 @@ systemctl enable --now aegisd
 aegisctl status
 ```
 
-`status` shows `mode audit`, lists seven probes, and has an `events`
+`status` shows `mode audit`, lists eight probes, and has an `events`
 counter that climbs. If it says aegisd isn't running, see
 [troubleshooting](troubleshooting.md#aegisd-wont-start).
 
@@ -105,7 +105,8 @@ start` returns once the probes are attached and the socket is listening.
 
 A config error exits with status 78, and the unit won't restart on that
 status, since restarting can't fix a bad file. Any other failure
-restarts after 5 seconds.
+restarts after 5 seconds, including the probe event stream ending
+unexpectedly, which makes aegisd exit non-zero.
 
 ## Upgrade
 

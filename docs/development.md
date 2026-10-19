@@ -212,9 +212,17 @@ limactl show-ssh --format=config aegis-rocky10 > lima.ssh
 cargo xtask e2e --host lima-aegis-rocky10 --ssh-config lima.ssh --sudo
 ```
 
-Use a disposable host. The harness installs `gdb`, `podman`,
-`python3-pip` and `strace` if they're missing, turns SELinux enforcing
-for the run, and stops and restarts aegisd between scenarios. Afterwards
+Use a disposable host, and mark it as one first:
+
+```sh
+ssh root@203.0.113.10 touch /etc/aegis-e2e-host
+```
+
+The harness refuses a host without `/etc/aegis-e2e-host` unless you pass
+`--yes-wipe`, because it reinstalls aegis-v2, deletes
+`/var/lib/aegis-v2` between scenarios, installs `gdb`, `podman`,
+`python3-pip` and `strace` if they're missing, and turns SELinux
+enforcing for the run. Afterwards
 it removes the packages it added, the aegis RPMs and
 `/var/lib/aegis-v2`, and puts SELinux back how it found it. `--keep`
 leaves everything installed.
@@ -225,15 +233,24 @@ cleared first. It passes when:
 - its command exits 0,
 - `aegisctl incidents list --json` shows exactly what `expect` says:
   `none`, or one incident with `would_throttle` or `would_quarantine`,
-- no SELinux denial mentioning aegis was logged, and
+- no SELinux denial mentioning aegis was logged (an `ausearch` failure
+  other than `<no matches>` fails the check), and
 - `/etc` hashes the same before and after, since v0.1 must never change
   the host.
 
-There are ten scenarios: five attack simulations (`tmp-dropper`,
-`memfd-exec`, `ptrace-daemon`, `port-scan`, `chain`) and five benign
+"No incident" has to hold for 8 seconds, past aegisd's 6-second hold on
+signals, and an expected incident has 15 seconds to appear.
+
+There are twelve scenarios: five attack simulations (`tmp-dropper`,
+`memfd-exec`, `ptrace-daemon`, `port-scan`, `chain`), five benign
 workloads that must not trip anything (`dnf-install`, `gdb-attach`,
-`pip-download`, `podman-run`, `ssh-login`). Adding one means adding a
-`[[scenario]]` with a `name`, a shell `run` command and an `expect`.
+`pip-download`, `podman-run`, `ssh-login`), and a pair for the
+injection check. `preload-memfd` pins `aegis-sim`, lists it as a memfd
+caller, and runs it with `LD_PRELOAD`, which must still quarantine;
+`pinned-memfd` does the same without the preload, which must not.
+
+Adding a scenario means adding a `[[scenario]]` with a `name`, a shell
+`run` command and an `expect`.
 `aegis-sim --help` lists the simulators.
 
 ## Licences and CI

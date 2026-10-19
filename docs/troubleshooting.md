@@ -36,8 +36,14 @@ or a missing program. Run `aegisctl preflight`:
   offsets it needs.
 - **`kernel` FAIL:** the kernel is older than 6.12.
 
-aegisd attaches all seven probes or none, and won't run with a partial
+aegisd attaches all eight probes or none, and won't run with a partial
 set.
+
+### It keeps restarting with `probe event stream ended`
+
+The kernel side stopped delivering events, and aegisd exited non-zero
+so systemd would restart it. If it happens again, report it with the
+journal around the restart and your kernel version.
 
 ### `another aegisd is running`
 
@@ -91,14 +97,14 @@ days. `incidents show <id>` finds older ones on disk.
 Work through them as [scoring](scoring.md#baselining-a-host) describes.
 Look at each incident's evidence and member verification:
 
-- **A tool you trust, marked `unverified`:** it isn't owned by an RPM
-  package, or it lives somewhere verification can't match (see below).
-  Pin its SHA-256 and add it to the relevant allowlist.
+- **A tool you trust, marked `unverified`:** aegisd only checks binaries
+  an allowlist entry or pin names, so this is expected for anything not
+  listed yet. Add its path to the list for the signal that fired, and
+  pin its SHA-256 too if no RPM package owns it.
 - **A tool you trust, marked `modified`:** the file no longer matches
   its package or pin. Find out why before you allowlist anything: `rpm
   -V <package>` shows what changed.
-- **A tool you trust, marked `rpm_owned`, but not on a list:** add its
-  path to the list for the signal that fired.
+- **Evidence that says `allowlist withheld:`:** see the next section.
 
 ### Allowlisted, but it still scores
 
@@ -106,12 +112,42 @@ Look at each incident's evidence and member verification:
   process.
 - The path must be exact and absolute. Allowlists match the resolved
   path the kernel executed, such as `/usr/bin/python3.12`, not the
-  symlink you typed.
+  symlink you typed. A symlink at a listed or pinned path never
+  verifies.
+- Look for `allowlist withheld:` in the evidence reason. It means the
+  binary verified but the process wasn't trusted:
+  - `LD_PRELOAD is set`, `LD_AUDIT is set` or `LD_LIBRARY_PATH is set`:
+    the process was started with that loader variable. On a host that
+    sets `LD_LIBRARY_PATH` globally (in `/etc/environment` or a profile
+    script, say), every allowlisted tool hits this. Remove the global
+    setting, or expect these incidents.
+  - `its environment could not be read`: aegisd couldn't read
+    `/proc/<pid>/environ` within 1 second, often because the process
+    exited first. If it happens for every allowlisted process until a
+    restart, see [stuck environment reads](#every-allowlisted-process-loses-its-allowlist).
+  - `it was the target of a ptrace attach`: a debugger attached to it,
+    or to its parent before the fork. The mark clears at the next exec.
 - For `excluded_parent_processes`, only the immediate parent of the
   process doing the exec counts.
 - For `scan_binaries`, the scanner must run as root and from a terminal.
 - After a reload, check the journal for `configuration reloaded`. A
   failed reload keeps the old config and says why.
+
+### Every allowlisted process loses its allowlist
+
+If every allowlisted process shows `its environment could not be read`
+until aegisd restarts, environment reads are stuck. A read of a process
+whose memory is backed by something that never answers, such as a hung
+FUSE filesystem, can block for good, and after 16 of those every
+further read is refused. That gives false positives, not missed
+detections. `systemctl restart aegisd` clears it.
+
+### An allowlisted RPM binary stays unverified
+
+If the RPM database was broken or unreadable when aegisd checked a
+binary, rpm can answer "not owned", and aegisd caches that. Fix the
+database (`rpm --rebuilddb`), then `systemctl reload aegisd`, which
+empties the cache.
 
 ### Binaries on btrfs or overlayfs never verify
 
@@ -129,8 +165,7 @@ known limitation, and servers rarely suspend.
 
 ## Counters in `aegisctl status`
 
-All of these should stay at 0. Each one that grows means something was
-lost.
+These should stay at 0. Each one that grows means something was lost.
 
 - **dropped events:** the 4 MiB ring buffer was full. Expect it only
   in huge bursts of execs or connects.
@@ -141,11 +176,15 @@ lost.
 - **verifications skipped:** 1,024 verifications were already in
   flight. Check that `rpm -qf /usr/bin/bash` returns quickly.
 - **defer queue overflows:** a process had 64 signals waiting on
-  verification. Report it, with the incident.
+  verification, or 8,192 were waiting in all. Report it, with the
+  incident.
 - **telemetry dropped: journald:** journald was away or its buffer was
   full. Check `systemctl status systemd-journald`.
 - **telemetry dropped: otlp ...:** see
   [telemetry](telemetry.md#failure-handling).
+
+`incident repeats not recorded` is different: it counts decisions inside
+an open incident that added nothing new, and it grows in normal use.
 
 ## Telemetry
 

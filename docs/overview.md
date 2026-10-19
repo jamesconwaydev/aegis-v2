@@ -37,7 +37,7 @@ v0.1 has five:
 | exec from a temp directory | runs a file from tmpfs, `/tmp` or `/var/tmp` |
 | `memfd_create`             | calls `memfd_create`                         |
 | exec of a memfd            | runs a file that only exists in memory       |
-| ptrace of a system daemon  | asks to attach to pid 1 or a systemd service |
+| ptrace of a system daemon  | attaches to pid 1 or a systemd service       |
 | egress scan                | makes many outbound TCP connects in 2 s      |
 
 [Scoring](scoring.md) has the exact rules and weights.
@@ -83,7 +83,16 @@ on the host and is either:
   the RPM database), or
 - pinned by an administrator to a SHA-256 in the config.
 
-Anything else is *unverified* and gets no allowlist credit.
+Anything else is *unverified* and gets no allowlist credit. aegisd
+only checks files that an allowlist entry or a pin names, so every
+other executable shows as unverified too; for those, a verdict wouldn't
+change the score.
+
+Even a verified binary loses its allowlist credit when something else
+may be running inside it: `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH`
+in its environment, an environment aegisd can't read, or a successful
+ptrace attach to it. See
+[scoring](scoring.md#when-an-allowlist-is-withheld).
 
 ## Where to go next
 

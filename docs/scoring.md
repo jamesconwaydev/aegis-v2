@@ -48,11 +48,11 @@ threshold with room to spare for the decay between the two calls.
 
 ### ptrace of a system daemon
 
-Raised when a process calls `ptrace` with `PTRACE_ATTACH` or
-`PTRACE_SEIZE` against a system daemon, whether or not the kernel
-allows it. A target is a system daemon when it is pid 1, or when its
-cgroup (from `/proc/<pid>/cgroup`) is directly a `system.slice/*.service`
-unit.
+Raised when a process attaches to a system daemon with `PTRACE_ATTACH`
+or `PTRACE_SEIZE` and the kernel allows it. A refused attach, such as
+one aimed at another user's process, doesn't score. A target is a
+system daemon when it is pid 1, or when its cgroup (from
+`/proc/<pid>/cgroup`) is directly a `system.slice/*.service` unit.
 
 ### Egress scan
 
@@ -147,19 +147,50 @@ signal still appears in the process's evidence.
   has a controlling terminal.
 
 A path on a list only counts when that binary verifies: RPM-owned and
-unchanged, or matching a pin. See
+unchanged, or matching a pin. Name the real file, not a symlink to it:
+a symlink never verifies. See
 [verified executables](overview.md#verified-executables).
 
 For an exec, "the binary doing the exec" is the image before the exec,
 not the file it starts. That's what lets `runc` run its own memfd copy
 without letting anything else run one.
 
+### When an allowlist is withheld
+
+A verified binary can still be running someone else's code. So a
+process gets no allowlist modifier at all, the SELinux-domain one
+included, when:
+
+- its environment at exec holds `LD_PRELOAD`, `LD_AUDIT` or
+  `LD_LIBRARY_PATH`;
+- its environment couldn't be read within 1 second (this fails closed);
+  or
+- a tracer in the host's pid namespace attached to it with ptrace and
+  the attach succeeded. Its children inherit that at fork, and its next
+  exec clears it.
+
+For a temp-directory exec the parent's state counts too, since the
+parent is what earns the modifier. The verification itself still shows
+as it is, and the evidence says what was withheld and why:
+
+```text
+exec of a memfd; allowlist withheld: LD_PRELOAD is set
+```
+
+On a host that sets `LD_LIBRARY_PATH` globally, every allowlisted tool
+loses its modifiers this way. Expect incidents from tools such as
+`runc` or `dnf` there, and look for `allowlist withheld:` in their
+evidence. These checks are best effort; the
+[threat model](threat-model.md#the-injection-checks-are-best-effort)
+explains how they can be beaten.
+
 ### Waiting for verification
 
-Verification takes a moment (an `rpm` query and a hash). A signal that
-needs a verdict still in progress is held for up to 2 seconds, then
-scored with whatever verdict exists by then, `unverified` if none. Up
-to 64 signals are held per process; past that they score at once.
+Verification takes a moment (an `rpm` query and a hash), and so does
+the environment read. A signal that needs either is held for up to
+6 seconds, then scored with whatever is known by then: `unverified` if
+no verdict came, tainted if no environment did. Up to 64 signals are
+held per process and 8,192 in all; past either cap they score at once.
 
 ## Default examples
 
@@ -174,6 +205,8 @@ run against a real Rocky 10 host. "throttle" and "quarantine" mean
 | `memfd-exec`    | `memfd_create`, then exec of it     | 85    | quarantine |
 | `ptrace-daemon` | `/tmp` strace copy traces sshd      | 70    | throttle   |
 | `chain`         | from `/tmp`: scan, then ptrace sshd | 110   | quarantine |
+| `preload-memfd` | allowlisted memfd, `LD_PRELOAD` set | 85    | quarantine |
+| `pinned-memfd`  | the same without `LD_PRELOAD`       | 0     | none       |
 | benign          | dnf, gdb, pip, podman, ssh login    | < 50  | none       |
 
 ## Baselining a host
@@ -192,12 +225,14 @@ out what's normal before enforcement exists.
 3. For each incident, read the evidence:
 
    ```sh
-   aegisctl incidents show AEG-20261019-093000-a1b2
+   aegisctl incidents show AEG-20261019-093000-0123456789abcdef
    ```
 
    The `reason` column says what fired and why, for example
    `exec from a temp directory (/tmp/x)`. Each line under `members`
-   ends with whether that process's binary verified.
+   ends with that process's verification. Only binaries an allowlist
+   or pin names are ever checked, so everything else shows
+   `unverified`.
 4. Decide. If it's something you'd want to know about, leave it. If it's
    a legitimate tool, forgive it as narrowly as you can, in a drop-in
    such as `/etc/aegis-v2/allowlist.d/50-site.toml`:
@@ -227,6 +262,9 @@ package, or a pinned file whose hash changed.
   component decays a little between two events. Set `memfd_create` to
   25, and a temp-directory exec followed by a `memfd_create` scores a
   hair under 50, not 50. Leave a margin, as `memfd_exec` does.
+- `allowlist withheld:` in an allowlisted tool's evidence means the
+  tool ran with a loader variable, an unreadable environment, or after
+  a ptrace attach. Find out which before you change anything.
 - A weight of 0 turns a signal off. Its evidence is still recorded if
   the process lands in an incident for another reason.
 - A shorter half-life forgives slow, spread-out activity sooner; a
