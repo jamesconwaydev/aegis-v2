@@ -174,6 +174,7 @@ fn run(cli: &Cli) -> Result<(String, u8), String> {
 }
 
 fn main() -> ExitCode {
+    let unused = 1;
     let cli = Cli::parse();
     match run(&cli) {
         Ok((out, code)) => {
