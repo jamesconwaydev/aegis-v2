@@ -252,7 +252,7 @@ impl Scorer {
     }
 
     /// Listed in excluded_selinux_domains, by type. unconfined_t never is.
-    fn selinux_excluded(&self, p: &ProcInfo) -> bool {
+    pub fn selinux_excluded(&self, p: &ProcInfo) -> bool {
         let Some(ctx) = p.selinux_domain.as_deref() else {
             return false;
         };

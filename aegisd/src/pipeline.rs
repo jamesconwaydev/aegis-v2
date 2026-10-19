@@ -39,7 +39,7 @@ use aegis_common::{Event, EventKind, EXEC_MEMFD, PATH_TRUNCATED};
 
 use crate::config::{Config, Mode};
 use crate::incident::{new_incident_id, verdict, IncidentStore};
-use crate::proctable::{ProcInfo, ProcKey, ProcTable};
+use crate::proctable::{env_taint, ProcInfo, ProcKey, ProcTable, UNREADABLE};
 use crate::scoring::{
     signals_for, DaemonClassifier, Decision, ScanDetector, Scorer, Signal, SignalKind, Tier, KINDS,
 };
@@ -66,6 +66,11 @@ const _: () = assert!(DEFER_DEADLINE.as_secs() > 2 * RPM_TIMEOUT.as_secs());
 const MAX_DEFERRED_PER_PROC: usize = 64;
 /// Deferred signals across every process; past this they score at once.
 const MAX_DEFERRED: usize = 8192;
+/// How long an environment read may take before it counts as unreadable.
+/// A process can make the read block for good, so it never runs here.
+const ENV_DEADLINE: Duration = Duration::from_secs(1);
+/// Environment reads in flight; past this a process is tainted at once.
+const MAX_ENV_READS: usize = 256;
 /// Inside an incident, the longest it stays quiet while decisions keep
 /// coming that add nothing new.
 const HEARTBEAT_NS: u64 = 60 * 1_000_000_000;
@@ -94,7 +99,9 @@ impl Incidents {
     }
 }
 
-/// A signal held back until the gate process's verification lands.
+/// A signal held back until what its trust depends on is known: the
+/// gate process's verdict, and the environment of the processes whose
+/// allowlist entries it could earn.
 struct Deferred {
     /// True when the verdict belongs to the parent (a TmpExec is judged
     /// by its parent), false when it belongs to the subject itself.
@@ -105,7 +112,19 @@ struct Deferred {
     target: Option<PathBuf>,
     ts_ns: u64,
     deadline: Instant,
+    waits_exe: Option<ExeKey>,
+    waits_env: Vec<ProcKey>,
 }
+
+/// An environment read for the caller to run off the loop: the process,
+/// and the image (dev, ino) the answer must be about.
+pub type EnvJob = (ProcKey, (u64, u64));
+
+#[cfg(test)]
+type EnvBytes = Vec<u8>;
+
+/// Reads an environment: tgid, start time, the image it must still be.
+pub type EnvReader = fn(u32, u64, (u64, u64)) -> Option<Vec<u8>>;
 
 /// What an open incident has already said, so a repeat isn't said again.
 #[derive(Default)]
@@ -131,12 +150,23 @@ pub struct Pipeline {
     /// Verifications in flight, by what is being verified: who is
     /// waiting, and the exe each had when it asked.
     pending: HashMap<ExeKey, Vec<(ProcKey, PathBuf)>>,
-    /// Signals waiting on a verdict, by the verdict they wait on.
-    deferred: HashMap<ExeKey, Vec<Deferred>>,
-    /// Signals in `deferred`, in all.
-    deferred_len: usize,
+    /// Signals waiting, by id, and the ids waiting on each verdict and
+    /// on each process's environment. An index may hold ids already gone.
+    deferred: HashMap<u64, Deferred>,
+    next_id: u64,
+    by_exe: HashMap<ExeKey, Vec<u64>>,
+    by_env: HashMap<ProcKey, Vec<u64>>,
     /// Signals in `deferred`, per subject process.
     held: HashMap<ProcKey, usize>,
+    /// Environment reads in flight: the image each is about, and when it
+    /// stops waiting and counts as unreadable.
+    env_reads: HashMap<ProcKey, ((u64, u64), Instant)>,
+    /// Environment reads for the caller to run.
+    pub to_read_env: Vec<EnvJob>,
+    /// Tests: answer every environment read at once, as an instant
+    /// worker would.
+    #[cfg(test)]
+    env_auto: Option<fn(ProcKey) -> Option<EnvBytes>>,
     /// The executables worth verifying: `Allowlist::verify_paths`.
     verify_paths: BTreeSet<PathBuf>,
     /// Per incident id, what it has recorded so far.
@@ -182,8 +212,14 @@ impl Pipeline {
             mode: cfg.general.mode,
             pending: HashMap::new(),
             deferred: HashMap::new(),
-            deferred_len: 0,
+            next_id: 0,
+            by_exe: HashMap::new(),
+            by_env: HashMap::new(),
             held: HashMap::new(),
+            env_reads: HashMap::new(),
+            to_read_env: Vec::new(),
+            #[cfg(test)]
+            env_auto: None,
             verify_paths: cfg.allowlist.verify_paths(),
             spoken: HashMap::new(),
             // Seeded once from what the store loaded, so an incident opened
@@ -237,6 +273,7 @@ impl Pipeline {
         if kind != Some(EventKind::Exit) && self.table.ensure(ev) && kind != Some(EventKind::Exec) {
             // Found late, with its exe read from /proc: verify that.
             self.request_verification(key);
+            self.request_env(key);
         }
         let mut sigs = signals_for(ev, &self.table, &*self.daemons);
         if kind == Some(EventKind::Connect) {
@@ -270,21 +307,127 @@ impl Pipeline {
             _ => {}
         }
         self.table.apply(ev);
-        // A memfd has no path to open, and a truncated path is not the file.
-        if kind == Some(EventKind::Exec) && ev.flags & (EXEC_MEMFD | PATH_TRUNCATED) == 0 {
-            self.request_verification(key);
+        match kind {
+            Some(EventKind::Exec) => {
+                // A memfd has no path to open, and a truncated path is not
+                // the file.
+                if ev.flags & (EXEC_MEMFD | PATH_TRUNCATED) == 0 {
+                    self.request_verification(key);
+                }
+                self.request_env(key);
+            }
+            // The child has its parent's environment, but if that is still
+            // being read, the child needs its own answer.
+            Some(EventKind::Fork) if self.env_reads.contains_key(&key) => {
+                self.request_env(ProcKey {
+                    tgid: ev.child_tgid,
+                    start_time_ns: ev.child_start_time_ns,
+                });
+            }
+            _ => {}
         }
+    }
+
+    /// Queues a read of this process's environment, if anything it could
+    /// be trusted for depends on it: an allowlisted or pinned exe, or an
+    /// excluded SELinux domain. Until the answer lands it is tainted.
+    fn request_env(&mut self, key: ProcKey) {
+        let Some(p) = self.table.get(&key) else {
+            return;
+        };
+        let wants = p
+            .exe
+            .as_ref()
+            .is_some_and(|e| self.verify_paths.contains(e))
+            || self.scorer.selinux_excluded(p);
+        if !wants {
+            return;
+        }
+        let Some(image) = p.exe_id else {
+            self.table.set_env(&key, Some(UNREADABLE), false);
+            return;
+        };
+        // An older read for this process was about an image it no longer
+        // runs; whatever waited on it can't be told now.
+        if self.env_reads.contains_key(&key) {
+            self.env_resolve(&key, Some(UNREADABLE));
+        }
+        if self.env_reads.len() >= MAX_ENV_READS {
+            self.table.set_env(&key, Some(UNREADABLE), false);
+            return;
+        }
+        self.table.set_env(&key, None, true);
+        self.env_reads
+            .insert(key, (image, Instant::now() + ENV_DEADLINE));
+        self.to_read_env.push((key, image));
+        #[cfg(test)]
+        if let Some(f) = self.env_auto {
+            self.to_read_env.pop();
+            self.env_read(key, image, f(key));
+        }
+    }
+
+    /// The answer to a job queued in `to_read_env`: the environment, or
+    /// None if it couldn't be read. Ignored if that read was superseded
+    /// or timed out.
+    pub fn env_read(&mut self, key: ProcKey, image: (u64, u64), env: Option<Vec<u8>>) {
+        if self.env_reads.get(&key).map(|r| r.0) != Some(image) {
+            return;
+        }
+        let taint = env_taint(env.as_deref());
+        if self
+            .table
+            .get(&key)
+            .is_some_and(|p| p.exe_id == Some(image))
+        {
+            self.table.set_env(&key, taint, false);
+        }
+        self.env_resolve(&key, taint);
+    }
+
+    /// `key`'s environment is settled as `taint`: put it on every
+    /// signal waiting for it, and score those with nothing left to wait on.
+    fn env_resolve(&mut self, key: &ProcKey, taint: Option<&'static str>) {
+        self.env_reads.remove(key);
+        for id in self.by_env.remove(key).unwrap_or_default() {
+            let Some(d) = self.deferred.get_mut(&id) else {
+                continue;
+            };
+            for p in std::iter::once(&mut d.subject).chain(d.ancestors.first_mut()) {
+                if p.key == *key {
+                    p.env_taint = taint;
+                    p.env_pending = false;
+                }
+            }
+            d.waits_env.retain(|k| k != key);
+            self.try_release(id);
+        }
+        self.reap_exited();
+    }
+
+    /// Scores deferred signal `id` if it no longer waits on anything.
+    fn try_release(&mut self, id: u64) {
+        let ready = self
+            .deferred
+            .get(&id)
+            .is_some_and(|d| d.waits_exe.is_none() && d.waits_env.is_empty());
+        if !ready {
+            return;
+        }
+        let d = self.deferred.remove(&id).unwrap();
+        self.release(&d.subject.key);
+        self.score(
+            &d.subject,
+            &d.ancestors,
+            d.signal,
+            d.target.as_deref(),
+            d.ts_ns,
+        );
     }
 
     /// Scores a signal now, or defers it if the verdict it needs is still
     /// in flight.
     fn consider(&mut self, key: ProcKey, sig: Signal, target: Option<PathBuf>, ts_ns: u64) {
-        // Trust is judged below, on this process and its parent: finish
-        // reading either's environment first.
-        self.table.settle_env(&key);
-        if let Some(parent) = self.table.get(&key).and_then(|p| p.parent) {
-            self.table.settle_env(&parent);
-        }
         let Some(subject) = self.table.get(&key).cloned() else {
             return;
         };
@@ -297,17 +440,34 @@ impl Pipeline {
         } else {
             Some(&subject)
         };
-        let gate = gated.and_then(|p| Some((p.exe.clone()?, p.exe_id?)));
+        let waits_exe = gated
+            .and_then(|p| Some((p.exe.clone()?, p.exe_id?)))
+            .filter(|g| self.pending.contains_key(g));
+        // Whose environment the modifiers depend on: the subject's (its own
+        // lists, its SELinux domain) and, for a tmp exec, the parent's.
+        let waits_env: Vec<ProcKey> = std::iter::once(&subject)
+            .chain(ancestors.first().filter(|_| gate_is_parent))
+            .filter(|p| p.env_pending)
+            .map(|p| p.key)
+            .collect();
 
-        if let Some(path) = gate {
-            if self.pending.contains_key(&path) {
-                let held = self.held.get(&key).copied().unwrap_or(0);
-                if held >= MAX_DEFERRED_PER_PROC || self.deferred_len >= MAX_DEFERRED {
-                    self.deferred_overflow += 1;
-                } else {
-                    *self.held.entry(key).or_default() += 1;
-                    self.deferred_len += 1;
-                    self.deferred.entry(path).or_default().push(Deferred {
+        if waits_exe.is_some() || !waits_env.is_empty() {
+            let held = self.held.get(&key).copied().unwrap_or(0);
+            if held >= MAX_DEFERRED_PER_PROC || self.deferred.len() >= MAX_DEFERRED {
+                self.deferred_overflow += 1;
+            } else {
+                let id = self.next_id;
+                self.next_id += 1;
+                *self.held.entry(key).or_default() += 1;
+                if let Some(g) = &waits_exe {
+                    self.by_exe.entry(g.clone()).or_default().push(id);
+                }
+                for k in &waits_env {
+                    self.by_env.entry(*k).or_default().push(id);
+                }
+                self.deferred.insert(
+                    id,
+                    Deferred {
                         gate_is_parent,
                         subject,
                         ancestors,
@@ -315,9 +475,11 @@ impl Pipeline {
                         target,
                         ts_ns,
                         deadline: Instant::now() + DEFER_DEADLINE,
-                    });
-                    return;
-                }
+                        waits_exe,
+                        waits_env,
+                    },
+                );
+                return;
             }
         }
         self.score(&subject, &ancestors, sig, target.as_deref(), ts_ns);
@@ -367,11 +529,10 @@ impl Pipeline {
                 self.table.set_verification(&k, v.clone());
             }
         }
-        let ready = self.deferred.remove(path).unwrap_or_default();
-        for d in &ready {
-            self.release(&d.subject.key);
-        }
-        for mut d in ready {
+        for id in self.by_exe.remove(path).unwrap_or_default() {
+            let Some(d) = self.deferred.get_mut(&id) else {
+                continue;
+            };
             // The gate's verdict is known now; put it on the snapshot.
             let gated = if d.gate_is_parent {
                 d.ancestors.first_mut()
@@ -381,35 +542,37 @@ impl Pipeline {
             if let Some(p) = gated {
                 p.verification = v.clone();
             }
-            self.score(
-                &d.subject,
-                &d.ancestors,
-                d.signal,
-                d.target.as_deref(),
-                d.ts_ns,
-            );
+            d.waits_exe = None;
+            self.try_release(id);
         }
         self.reap_exited();
     }
 
-    /// Scores every signal whose deadline has passed as Unverified. The
-    /// caller runs this on a timer.
+    /// Scores every signal whose deadline has passed, as Unverified or
+    /// tainted for whatever it still waited on, and gives up on
+    /// environment reads past theirs. The caller runs this on a timer.
     pub fn flush_expired(&mut self, cutoff: Instant) {
-        let mut expired = Vec::new();
-        for v in self.deferred.values_mut() {
-            let (gone, keep): (Vec<_>, Vec<_>) = std::mem::take(v)
-                .into_iter()
-                .partition(|d| d.deadline <= cutoff);
-            *v = keep;
-            expired.extend(gone);
+        let late: Vec<ProcKey> = self
+            .env_reads
+            .iter()
+            .filter(|(_, (_, at))| *at <= cutoff)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in late {
+            let image = self.env_reads[&k].0;
+            self.env_read(k, image, None);
         }
-        self.deferred.retain(|_, v| !v.is_empty());
-        // In the order they happened, whichever verdict each waited on.
-        expired.sort_by_key(|d| d.ts_ns);
-        for d in &expired {
+        let mut expired: Vec<(u64, u64)> = self
+            .deferred
+            .iter()
+            .filter(|(_, d)| d.deadline <= cutoff)
+            .map(|(id, d)| (d.ts_ns, *id))
+            .collect();
+        // In the order they happened, whatever each waited on.
+        expired.sort();
+        for (_, id) in expired {
+            let d = self.deferred.remove(&id).unwrap();
             self.release(&d.subject.key);
-        }
-        for d in expired {
             self.score(
                 &d.subject,
                 &d.ancestors,
@@ -423,7 +586,6 @@ impl Pipeline {
 
     /// One of `key`'s deferred signals has left the queue.
     fn release(&mut self, key: &ProcKey) {
-        self.deferred_len -= 1;
         if let Some(n) = self.held.get_mut(key) {
             *n -= 1;
             if *n == 0 {
@@ -680,6 +842,52 @@ impl Pipeline {
     }
 }
 
+/// Runs environment reads on their own threads, at most `max` at once. A
+/// read can block for good (a FUSE-backed environment), so a stuck
+/// thread is simply left behind; past the cap a job fails at once, and
+/// the pipeline's deadline covers any answer that never comes. Either
+/// way the process counts as tainted.
+pub struct EnvReaders {
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    max: usize,
+    reader: EnvReader,
+}
+
+impl EnvReaders {
+    pub fn new() -> Self {
+        Self::with(crate::proctable::read_environ, 16)
+    }
+
+    pub fn with(reader: EnvReader, max: usize) -> Self {
+        Self {
+            inflight: Arc::default(),
+            max,
+            reader,
+        }
+    }
+
+    /// Reads `job` off the caller's thread; `done` gets the answer.
+    pub fn spawn(&self, job: EnvJob, done: impl FnOnce(EnvJob, Option<Vec<u8>>) + Send + 'static) {
+        if self.inflight.fetch_add(1, Ordering::SeqCst) >= self.max {
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            done(job, None);
+            return;
+        }
+        let (n, read) = (self.inflight.clone(), self.reader);
+        let r = std::thread::Builder::new()
+            .name("aegis-env".into())
+            .spawn(move || {
+                let env = read(job.0.tgid, job.0.start_time_ns, job.1);
+                n.fetch_sub(1, Ordering::SeqCst);
+                done(job, env);
+            });
+        if r.is_err() {
+            // No answer will come; the deadline taints it.
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// The exec'd file from the event, by its exact path bytes.
 fn exec_path(ev: &Event) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
@@ -801,7 +1009,7 @@ mod tests {
         let mut p = Pipeline::new(&cfg, Incidents::inline(store), sinks, Box::new(Pid1), false);
         // No real processes behind these tgids: give each a clean
         // environment.
-        p.table.environ = |_, _, _| Some(b"PATH=/usr/bin\0".to_vec());
+        p.env_auto = Some(|_| Some(b"PATH=/usr/bin\0".to_vec()));
         p.table.host_pidns = |_| true;
         (p, Dir(d))
     }
@@ -872,14 +1080,14 @@ mod tests {
             EXEC_MEMFD | EXEC_FROM_TMP,
         ));
         assert!(p.to_verify.is_empty(), "a memfd is not verified");
-        assert_eq!(p.deferred_len, 2, "memfd_create and memfd exec deferred");
+        assert_eq!(p.deferred.len(), 2, "memfd_create and memfd exec deferred");
         if let Some(v) = runc_verdict {
             p.verified(&exe_key("/usr/bin/runc"), v);
         } else {
             // Verdict never comes: the deadline fires them as Unverified.
             p.flush_expired(Instant::now() + DEFER_DEADLINE + Duration::from_secs(1));
         }
-        assert_eq!(p.deferred_len, 0);
+        assert_eq!(p.deferred.len(), 0);
     }
 
     #[test]
@@ -912,11 +1120,11 @@ mod tests {
         p.to_verify.clear();
         p.handle(&ev(EventKind::MemfdCreate, 60));
         p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
-        assert_eq!(p.deferred_len, 2);
+        assert_eq!(p.deferred.len(), 2);
         // Gone before the verdict: its signals must not go with it.
         p.handle(&ev(EventKind::Exit, 60));
         assert!(p.table.get(&key(60)).is_none());
-        assert_eq!(p.deferred_len, 2);
+        assert_eq!(p.deferred.len(), 2);
         p.flush_expired(Instant::now() + DEFER_DEADLINE + Duration::from_secs(1));
         let l = p.store().list();
         assert_eq!(l.len(), 1);
@@ -938,7 +1146,7 @@ mod tests {
         p.handle(&ev(EventKind::MemfdCreate, 60));
         p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
         p.flush_all();
-        assert_eq!(p.deferred_len, 0);
+        assert_eq!(p.deferred.len(), 0);
         assert_eq!(p.store().open_count(), 1);
     }
 
@@ -950,7 +1158,7 @@ mod tests {
         p.handle(&exec(60, "/usr/bin/runc", 0));
         p.to_verify.clear();
         p.handle(&ev(EventKind::MemfdCreate, 60));
-        assert_eq!(p.deferred_len, 1);
+        assert_eq!(p.deferred.len(), 1);
         p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
         assert_eq!(p.store().open_count(), 0);
     }
@@ -958,7 +1166,7 @@ mod tests {
     #[test]
     fn a_preloaded_runc_is_quarantined_even_once_verified() {
         let (mut p, _d) = pipeline("preload");
-        p.table.environ = |_, _, _| Some(b"LD_PRELOAD=/tmp/evil.so\0".to_vec());
+        p.env_auto = Some(|_| Some(b"LD_PRELOAD=/tmp/evil.so\0".to_vec()));
         runc_self_clone(&mut p, Some(rpm("runc")));
         let l = p.store().list();
         assert_eq!(l.len(), 1);
@@ -979,17 +1187,67 @@ mod tests {
     }
 
     #[test]
-    fn an_environment_read_too_early_is_read_again_and_trusted() {
-        // At the exec's commit the new environment isn't laid out yet:
-        // empty. By runc's memfd_create it is.
-        let (mut p, _d) = pipeline("env-late");
-        p.table.environ = |_, _, _| Some(Vec::new());
+    fn signals_wait_for_the_environment_read_off_the_loop() {
+        // Nothing answers by itself: the read is the caller's job.
+        let (mut p, _d) = pipeline("env-async");
+        p.env_auto = None;
         p.handle(&exec(60, "/usr/bin/runc", 0));
+        let jobs = std::mem::take(&mut p.to_read_env);
+        assert_eq!(jobs.len(), 1);
+        assert!(p.table.get(&key(60)).unwrap().env_pending);
         p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
-        p.table.environ = |_, _, _| Some(b"PATH=/usr/bin\0".to_vec());
         p.handle(&ev(EventKind::MemfdCreate, 60));
+        assert_eq!(p.deferred.len(), 1, "waits for the environment");
+        p.env_read(jobs[0].0, jobs[0].1, Some(b"PATH=/usr/bin\0".to_vec()));
+        assert_eq!(p.deferred.len(), 0);
         p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
         assert_eq!(p.store().open_count(), 0);
+    }
+
+    #[test]
+    fn an_environment_read_that_never_answers_taints_after_its_deadline() {
+        let (mut p, _d) = pipeline("env-stuck");
+        p.env_auto = None;
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
+        assert_eq!(p.deferred.len(), 2);
+        // Not yet: the loop doesn't wait, it just hasn't heard.
+        p.flush_expired(Instant::now());
+        assert_eq!(p.deferred.len(), 2);
+        p.flush_expired(Instant::now() + ENV_DEADLINE + Duration::from_millis(1));
+        assert_eq!(p.deferred.len(), 0);
+        let l = p.store().list();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].verdict, "would_quarantine");
+        // A late answer changes nothing.
+        let job = (key(60), (0, 0));
+        p.env_read(job.0, job.1, Some(b"PATH=/usr/bin\0".to_vec()));
+        assert_eq!(p.store().list()[0].verdict, "would_quarantine");
+    }
+
+    #[test]
+    fn a_reader_that_blocks_forever_never_blocks_the_caller() {
+        fn stuck(_: u32, _: u64, _: (u64, u64)) -> Option<Vec<u8>> {
+            loop {
+                std::thread::park();
+            }
+        }
+        let r = EnvReaders::with(stuck, 2);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = Instant::now();
+        for i in 0..4 {
+            let tx = tx.clone();
+            r.spawn((key(i), (0, 0)), move |j, env| {
+                let _ = tx.send((j.0.tgid, env));
+            });
+        }
+        assert!(t.elapsed() < Duration::from_secs(1));
+        // Two threads are stuck; the two past the cap fail at once.
+        let mut got: Vec<_> = rx.try_iter().collect();
+        got.sort();
+        assert_eq!(got, [(2, None), (3, None)]);
     }
 
     #[test]
@@ -1016,7 +1274,7 @@ mod tests {
         assert!(p.pending.is_empty());
         // Nothing to wait for, so nothing is deferred either.
         p.handle(&ev(EventKind::MemfdCreate, 60));
-        assert_eq!(p.deferred_len, 0);
+        assert_eq!(p.deferred.len(), 0);
         p.handle(&exec(61, "/usr/bin/runc", 0));
         assert_eq!(lookups(&p.to_verify), paths(&["/usr/bin/runc"]));
     }
@@ -1028,9 +1286,9 @@ mod tests {
         p.handle(&ev(EventKind::MemfdCreate, 60));
         // Two rpm calls at their timeout: still waiting.
         p.flush_expired(Instant::now() + 2 * RPM_TIMEOUT);
-        assert_eq!(p.deferred_len, 1);
+        assert_eq!(p.deferred.len(), 1);
         p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
-        assert_eq!(p.deferred_len, 0);
+        assert_eq!(p.deferred.len(), 0);
         assert_eq!(p.store().open_count(), 0);
     }
 
@@ -1044,14 +1302,14 @@ mod tests {
                 p.handle(&ev(EventKind::MemfdCreate, 10_000 + t));
             }
         }
-        assert_eq!(p.deferred_len, MAX_DEFERRED);
+        assert_eq!(p.deferred.len(), MAX_DEFERRED);
         assert_eq!(
             p.deferred_overflow as usize,
             procs * MAX_DEFERRED_PER_PROC - MAX_DEFERRED
         );
         assert_eq!(p.held.values().sum::<usize>(), MAX_DEFERRED);
         p.verified(&exe_key("/usr/bin/x"), rpm("x"));
-        assert_eq!(p.deferred_len, 0);
+        assert_eq!(p.deferred.len(), 0);
         assert!(p.held.is_empty() && p.deferred.is_empty());
     }
 
@@ -1169,7 +1427,7 @@ mod tests {
         for _ in 0..MAX_DEFERRED_PER_PROC + 5 {
             p.handle(&ev(EventKind::MemfdCreate, 90));
         }
-        assert_eq!(p.deferred_len, MAX_DEFERRED_PER_PROC);
+        assert_eq!(p.deferred.len(), MAX_DEFERRED_PER_PROC);
         assert_eq!(p.deferred_overflow, 5);
     }
 
@@ -1207,7 +1465,7 @@ mod tests {
         p.verified(&exe_key("/tmp/st"), Verification::Unverified);
         p.handle(&ptrace_pid1(child));
         p.to_verify.clear();
-        assert_eq!(p.deferred_len, 0);
+        assert_eq!(p.deferred.len(), 0);
     }
 
     #[test]

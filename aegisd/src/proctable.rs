@@ -34,8 +34,8 @@ pub struct ProcInfo {
     /// Why the environment it was exec'd with voids allowlist trust
     /// (a loader variable, or no readable environment at all).
     pub env_taint: Option<&'static str>,
-    /// Its environment wasn't there to read yet: at an exec's commit the
-    /// kernel hasn't laid it out. `ProcTable::settle_env` tries again.
+    /// Its environment is being read off the event loop. Until it lands
+    /// the process counts as tainted.
     pub env_pending: bool,
     /// It was the target of a ptrace attach or seize. Inherited at
     /// fork, cleared at exec.
@@ -56,17 +56,12 @@ impl ProcInfo {
     }
 }
 
-/// Reads a process's environment, given its tgid, start time and, when
-/// known, the (dev, ino) its image must still be.
-pub type EnvReader = fn(u32, u64, Option<(u64, u64)>) -> Option<Vec<u8>>;
-
-const UNREADABLE: &str = "its environment could not be read";
+pub const UNREADABLE: &str = "its environment could not be read";
 
 pub struct ProcTable {
     procs: HashMap<ProcKey, ProcInfo>,
-    /// Swappable so tests can run without real processes behind them.
-    pub environ: EnvReader,
-    /// Whether a tgid is in the host's pid namespace. Swappable likewise.
+    /// Whether a tgid is in the host's pid namespace. Swappable so tests
+    /// can run without real processes behind them.
     pub host_pidns: fn(u32) -> bool,
 }
 
@@ -74,34 +69,47 @@ impl Default for ProcTable {
     fn default() -> Self {
         Self {
             procs: HashMap::new(),
-            environ: read_environ,
             host_pidns: in_host_pidns,
         }
     }
 }
 
-/// `tgid` shares pid 1's pid namespace, so a pid it names is a host pid.
-/// Unreadable counts as no.
-fn in_host_pidns(tgid: u32) -> bool {
+/// Whether `tgid` shares pid 1's pid namespace, so a pid it names is a
+/// host pid. Fails closed: if either link can't be read (a tracer that
+/// attached, injected and exited before we got here), it counts as the
+/// host's.
+pub fn in_host_pidns(tgid: u32) -> bool {
     let ns = |p: &str| std::fs::read_link(format!("/proc/{p}/ns/pid")).ok();
-    ns(&tgid.to_string()).is_some_and(|n| Some(n) == ns("1"))
+    match (ns(&tgid.to_string()), ns("1")) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
 }
 
 /// `/proc/<tgid>/environ`, once the start time shows the pid hasn't been
-/// reused and, given `image`, that it still runs that file: after a
-/// later exec the environment is the new image's.
-fn read_environ(tgid: u32, start_time_ns: u64, image: Option<(u64, u64)>) -> Option<Vec<u8>> {
-    if !crate::pipeline::proc_start_matches(tgid, start_time_ns) {
-        return None;
-    }
-    let env = std::fs::read(format!("/proc/{tgid}/environ")).ok()?;
-    if let Some(want) = image {
-        let md = std::fs::metadata(format!("/proc/{tgid}/exe")).ok()?;
-        if (md.dev(), md.ino()) != want {
+/// reused and that it still runs `image`: after a later exec the
+/// environment is the new image's. Blocking, and a process can make it
+/// block for good (environment pages backed by FUSE), so it only ever
+/// runs off the event loop.
+///
+/// At an exec's commit the kernel hasn't laid the new environment out
+/// yet, so an empty read is retried for a little while.
+pub fn read_environ(tgid: u32, start_time_ns: u64, image: (u64, u64)) -> Option<Vec<u8>> {
+    for _ in 0..10 {
+        if !crate::pipeline::proc_start_matches(tgid, start_time_ns) {
             return None;
         }
+        let env = std::fs::read(format!("/proc/{tgid}/environ")).ok()?;
+        let md = std::fs::metadata(format!("/proc/{tgid}/exe")).ok()?;
+        if (md.dev(), md.ino()) != image {
+            return None;
+        }
+        if !env.is_empty() {
+            return Some(env);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    Some(env)
+    None
 }
 
 /// Why an environment (NUL-separated `NAME=value` entries) voids
@@ -150,39 +158,17 @@ fn selinux_domain(tgid: u32) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// Judges an environment read at exec. Nothing there yet (the kernel
-/// lays it out after the exec commits) leaves it pending.
-fn set_env(p: &mut ProcInfo, env: Option<Vec<u8>>) {
-    match env.filter(|e| !e.is_empty()) {
-        Some(e) => {
-            p.env_taint = env_taint(Some(&e));
-            p.env_pending = false;
-        }
-        None => {
-            p.env_taint = None;
-            p.env_pending = true;
-        }
-    }
-}
-
 impl ProcTable {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Reads a pending environment again, once, now that the process has
-    /// run: before its trust is judged. Still nothing, or a different
-    /// image by now, fails closed.
-    pub fn settle_env(&mut self, key: &ProcKey) {
-        let Some(p) = self.procs.get(key).filter(|p| p.env_pending) else {
-            return;
-        };
-        let env = p
-            .exe_id
-            .and_then(|id| (self.environ)(key.tgid, key.start_time_ns, Some(id)));
-        let p = self.procs.get_mut(key).unwrap();
-        p.env_taint = env_taint(env.as_deref());
-        p.env_pending = false;
+    /// Records where reading a process's environment stands.
+    pub fn set_env(&mut self, k: &ProcKey, taint: Option<&'static str>, pending: bool) {
+        if let Some(p) = self.procs.get_mut(k) {
+            p.env_taint = taint;
+            p.env_pending = pending;
+        }
     }
 
     pub fn get(&self, k: &ProcKey) -> Option<&ProcInfo> {
@@ -258,11 +244,10 @@ impl ProcTable {
         match kind {
             Some(EventKind::Exec) => {
                 let n = (ev.path_len as usize).min(ev.path.len());
-                // Read now, as early as we can: a process that has exited
-                // has nothing left to read, and that fails closed.
-                let env = (self.environ)(ev.tgid, ev.start_time_ns, Some(exe_id(ev)));
                 let p = self.procs.get_mut(&key).unwrap();
-                set_env(p, env);
+                // The new image's environment is the pipeline's to read.
+                p.env_taint = None;
+                p.env_pending = false;
                 // A tracer's hold on the old image doesn't carry over.
                 p.ptraced = false;
                 p.exe = Some(PathBuf::from(OsStr::from_bytes(&ev.path[..n])));
@@ -331,11 +316,6 @@ impl ProcTable {
         let parent = (ev.ppid != 0)
             .then(|| self.by_tgid(ev.ppid).map(|p| p.key))
             .flatten();
-        // Before an Exec, /proc already holds the new image's environment,
-        // not this one's.
-        let env = (ev.kind != EventKind::Exec as u32)
-            .then(|| (self.environ)(ev.tgid, ev.start_time_ns, None))
-            .flatten();
         self.procs.insert(
             key,
             ProcInfo {
@@ -355,7 +335,10 @@ impl ProcTable {
                 selinux_domain: live.then(|| selinux_domain(ev.tgid)).flatten(),
                 verification: Verification::Unverified,
                 cgroup_id: ev.cgroup_id,
-                env_taint: env_taint(env.as_deref()),
+                // The pipeline reads the environment when it matters. Found
+                // at an Exec, this entry is the old image, whose
+                // environment is already gone: never trusted.
+                env_taint: (ev.kind == EventKind::Exec as u32).then_some(UNREADABLE),
                 env_pending: false,
                 ptraced: false,
             },
@@ -459,38 +442,36 @@ mod tests {
         );
     }
 
-    fn table(env: EnvReader) -> ProcTable {
+    fn table() -> ProcTable {
         ProcTable {
-            environ: env,
             host_pidns: |_| true,
             ..ProcTable::new()
         }
     }
 
     #[test]
-    fn an_environment_not_laid_out_yet_is_read_again_before_judging() {
-        // Empty at the exec's commit, there by the time it matters.
-        let mut t = table(|_, _, _| Some(Vec::new()));
+    fn an_unreadable_pid_namespace_counts_as_the_hosts() {
+        // A tracer that is already gone can't show it was contained.
+        assert!(in_host_pidns(u32::MAX));
+    }
+
+    #[test]
+    fn an_exec_leaves_the_environment_to_the_pipeline() {
+        let mut t = table();
         t.apply(&ev(EventKind::Exec, 10, 1));
-        let k = ProcKey {
-            tgid: 10,
-            start_time_ns: 1,
-        };
-        assert!(t.get(&k).unwrap().env_pending);
-        t.environ = |_, _, _| Some(b"LD_PRELOAD=/tmp/x.so\0".to_vec());
-        t.settle_env(&k);
-        assert_eq!(t.get(&k).unwrap().taint(), Some("LD_PRELOAD is set"));
-        // A clean one settles clean.
-        let mut t = table(|_, _, _| Some(Vec::new()));
-        t.apply(&ev(EventKind::Exec, 10, 1));
-        t.environ = |_, _, _| Some(b"PATH=/usr/bin\0".to_vec());
-        t.settle_env(&k);
-        assert_eq!(t.get(&k).unwrap().taint(), None);
+        let p = t
+            .get(&ProcKey {
+                tgid: 10,
+                start_time_ns: 1,
+            })
+            .unwrap();
+        assert!(!p.env_pending);
+        assert_eq!(p.taint(), None);
     }
 
     #[test]
     fn a_tracer_outside_the_host_pid_namespace_taints_nothing() {
-        let mut t = table(|_, _, _| Some(b"PATH=/usr/bin\0".to_vec()));
+        let mut t = table();
         t.host_pidns = |_| false;
         t.apply(&ev(EventKind::Exec, 20, 20));
         let mut p = ev(EventKind::Ptrace, 30, 30);
@@ -504,36 +485,8 @@ mod tests {
     }
 
     #[test]
-    fn exec_reads_the_environment() {
-        let mut t = table(|_, _, _| Some(b"LD_PRELOAD=/tmp/x.so\0".to_vec()));
-        t.apply(&ev(EventKind::Exec, 10, 1));
-        let k = ProcKey {
-            tgid: 10,
-            start_time_ns: 1,
-        };
-        assert_eq!(t.get(&k).unwrap().taint(), Some("LD_PRELOAD is set"));
-        // Unreadable stays pending, and fails closed until settled.
-        let mut t = table(|_, _, _| None);
-        t.apply(&ev(EventKind::Exec, 10, 1));
-        assert!(t.get(&k).unwrap().env_pending);
-        assert_eq!(
-            t.get(&k).unwrap().taint(),
-            Some("its environment could not be read")
-        );
-        t.settle_env(&k);
-        assert!(!t.get(&k).unwrap().env_pending);
-        assert_eq!(
-            t.get(&k).unwrap().taint(),
-            Some("its environment could not be read")
-        );
-        let mut t = table(|_, _, _| Some(b"PATH=/usr/bin\0".to_vec()));
-        t.apply(&ev(EventKind::Exec, 10, 1));
-        assert_eq!(t.get(&k).unwrap().taint(), None);
-    }
-
-    #[test]
     fn a_ptrace_target_is_tainted_its_children_inherit_and_exec_clears() {
-        let mut t = table(|_, _, _| Some(b"PATH=/usr/bin\0".to_vec()));
+        let mut t = table();
         let k = |tgid| ProcKey {
             tgid,
             start_time_ns: tgid as u64,

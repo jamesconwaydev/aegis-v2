@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{Config, ConfigHandle};
 use crate::incident::{IncidentId, IncidentStore};
-use crate::pipeline::{ExeKey, Incidents, Pipeline};
+use crate::pipeline::{EnvReaders, ExeKey, Incidents, Pipeline};
 use crate::telemetry::{mode_str, Sinks};
 use crate::verify::{Rpm, Verification, Verifier};
 
@@ -224,6 +224,10 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
         cli.debug,
     );
     let (done_tx, mut done) = mpsc::unbounded_channel();
+    // Environment reads can block for good; they run on their own
+    // threads and answer here.
+    let env_readers = EnvReaders::new();
+    let (env_tx, mut env_done) = mpsc::unbounded_channel();
     let mut verifying = Verifying {
         verifier: Arc::new(Verifier::new(Rpm)),
         pinned: Arc::new(c.allowlist.pinned.clone()),
@@ -274,8 +278,15 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                 for p in pipe.to_verify.drain(..) {
                     verifying.spawn(p);
                 }
+                for job in pipe.to_read_env.drain(..) {
+                    let tx = env_tx.clone();
+                    env_readers.spawn(job, move |job, env| {
+                        let _ = tx.send((job, env));
+                    });
+                }
             }
             Some((path, v)) = done.recv() => pipe.verified(&path, v),
+            Some(((key, image), env)) = env_done.recv() => pipe.env_read(key, image, env),
             Some((req, reply)) = calls.recv() => match req {
                 // Disk reads: answer off the loop.
                 Request::IncidentShow { .. } | Request::IncidentTimeline { .. } => {
