@@ -234,10 +234,62 @@ impl Default for QuarantineConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+/// Where to send OTLP logs (`http://` or `https://`).
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OtlpConfig {
     pub endpoint: String,
+    /// Extra request headers, for auth tokens. Values are never logged.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default = "default_otlp_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_otlp_timeout() -> u64 {
+    5
+}
+
+impl fmt::Debug for OtlpConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OtlpConfig")
+            .field("endpoint", &self.endpoint)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
+impl OtlpConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let bad = |s: &str| s.chars().any(|c| c.is_control());
+        let host = self
+            .endpoint
+            .strip_prefix("http://")
+            .or_else(|| self.endpoint.strip_prefix("https://"))
+            .ok_or("otlp endpoint must start with http:// or https://")?;
+        if host.is_empty() || bad(&self.endpoint) || self.endpoint.contains(' ') {
+            return Err("otlp endpoint is empty or has control characters".into());
+        }
+        if self.timeout_secs == 0 {
+            return Err("otlp timeout_secs must be at least 1".into());
+        }
+        for (k, v) in &self.headers {
+            // RFC 7230 token characters.
+            let token = !k.is_empty()
+                && k.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+            if !token {
+                return Err(format!("otlp header name {k:?} is not a valid token"));
+            }
+            if bad(v) {
+                return Err(format!(
+                    "otlp header {k} has control characters in its value"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// journald is always on and has no switch.
@@ -397,6 +449,9 @@ impl Config {
                 "enforce mode is not available in this release (planned for v0.2.0)",
             ));
         }
+        if let Some(msg) = cfg.telemetry.otlp.as_ref().and_then(|o| o.validate().err()) {
+            return Err(ConfigError::at(main, &src, None, msg));
+        }
         let (thr, quar) = (
             cfg.general.score_threshold_throttle,
             cfg.general.score_threshold_quarantine,
@@ -521,6 +576,29 @@ mod tests {
 
     fn load(t: &Dir, body: &str) -> Result<Config, ConfigError> {
         Config::load(&t.main(body), &t.dir())
+    }
+
+    #[test]
+    fn otlp_config_validates() {
+        let t = Dir::new("otlp");
+        let c = load(
+            &t,
+            "[telemetry.otlp]\nendpoint = \"https://h:4318\"\n[telemetry.otlp.headers]\nAuthorization = \"Bearer s3cret\"\n",
+        )
+        .unwrap();
+        let o = c.telemetry.otlp.unwrap();
+        assert_eq!(o.timeout_secs, 5);
+        assert!(!format!("{o:?}").contains("s3cret"));
+        for bad in [
+            "endpoint = \"ftp://h\"",
+            "endpoint = \"http://h\\nX: y\"",
+            "endpoint = \"http://h\"\ntimeout_secs = 0",
+            "endpoint = \"http://h\"\n[telemetry.otlp.headers]\n\"Bad Name\" = \"v\"",
+            "endpoint = \"http://h\"\n[telemetry.otlp.headers]\nX = \"a\\r\\nB: c\"",
+        ] {
+            let r = load(&t, &format!("[telemetry.otlp]\n{bad}\n"));
+            assert!(r.is_err(), "{bad}");
+        }
     }
 
     #[test]

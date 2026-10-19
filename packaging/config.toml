@@ -40,7 +40,10 @@ dir = "/var/lib/aegis-v2/incidents"
 # jsonl = "/var/log/aegis-v2/events.jsonl"
 #
 # [telemetry.otlp]
-# endpoint = "http://localhost:4318"
+# endpoint = "http://localhost:4318"     # or https://, system CA bundle
+# timeout_secs = 5
+# [telemetry.otlp.headers]
+# Authorization = "Bearer <token>"
 
 # [allowlist] is optional here and usually lives in allowlist.d/.
 # Pin a binary that isn't in the RPM database by its SHA-256:

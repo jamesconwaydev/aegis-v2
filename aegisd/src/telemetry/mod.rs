@@ -76,7 +76,7 @@ pub fn build(cfg: &TelemetryConfig) -> Vec<Box<dyn Sink>> {
         }
     }
     if let Some(o) = &cfg.otlp {
-        v.push(Box::new(otlp::Otlp::new(&o.endpoint)));
+        v.push(Box::new(otlp::Otlp::new(o)));
     }
     v
 }

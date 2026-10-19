@@ -3,6 +3,7 @@
 //! (a Mac, a container) every emit is a no-op.
 
 use std::os::unix::net::UnixDatagram;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Sink, TelemetryRecord};
 use crate::scoring::Tier;
@@ -11,6 +12,7 @@ const SOCKET: &str = "/run/systemd/journal/socket";
 
 pub struct Journald {
     sock: Option<UnixDatagram>,
+    dropped: AtomicU64,
 }
 
 impl Journald {
@@ -18,7 +20,22 @@ impl Journald {
         let sock = UnixDatagram::unbound()
             .and_then(|s| s.connect(SOCKET).map(|()| s))
             .ok();
-        Self { sock }
+        Self::with_socket(sock)
+    }
+
+    /// The socket is made non-blocking: a stuck journald must cost a
+    /// record, never stall the pipeline.
+    pub fn with_socket(sock: Option<UnixDatagram>) -> Self {
+        let sock = sock.filter(|s| s.set_nonblocking(true).is_ok());
+        Self {
+            sock,
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Records lost to a full socket buffer or an oversize datagram.
+    pub fn dropped_records(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -53,6 +70,8 @@ pub fn encode(rec: &TelemetryRecord) -> Vec<u8> {
     );
     field(&mut b, "AEGIS_TIER", rec.tier_str().as_bytes());
     field(&mut b, "AEGIS_VERDICT", rec.verdict.as_bytes());
+    field(&mut b, "AEGIS_COMM", rec.comm.as_bytes());
+    field(&mut b, "AEGIS_EXE", rec.exe_lossy().as_bytes());
     field(&mut b, "AEGIS_EXE_B64", rec.exe_b64().as_bytes());
     b
 }
@@ -60,8 +79,10 @@ pub fn encode(rec: &TelemetryRecord) -> Vec<u8> {
 impl Sink for Journald {
     fn emit(&self, rec: &TelemetryRecord) {
         if let Some(s) = &self.sock {
-            // Best effort: journald being busy must not stall detection.
-            let _ = s.send(&encode(rec));
+            // WouldBlock (buffer full) and EMSGSIZE both land here.
+            if s.send(&encode(rec)).is_err() {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -93,6 +114,34 @@ mod tests {
         assert!(s.contains("AEGIS_TIER=quarantine\n"));
         assert!(s.contains("AEGIS_EXE_B64=L3RtcC9hCmI=\n"));
         assert!(out.windows(8).any(|w| w == b"MESSAGE\n"));
-        Journald { sock: None }.emit(&rec);
+        assert!(s.contains("AEGIS_COMM"));
+        assert!(out.windows(9).any(|w| w == b"AEGIS_EXE"));
+        let j = Journald::with_socket(None);
+        j.emit(&rec);
+        assert_eq!(j.dropped_records(), 0);
+    }
+
+    #[test]
+    fn full_socket_drops_instead_of_blocking() {
+        let (a, _b) = UnixDatagram::pair().unwrap();
+        let j = Journald::with_socket(Some(a));
+        let rec = TelemetryRecord {
+            ts_unix_ns: 0,
+            incident: "AEG-1".into(),
+            tier: Tier::Throttle,
+            verdict: "would_throttle",
+            score: 1.0,
+            mode: Mode::Audit,
+            tgid: 7,
+            comm: "c".into(),
+            exe: Some(vec![b'x'; 4000]),
+            reasons: vec![],
+        };
+        let t = std::time::Instant::now();
+        for _ in 0..5000 {
+            j.emit(&rec);
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        assert!(j.dropped_records() > 0);
     }
 }
