@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+## <summary>Aegis v2 runtime threat detection daemon.</summary>
+
+########################################
+## <summary>
+##	Connect to aegisd over its control socket.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`aegis_stream_connect',`
+	gen_require(`
+		type aegisd_t, aegis_var_run_t;
+	')
+
+	files_search_pids($1)
+	stream_connect_pattern($1, aegis_var_run_t, aegis_var_run_t, aegisd_t)
+')

@@ -33,5 +33,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - systemd and cockpit-tls can create memfds without scoring. On Rocky 10,
   systemd makes one for every unit it starts, and that alone pushed pid 1
   past the quarantine threshold seconds after startup.
+- RPMs. `cargo xtask rpm` builds `aegis-v2` and a noarch
+  `aegis-v2-selinux`, and `dnf install ./*.rpm` gives you a systemd unit
+  and a daemon confined to its own SELinux domain, `aegisd_t`. It runs in
+  enforcing mode without a single denial in the audit log. The unit
+  keeps six capabilities out of root's forty-one and sees the filesystem
+  read-only, apart from its state, socket and log directories.
+- OTLP export now needs one more step on an SELinux host:
+  `setsebool -P aegisd_can_network_connect 1`. Until you run it, aegisd
+  can't open a socket to anything.
 - Contributor scaffolding: issue forms, pull request template, security
   policy, code of conduct and contributing guide.

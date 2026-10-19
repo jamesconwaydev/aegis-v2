@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[Unit]
+Description=Aegis v2 runtime threat detection daemon
+Documentation=https://github.com/jamesconwaydev/aegis-v2
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/aegisd
+# Not `systemctl kill`: that would also signal any rpm query in flight.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+# A bad config exits 78 (EX_CONFIG). Restarting won't fix it.
+RestartPreventExitStatus=78
+
+# Root, holding only what v0.1 uses:
+#   CAP_BPF, CAP_PERFMON  load the probes, open the tracepoints
+#   CAP_SYS_ADMIN         attach the BPF LSM programs
+#   CAP_SYS_RESOURCE      lift RLIMIT_MEMLOCK if the BPF loader asks
+#   CAP_SYS_PTRACE        read /proc/<pid>/exe, ns/mnt and root of any
+#                         process, other users' included
+#   CAP_DAC_READ_SEARCH   open and hash any executable, whatever its mode
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
+NoNewPrivileges=yes
+LimitMEMLOCK=infinity
+UMask=0077
+
+# Everything is read-only except state, the socket and the log dir.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aegis-v2 /run/aegis-v2
+RuntimeDirectory=aegis-v2
+RuntimeDirectoryMode=0700
+# For the optional JSONL sink, if you point it at /var/log/aegis-v2.
+LogsDirectory=aegis-v2
+LogsDirectoryMode=0700
+
+# Hardening that still lets aegisd see every process: ProtectProc stays
+# at its default and there is no ProcSubset=pid. The private mount
+# namespace these imply is fine; aegisd compares exe paths against pid
+# 1's namespace, not its own.
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

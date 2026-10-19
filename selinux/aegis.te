@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+policy_module(aegis, 0.1.0)
+
+########################################
+#
+# Declarations
+#
+
+## <desc>
+##	<p>
+##	Allow aegisd to make outbound TCP connections, for the optional
+##	OTLP sink. Off by default; turn it on with
+##	setsebool -P aegisd_can_network_connect 1
+##	</p>
+## </desc>
+gen_tunable(aegisd_can_network_connect, false)
+
+gen_require(`
+	type tracefs_t, default_context_t, semanage_store_t;
+')
+
+type aegisd_t;
+type aegisd_exec_t;
+init_daemon_domain(aegisd_t, aegisd_exec_t)
+# The unit sets NoNewPrivileges=yes.
+init_nnp_daemon_domain(aegisd_t)
+
+type aegis_etc_t;
+files_config_file(aegis_etc_t)
+
+type aegis_var_lib_t;
+files_type(aegis_var_lib_t)
+
+type aegis_var_run_t;
+files_pid_file(aegis_var_run_t)
+
+type aegis_log_t;
+logging_log_file(aegis_log_t)
+
+########################################
+#
+# aegisd local policy
+#
+
+# Root with the unit's bounding set. dac_read_search opens executables
+# of any mode; sys_ptrace reads other users' /proc/<pid>/exe and root.
+allow aegisd_t self:capability { dac_read_search sys_admin sys_ptrace sys_resource };
+allow aegisd_t self:capability2 { bpf perfmon };
+# The same, for processes inside a user namespace (rootless containers).
+allow aegisd_t self:cap_userns sys_ptrace;
+allow aegisd_t self:unix_dgram_socket create_socket_perms;
+allow aegisd_t self:unix_stream_socket create_stream_socket_perms;
+
+# The probes: maps, programs, the ring buffer and the tracepoints.
+allow aegisd_t self:bpf { map_create map_read map_write prog_load prog_run };
+allow aegisd_t self:perf_event { open cpu kernel tracepoint read write };
+
+# Kernel BTF for the field offsets; tracepoint ids from tracefs.
+dev_read_sysfs(aegisd_t)
+fs_search_tracefs_dirs(aegisd_t)
+read_files_pattern(aegisd_t, tracefs_t, tracefs_t)
+kernel_read_kernel_sysctls(aegisd_t)
+
+# /proc/<pid>/{stat,exe,cgroup,attr/current,ns/mnt,root} of every process.
+domain_read_all_domains_state(aegisd_t)
+domain_getattr_all_domains(aegisd_t)
+
+# Open and hash whatever a process executed, wherever it lives. Shadow,
+# keys and other security types stay out of reach.
+files_read_non_security_files(aegisd_t)
+
+# rpm -qf --dump runs in our domain and reads the rpm database.
+rpm_exec(aegisd_t)
+rpm_read_db(aegisd_t)
+# rpm runs as root, so sqlite tries the WAL and shm files read-write
+# first, then falls back to read-only and the query works. Read-only is
+# all aegisd should have; keep the first attempt out of the log.
+dontaudit aegisd_t rpm_var_lib_t:file write;
+# rpm's SELinux plugin peeks at the policy store and contexts. A query
+# works without them.
+dontaudit aegisd_t { default_context_t semanage_store_t }:dir { getattr search };
+
+# Config and drop-ins.
+read_files_pattern(aegisd_t, aegis_etc_t, aegis_etc_t)
+list_dirs_pattern(aegisd_t, aegis_etc_t, aegis_etc_t)
+
+# Incidents.
+manage_dirs_pattern(aegisd_t, aegis_var_lib_t, aegis_var_lib_t)
+manage_files_pattern(aegisd_t, aegis_var_lib_t, aegis_var_lib_t)
+files_var_lib_filetrans(aegisd_t, aegis_var_lib_t, dir)
+
+# Control socket and lock file.
+manage_dirs_pattern(aegisd_t, aegis_var_run_t, aegis_var_run_t)
+manage_files_pattern(aegisd_t, aegis_var_run_t, aegis_var_run_t)
+manage_sock_files_pattern(aegisd_t, aegis_var_run_t, aegis_var_run_t)
+files_pid_filetrans(aegisd_t, aegis_var_run_t, dir)
+
+# Optional JSONL sink under /var/log/aegis-v2.
+manage_dirs_pattern(aegisd_t, aegis_log_t, aegis_log_t)
+manage_files_pattern(aegisd_t, aegis_log_t, aegis_log_t)
+logging_log_filetrans(aegisd_t, aegis_log_t, dir)
+
+# journald. sd_notify needs nothing more: init_daemon_domain covers it.
+logging_send_syslog_msg(aegisd_t)
+
+# The OTLP sink. sysnet_dns_name_resolve can't sit in a conditional
+# (it carries optional blocks), so DNS is spelled out.
+tunable_policy(`aegisd_can_network_connect',`
+	allow aegisd_t self:tcp_socket create_stream_socket_perms;
+	allow aegisd_t self:udp_socket create_socket_perms;
+	corenet_tcp_connect_all_ports(aegisd_t)
+	corenet_udp_sendrecv_dns_port(aegisd_t)
+	sysnet_read_config(aegisd_t)
+	miscfiles_read_generic_certs(aegisd_t)
+')

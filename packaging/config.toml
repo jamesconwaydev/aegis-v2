@@ -39,6 +39,8 @@ dir = "/var/lib/aegis-v2/incidents"
 # [telemetry]
 # jsonl = "/var/log/aegis-v2/events.jsonl"
 #
+# SELinux keeps aegisd off the network until you allow it:
+#   setsebool -P aegisd_can_network_connect 1
 # [telemetry.otlp]
 # endpoint = "http://localhost:4318"     # or https://, system CA bundle
 # timeout_secs = 5

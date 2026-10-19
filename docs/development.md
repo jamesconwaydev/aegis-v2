@@ -156,6 +156,33 @@ object's `OFFSETS` global before loading it. Adding a field means adding
 it to `KernelOffsets` in `aegis-common` and looking it up in
 `aegisd/src/ebpf.rs`.
 
+## Packaging
+
+```sh
+cargo xtask rpm --arch x86_64
+```
+
+That's a release build, then rpmbuild, both in the container. You get
+two RPMs in `dist/rpm/`: `aegis-v2-0.1.0-1.el10.x86_64.rpm` and the
+noarch `aegis-v2-selinux-0.1.0-1.el10.noarch.rpm`. The spec is
+`packaging/aegis-v2.spec`, the unit is `packaging/aegisd.service`, and
+the policy module lives in `selinux/`.
+
+Test a policy change on an enforcing x86_64 host, not under Lima. Install
+both RPMs, start the daemon, put it through its paces, then look for
+denials:
+
+```sh
+dnf install ./*.rpm
+systemctl enable --now aegisd
+ps -eZ | grep aegisd            # should say aegisd_t
+ausearch -m AVC -ts recent      # should say <no matches>
+```
+
+`semodule -DB` turns off the policy's dontaudit rules while you hunt
+for a denial that's hiding; `semodule -B` turns them back on. Never
+commit a `permissive aegisd_t;` line.
+
 ## Caches
 
 Two named volumes per architecture keep rebuilds quick:

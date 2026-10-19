@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Rocky 10 labels /usr/sbin as if it were /usr/bin (file_contexts.subs_dist),
+# so the /usr/bin line is the one that applies. Literal paths, because a
+# regex here would sort below the policy's own /usr/bin(/.*)? and lose.
+/usr/bin/aegisd	--	gen_context(system_u:object_r:aegisd_exec_t,s0)
+/usr/sbin/aegisd	--	gen_context(system_u:object_r:aegisd_exec_t,s0)
+
+/etc/aegis-v2(/.*)?		gen_context(system_u:object_r:aegis_etc_t,s0)
+
+/var/lib/aegis-v2(/.*)?		gen_context(system_u:object_r:aegis_var_lib_t,s0)
+
+/var/log/aegis-v2(/.*)?		gen_context(system_u:object_r:aegis_log_t,s0)
+
+/run/aegis-v2(/.*)?		gen_context(system_u:object_r:aegis_var_run_t,s0)

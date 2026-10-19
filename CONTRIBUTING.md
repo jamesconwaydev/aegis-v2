@@ -14,8 +14,8 @@ cargo xtask build --release
 ```
 
 [docs/development.md](docs/development.md) covers the other architecture,
-picking a container engine, and the caches. `cargo xtask rpm` and
-`cargo xtask e2e` arrive in later PRs.
+picking a container engine, the caches, and building the RPMs with
+`cargo xtask rpm`. `cargo xtask e2e` arrives in a later PR.
 
 ## Pull requests
 
