@@ -89,6 +89,7 @@ fn payload(r: &Response) -> Value {
 
 fn run(cli: &Cli) -> Result<u8, String> {
     let wrong = || "aegisd sent a reply this aegisctl doesn't understand".to_string();
+    let mut id = String::new();
     let req = match &cli.cmd {
         Cmd::Preflight => {
             let path: Vec<PathBuf> =
@@ -105,7 +106,10 @@ fn run(cli: &Cli) -> Result<u8, String> {
         Cmd::Status => Request::Status,
         Cmd::Incidents(Inc::List) => Request::IncidentsList,
         Cmd::Incidents(Inc::Show { id }) => Request::IncidentShow { id: id.clone() },
-        Cmd::Incidents(Inc::Timeline { id }) => Request::IncidentTimeline { id: id.clone() },
+        Cmd::Incidents(Inc::Timeline { id: i }) => {
+            id = i.clone();
+            Request::IncidentTimeline { id: i.clone() }
+        }
     };
     let resp = call(&cli.socket, &req)?;
     match (&resp, cli.json) {
@@ -114,7 +118,14 @@ fn run(cli: &Cli) -> Result<u8, String> {
         (Response::Status { .. }, false) => print!("{}", render::status(&resp).unwrap()),
         (Response::Incidents(l), false) => print!("{}", render::incidents(l)),
         (Response::Incident(v), false) => print!("{}", render::incident(v)),
-        (Response::Timeline(l), false) => print!("{}", render::timeline(l)),
+        (Response::Timeline(l), false) => {
+            // Best effort: names come from the incident, lines print without them.
+            let v = match call(&cli.socket, &Request::IncidentShow { id: id.clone() }) {
+                Ok(Response::Incident(v)) => Some(v),
+                _ => None,
+            };
+            print!("{}", render::timeline(l, v.as_ref()))
+        }
         (Response::Error(_), _) => return Err(wrong()),
     }
     Ok(0)

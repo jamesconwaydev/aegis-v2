@@ -10,3 +10,4 @@ repository.workspace = true
 clap = { workspace = true }
 aegis-proto = { path = "../aegis-proto" }
 serde_json = { workspace = true }
+libc = "0.2"

@@ -148,29 +148,45 @@ fn n(v: &Value, k: &str) -> f64 {
     v.get(k).and_then(Value::as_f64).unwrap_or(0.0)
 }
 
-/// Evidence times are Unix ns in some records and ns since boot in
-/// others; show whichever it looks like.
-fn when(ns: u64) -> String {
-    if ns > 1_000_000_000_000_000_000 {
-        let secs = ns / 1_000_000_000;
-        let z = secs / 86400 + 719_468;
-        let (era, doe) = (z / 146_097, z % 146_097);
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = yoe + era * 400 + (m <= 2) as u64;
-        let r = secs % 86400;
-        format!(
-            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-            r / 3600,
-            r % 3600 / 60,
-            r % 60
-        )
-    } else {
-        format!("boot+{:.3}s", ns as f64 / 1e9)
-    }
+fn clock_ns(clock: libc::clockid_t) -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: ts is a valid out-pointer.
+    unsafe { libc::clock_gettime(clock, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Wall-clock UTC for a monotonic timestamp, given the two clocks now.
+fn wall(ts: u64, real_now: u64, mono_now: u64) -> String {
+    let ns = real_now.saturating_sub(mono_now.saturating_sub(ts));
+    let secs = ns / 1_000_000_000;
+    let z = secs / 86400 + 719_468;
+    let (era, doe) = (z / 146_097, z % 146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as u64;
+    let r = secs % 86400;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        r / 3600,
+        r % 3600 / 60,
+        r % 60
+    )
+}
+
+/// Probe timestamps are CLOCK_MONOTONIC ns since boot. Convert with the
+/// clocks as they read now; approximate if the host has suspended since.
+fn when(ts: u64) -> String {
+    wall(
+        ts,
+        clock_ns(libc::CLOCK_REALTIME),
+        clock_ns(libc::CLOCK_MONOTONIC),
+    )
 }
 
 fn proc_line(p: &Value) -> String {
@@ -256,7 +272,16 @@ pub fn incident(v: &Value) -> String {
 }
 
 /// One line per timeline record: time, process, signals, score, tier.
-pub fn timeline(lines: &[Value]) -> String {
+pub fn timeline(lines: &[Value], incident: Option<&Value>) -> String {
+    // Records carry only tgid; the incident knows the names.
+    let name = |tgid: &Value| {
+        let p = incident?
+            .get("process_tree")?
+            .as_array()?
+            .iter()
+            .find(|p| &p["tgid"] == tgid)?;
+        Some(s(p, "comm").to_string())
+    };
     let rows: Vec<_> = lines
         .iter()
         .map(|l| {
@@ -266,7 +291,10 @@ pub fn timeline(lines: &[Value]) -> String {
                 .unwrap_or_default();
             vec![
                 s(l, "ts").to_string(),
-                format!("pid {}", l["tgid"]),
+                match name(&l["tgid"]) {
+                    Some(c) => format!("{c} ({})", l["tgid"]),
+                    None => format!("pid {}", l["tgid"]),
+                },
                 if sig.is_empty() {
                     "-".into()
                 } else {
@@ -301,4 +329,14 @@ pub fn preflight(checks: &[Check], colour: bool) -> String {
         }
     }
     o
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn monotonic_to_wall() {
+        // Booted at Unix 1_000_000_000 s; event 10 s in, now 100 s in.
+        let s = super::wall(10_000_000_000, 1_000_000_100_000_000_000, 100_000_000_000);
+        assert_eq!(s, "2001-09-09T01:46:50Z");
+    }
 }
