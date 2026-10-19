@@ -166,7 +166,7 @@ impl Preflight {
             "Use a kernel built with CONFIG_DEBUG_INFO_BTF=y (Rocky's is).",
         ));
 
-        let lsm = read(root, "/sys/kernel/security/lsm");
+        let lsm = read(root, "/sys/kernel/security/lsm").filter(|l| !l.is_empty());
         let has_bpf = lsm
             .as_deref()
             .is_some_and(|l| l.split(',').any(|x| x == "bpf"));
@@ -180,7 +180,15 @@ impl Preflight {
                 Some(_) => format!("bpf is not in the LSM list ({cur})"),
                 None => "can't read /sys/kernel/security/lsm".into(),
             },
-            &format!("grubby --update-kernel=ALL --args=\"lsm={cur},bpf\" (reboot required)"),
+            &if cur.is_empty() {
+                // lsm=bpf alone would drop SELinux and the rest.
+                "Read the current list with `cat /sys/kernel/security/lsm`, then run \
+                 grubby --update-kernel=ALL --args=\"lsm=<that list>,bpf\" \
+                 (reboot required)"
+                    .to_string()
+            } else {
+                format!("grubby --update-kernel=ALL --args=\"lsm={cur},bpf\" (reboot required)")
+            },
         ));
 
         let enforcing = read(root, "/sys/fs/selinux/enforce").as_deref() == Some("1");
@@ -305,6 +313,39 @@ mod tests {
         ));
         assert!(fix.contains("reboot required"));
         assert_eq!(exit_code(&c), 1);
+    }
+
+    #[test]
+    fn unreadable_lsm_list_never_suggests_a_bare_list() {
+        let f = fixture("nolsm");
+        fs::remove_file(f.root.join("sys/kernel/security/lsm")).unwrap();
+        let c = Preflight::run(&f.root);
+        let l = get(&c, "bpf-lsm");
+        assert_eq!(l.status, Status::Fail);
+        let fix = l.fix.as_deref().unwrap();
+        assert!(!fix.contains("lsm=,bpf"), "{fix}");
+        assert!(fix.contains("cat /sys/kernel/security/lsm"));
+        assert!(fix.contains("lsm=<that list>,bpf"));
+        assert!(fix.contains("reboot required"));
+    }
+
+    #[test]
+    fn kernel_versions() {
+        for (s, ok) in [
+            ("6.12.0-211.el10.x86_64", true),
+            ("6.12", true),
+            ("6.13.1", true),
+            ("7.0.0", true),
+            ("6.11.9", false),
+            ("5.14.0-503.el9", false),
+            ("6", false),
+            ("", false),
+            ("garbage", false),
+            ("v6.12", true),
+            ("6.x", false),
+        ] {
+            assert_eq!(kernel_ok(s), ok, "{s:?}");
+        }
     }
 
     #[test]

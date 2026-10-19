@@ -20,9 +20,33 @@ fn paint(s: &str, code: &str, on: bool) -> String {
     }
 }
 
+/// Make daemon- and attacker-supplied text safe to print: control
+/// characters (C0, DEL, C1) and bidi/zero-width marks become visible
+/// escapes like `\x1b` or `\u{202e}`.
+pub fn clean(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        let bad = c.is_control()
+            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}');
+        if !bad {
+            o.push(c);
+        } else if (c as u32) < 0x100 {
+            o += &format!("\\x{:02x}", c as u32);
+        } else {
+            o += &format!("\\u{{{:x}}}", c as u32);
+        }
+    }
+    o
+}
+
 /// Rows of cells as left-aligned columns, two spaces apart. The last
 /// column is not padded.
 fn table(rows: &[Vec<String>]) -> String {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| clean(c)).collect())
+        .collect();
+    let rows = &rows[..];
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let w: Vec<usize> = (0..cols)
         .map(|i| {
@@ -181,12 +205,24 @@ fn wall(ts: u64, real_now: u64, mono_now: u64) -> String {
 
 /// Probe timestamps are CLOCK_MONOTONIC ns since boot. Convert with the
 /// clocks as they read now; approximate if the host has suspended since.
-fn when(ts: u64) -> String {
-    wall(
-        ts,
-        clock_ns(libc::CLOCK_REALTIME),
-        clock_ns(libc::CLOCK_MONOTONIC),
-    )
+/// Only meaningful for the boot the incident was recorded in.
+fn when(ts: Option<u64>, same_boot: Option<bool>) -> String {
+    let Some(ts) = ts else { return "-".into() };
+    match same_boot {
+        Some(true) => wall(
+            ts,
+            clock_ns(libc::CLOCK_REALTIME),
+            clock_ns(libc::CLOCK_MONOTONIC),
+        ),
+        Some(false) => format!("boot+{}s (previous boot)", ts / 1_000_000_000),
+        None => format!("boot+{}s (boot unknown)", ts / 1_000_000_000),
+    }
+}
+
+pub fn current_boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn proc_line(p: &Value) -> String {
@@ -198,7 +234,11 @@ fn proc_line(p: &Value) -> String {
     )
 }
 
-pub fn incident(v: &Value) -> String {
+pub fn incident(v: &Value, cur_boot: Option<&str>) -> String {
+    let same_boot = match (v.get("boot_id").and_then(Value::as_str), cur_boot) {
+        (Some(b), Some(c)) if !b.is_empty() => Some(b == c),
+        _ => None,
+    };
     let mut o = String::new();
     let kv = [
         ("id", s(v, "id").to_string()),
@@ -260,7 +300,7 @@ pub fn incident(v: &Value) -> String {
     for e in ev {
         rows.push(vec![
             String::new(),
-            when(e.get("ts_ns").and_then(Value::as_u64).unwrap_or(0)),
+            when(e.get("ts_ns").and_then(Value::as_u64), same_boot),
             s(e, "signal").to_string(),
             format!("{:.1}", n(e, "base")),
             format!("{:.2}", n(e, "modifier")),
@@ -323,9 +363,9 @@ pub fn preflight(checks: &[Check], colour: bool) -> String {
         };
         // Pad before painting, so the escape codes don't skew columns.
         let tag = paint(c.status.as_str(), code, colour);
-        o += &format!("{:<w$}  {tag}  {}\n", c.check, c.detail);
+        o += &format!("{:<w$}  {tag}  {}\n", c.check, clean(&c.detail));
         if let (Some(f), false) = (&c.fix, c.status == Status::Pass) {
-            o += &format!("{:<w$}        fix: {f}\n", "");
+            o += &format!("{:<w$}        fix: {}\n", "", clean(f));
         }
     }
     o
@@ -333,10 +373,114 @@ pub fn preflight(checks: &[Check], colour: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use serde_json::json;
+
     #[test]
     fn monotonic_to_wall() {
         // Booted at Unix 1_000_000_000 s; event 10 s in, now 100 s in.
-        let s = super::wall(10_000_000_000, 1_000_000_100_000_000_000, 100_000_000_000);
+        let s = wall(10_000_000_000, 1_000_000_100_000_000_000, 100_000_000_000);
         assert_eq!(s, "2001-09-09T01:46:50Z");
+    }
+
+    fn incident_json() -> Value {
+        json!({"id":"AEG-1","verdict":"would_quarantine","mode":"audit","score":90.0,"max_score":95.0,
+            "created":"c","updated":"u","boot_id":"boot-a",
+            "root":{"tgid":7,"exe":"\u{1b}[2J\nFAKE","comm":"x\u{202e}y","uid":0,"verification":"un\u{9b}verified"},
+            "process_tree":[{"tgid":7,"exe":"\u{1b}[2J\nFAKE","comm":"c","verification":"unverified"}],
+            "evidence":[{"signal":"TmpExec","base":25.0,"modifier":1.0,"reason":"r\u{7}\nFAKE ROW","ts_ns":5_000_000_000u64},
+                        {"signal":"NoTs","base":1.0,"modifier":1.0,"reason":"-"}]})
+    }
+
+    #[test]
+    fn hostile_text_has_no_control_chars_or_extra_rows() {
+        let v = incident_json();
+        let o = incident(&v, Some("boot-a"));
+        assert!(!o.chars().any(|c| c.is_control() && c != '\n'), "{o:?}");
+        assert!(!o.contains('\u{202e}'));
+        assert!(o.contains("\\x1b[2J\\x0aFAKE"));
+        // 7 summary rows, 3 for members, 5 for evidence: nothing smuggled in.
+        assert_eq!(o.lines().count(), 15, "{o}");
+        assert!(!o.lines().any(|l| l.trim_start().starts_with("FAKE")));
+        let t = timeline(
+            &[json!({"ts":"t\u{1b}","tgid":7,"tier":"x\ny","score":1.0})],
+            Some(&v),
+        );
+        assert_eq!(t.lines().count(), 1);
+        assert!(!t.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn evidence_time_depends_on_boot() {
+        let v = incident_json();
+        let prev = incident(&v, Some("boot-b"));
+        assert!(prev.contains("boot+5s (previous boot)"), "{prev}");
+        let unk = incident(
+            &json!({"evidence":[{"ts_ns":2_000_000_000u64}]}),
+            Some("boot-b"),
+        );
+        assert!(unk.contains("boot+2s (boot unknown)"), "{unk}");
+        let same = incident(&v, Some("boot-a"));
+        assert!(same.contains('Z') && !same.contains("boot+"));
+        // the evidence row without ts_ns shows "-"
+        assert!(
+            same.lines()
+                .any(|l| l.contains("NoTs") && l.contains("  -  ")),
+            "{same}"
+        );
+    }
+
+    #[test]
+    fn status_shows_every_counter() {
+        let r = Response::Status {
+            version: "0.1.0".into(),
+            mode: "audit".into(),
+            uptime_s: 93784,
+            events_total: 15401,
+            dropped_events: 3,
+            probes: vec![aegis_proto::ProbeStatus {
+                name: "p".into(),
+                hook: "h".into(),
+            }],
+            incidents_open: 1,
+            incident_errors: 4,
+            incident_dropped: 5,
+            verify_skipped: 6,
+            deferred_overflow: 7,
+            telemetry_dropped: aegis_proto::TelemetryDropped {
+                journald: 8,
+                otlp_queue_full: 9,
+                otlp_export_failed: 10,
+                otlp_disconnected: 11,
+            },
+        };
+        let o = status(&r).unwrap();
+        for (k, v) in [
+            ("uptime", "1d 2h 3m"),
+            ("events", "15401"),
+            ("dropped events", "3"),
+            ("incident write errors", "4"),
+            ("incidents dropped", "5"),
+            ("verifications skipped", "6"),
+            ("defer queue overflows", "7"),
+            ("journald", "8"),
+            ("otlp queue full", "9"),
+            ("otlp export failed", "10"),
+            ("otlp disconnected", "11"),
+        ] {
+            assert!(
+                o.lines()
+                    .any(|l| l.contains(k) && l.trim_end().ends_with(v)),
+                "{k}: {o}"
+            );
+        }
+    }
+
+    #[test]
+    fn incident_table_is_aligned() {
+        let o = incident(&incident_json(), Some("boot-a"));
+        let l = o.lines().find(|l| l.starts_with("verdict")).unwrap();
+        let m = o.lines().find(|l| l.starts_with("created")).unwrap();
+        assert_eq!(l.find("would"), m.rfind('c'));
     }
 }
