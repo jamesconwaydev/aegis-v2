@@ -623,11 +623,18 @@ fn proc_start_ns(tgid: u32) -> Option<u64> {
 ///
 /// An exe path is only meaningful in the mount namespace of the process
 /// that ran it. A container (or a service with PrivateTmp and friends)
-/// has its own, where `/usr/bin/x` may be a different file from ours.
-/// For such a process we open the file through `/proc/<tgid>/root`,
-/// which the kernel resolves in that process's namespace. The host
-/// rpmdb doesn't own that path, so in practice a container process
-/// stays `Unverified`, which is the safe answer: no allowlist offsets.
+/// has its own, where `/usr/bin/x` may be a different file from the
+/// host's. For such a process we open the file through
+/// `/proc/<tgid>/root`, which the kernel resolves in that process's
+/// namespace. The host rpmdb doesn't own that path, so in practice a
+/// container process stays `Unverified`, which is the safe answer: no
+/// allowlist offsets.
+///
+/// "The host" is pid 1's namespace, not ours. Under systemd aegisd has
+/// its own (ProtectSystem=strict, PrivateTmp), which sees the same /usr
+/// and /etc read-only and hides only /tmp, /var/tmp and /dev. A host
+/// path opened from here is therefore the host's file, or missing, and
+/// missing is `Unverified`.
 ///
 /// None when the process is gone or a different one now holds the pid,
 /// since then its path means nothing to us; it stays `Unverified`.
@@ -635,12 +642,12 @@ pub fn resolve_exe(tgid: u32, start_time_ns: u64, exe: &Path) -> Option<PathBuf>
     if !proc_start_matches(tgid, start_time_ns) {
         return None;
     }
-    static OURS: OnceLock<Option<PathBuf>> = OnceLock::new();
-    let ours = OURS
-        .get_or_init(|| std::fs::read_link("/proc/self/ns/mnt").ok())
+    static HOST: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let host = HOST
+        .get_or_init(|| std::fs::read_link("/proc/1/ns/mnt").ok())
         .as_ref()?;
     let theirs = std::fs::read_link(format!("/proc/{tgid}/ns/mnt")).ok()?;
-    if &theirs == ours {
+    if &theirs == host {
         return Some(exe.to_path_buf());
     }
     Some(PathBuf::from(format!("/proc/{tgid}/root")).join(exe.strip_prefix("/").ok()?))
@@ -1038,7 +1045,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_exe_in_our_namespace_is_the_path_itself() {
+    fn resolve_exe_in_the_host_namespace_is_the_path_itself() {
         let me = std::process::id();
         let st = proc_start_ns(me).unwrap();
         let p = Path::new("/usr/bin/true");
