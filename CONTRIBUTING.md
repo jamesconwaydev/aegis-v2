@@ -39,7 +39,7 @@ what is new rather than "update stuff", and wrap the body at 72.
 
 ## Before you push
 
-Run these. CI runs them too, and they're quicker on your machine.
+Run these. CI will run them too once the workflows land, and they're quicker on your machine.
 
 ```sh
 cargo fmt --all -- --check
