@@ -4,19 +4,29 @@
 //!
 //! `bprm_check_security` fires once per binfmt rewrite: first for the
 //! script (`bprm->file` = /tmp/evil.sh), then again for its interpreter
-//! (`bprm->file` = /bin/sh). The first call for an exec wins, so we
-//! record the original file's resolved path and flags there, keyed by
-//! the thread. `bprm_committed_creds` runs once, past the point of no
-//! return and after `__set_task_comm`, so it has the right `comm` and
-//! never fires for a failed exec; it consumes the record and emits.
+//! (`bprm->file` = /bin/sh). Depth 0 is recognised from kernel state:
+//! until `load_script` or binfmt_misc calls `bprm_change_interp`,
+//! `bprm->interp == bprm->filename`. At depth 0 we record the file's
+//! resolved path and flags unconditionally, which also overwrites any
+//! stale record left by an earlier exec that failed before committing;
+//! later depths are skipped.
 //!
-//! If no record is found (e.g. tracing started mid-exec) the committed
-//! hook falls back to classifying its own `bprm->file`.
+//! Records are keyed by tgid. `cred_guard_mutex` allows one exec in
+//! flight per thread group, and the key survives `de_thread` when a
+//! non-leader thread execs (its tid becomes the tgid).
+//!
+//! `bprm_committed_creds` runs once, past the point of no return and
+//! after `__set_task_comm`, so it has the right `comm` and never fires
+//! for a failed exec; it consumes the record and emits. If no record
+//! matches this bprm (e.g. tracing began mid-exec) it classifies its
+//! own `bprm->file` and sets `EXEC_FALLBACK`.
 //!
 //! `bpf_d_path` is permitted on both hooks on 6.12, and gives the file's
 //! real path rather than argv[0].
 
-use aegis_common::{EventKind, EXEC_FROM_TMP, EXEC_MEMFD, PATH_MAX_EV, PATH_TRUNCATED};
+use aegis_common::{
+    EventKind, EXEC_FALLBACK, EXEC_FROM_TMP, EXEC_MEMFD, PATH_MAX_EV, PATH_TRUNCATED,
+};
 use aya_ebpf::{
     bindings::path,
     helpers::{bpf_d_path, bpf_get_current_pid_tgid, bpf_probe_read_kernel_str_bytes},
@@ -31,14 +41,13 @@ const SCRATCH_LEN: usize = 4096;
 const ENAMETOOLONG: i64 = 36;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 
-/// The original executed file's verdict, carried from the first
-/// `bprm_check_security` to `bprm_committed_creds`, keyed by pid_tgid.
+/// The original executed file's verdict, carried from the depth-0
+/// `bprm_check_security` to `bprm_committed_creds`, keyed by tgid.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ExecRecord {
-    /// The `linux_binprm` this verdict belongs to, so a later binfmt
-    /// rewrite of the same exec (same bprm) doesn't overwrite it, and a
-    /// stale entry from an earlier exec is recognised and replaced.
+    /// The `linux_binprm` this verdict was taken from; checked again at
+    /// commit as a sanity check only.
     bprm: u64,
     flags: u32,
     path_len: u32,
@@ -141,13 +150,13 @@ fn classify(bprm: *const u8, out: &mut [u8; PATH_MAX_EV]) -> (u32, u32) {
 
 fn try_check(ctx: &LsmContext) -> Option<()> {
     let bprm: *const u8 = ctx.arg(0);
-    let key = bpf_get_current_pid_tgid();
-    // First rewrite wins: a later depth of the same exec shares this bprm.
-    if let Some(e) = unsafe { RECORDS.get(&key) } {
-        if e.bprm == bprm as u64 {
-            return Some(());
-        }
+    // Only depth 0: a binfmt rewrite gives interp its own string.
+    let filename: u64 = read(bprm, off!(bprm_filename));
+    let interp: u64 = read(bprm, off!(bprm_interp));
+    if filename != interp {
+        return Some(());
     }
+    let key = bpf_get_current_pid_tgid() >> 32;
     let rec = unsafe { &mut *REC_BUILD.get_ptr_mut(0)? };
     unsafe { core::ptr::write_bytes(rec as *mut ExecRecord, 0, 1) };
     rec.bprm = bprm as u64;
@@ -160,7 +169,7 @@ fn try_check(ctx: &LsmContext) -> Option<()> {
 
 fn try_exec(ctx: &LsmContext) -> Option<()> {
     let bprm: *const u8 = ctx.arg(0);
-    let key = bpf_get_current_pid_tgid();
+    let key = bpf_get_current_pid_tgid() >> 32;
     let rec = unsafe { RECORDS.get(&key) };
 
     emit(EventKind::Exec, |ev| {
@@ -173,11 +182,11 @@ fn try_exec(ctx: &LsmContext) -> Option<()> {
                 ev.path = r.path;
                 ev.path_len = r.path_len;
             }
-            // No record (tracing began mid-exec): fall back to this
-            // hook's own file, which for a script is the interpreter.
+            // No matching record (tracing began mid-exec): fall back to
+            // this hook's own file, which for a script is the interpreter.
             _ => {
                 let (flags, path_len) = classify(bprm, &mut ev.path);
-                ev.flags |= flags;
+                ev.flags |= flags | EXEC_FALLBACK;
                 ev.path_len = path_len;
             }
         }

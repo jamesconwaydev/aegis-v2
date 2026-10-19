@@ -40,6 +40,8 @@ static OFFSETS: KernelOffsets = KernelOffsets {
     signal_tty: 0,
     signal_live: 0,
     bprm_file: 0,
+    bprm_filename: 0,
+    bprm_interp: 0,
     file_f_path: 0,
     file_f_inode: 0,
     inode_i_sb: 0,

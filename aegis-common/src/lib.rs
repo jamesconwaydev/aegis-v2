@@ -37,6 +37,9 @@ pub const EXEC_FROM_TMP: u32 = 1;
 pub const EXEC_MEMFD: u32 = 2;
 pub const PATH_TRUNCATED: u32 = 4;
 pub const HAS_TTY: u32 = 8;
+/// Exec: no depth-0 record matched, so the path and flags describe the
+/// file the commit hook saw (for a script, its interpreter).
+pub const EXEC_FALLBACK: u32 = 16;
 
 /// One record on the `EVENTS` ring buffer. Fields after `flags` are only
 /// meaningful for the kind named beside them; the rest are zero.
@@ -98,6 +101,8 @@ pub struct KernelOffsets {
     pub signal_tty: u32,
     pub signal_live: u32,
     pub bprm_file: u32,
+    pub bprm_filename: u32,
+    pub bprm_interp: u32,
     pub file_f_path: u32,
     pub file_f_inode: u32,
     pub inode_i_sb: u32,

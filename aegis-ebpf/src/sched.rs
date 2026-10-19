@@ -4,6 +4,7 @@
 
 use aegis_common::EventKind;
 use aya_ebpf::{
+    bindings::BPF_NOEXIST,
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_task},
     macros::{btf_tracepoint, map, tracepoint},
     maps::LruHashMap,
@@ -12,14 +13,12 @@ use aya_ebpf::{
 
 use crate::{current, emit, off, read};
 
-/// Leader start times we've already emitted an Exit for, so a race
-/// between the last threads can't double-report one process. The key is
-/// the leader's start_time_ns, not a pointer: a freed signal_struct or
-/// task_struct is slab-reused by the next short-lived process, which
-/// would collide and suppress a real exit. A monotonic start time is
-/// effectively unique and never reused.
+/// Processes we've already emitted an Exit for, so a race between the
+/// last threads can't double-report one. Keyed by (tgid, leader
+/// start_time_ns), not a pointer: a freed signal_struct is slab-reused by
+/// the next short-lived process and would suppress its real exit.
 #[map]
-static EXITED: LruHashMap<u64, u8> = LruHashMap::with_max_entries(4096, 0);
+static EXITED: LruHashMap<[u64; 2], u8> = LruHashMap::with_max_entries(4096, 0);
 
 #[btf_tracepoint(function = "sched_process_fork")]
 pub fn aegis_fork(ctx: BtfTracePointContext) -> i32 {
@@ -50,13 +49,13 @@ pub fn aegis_exit(_ctx: TracePointContext) -> u32 {
     if live != 0 {
         return 0;
     }
-    // Dedupe by the leader's start time, in case two threads race to zero.
+    // BPF_NOEXIST makes the check-and-claim atomic: only the first thread
+    // to insert this process's key emits.
     let leader: u64 = read(task, off!(task_group_leader));
-    let key: u64 = read(leader as *const u8, off!(task_start_time));
-    if unsafe { EXITED.get(&key) }.is_some() {
-        return 0;
+    let start: u64 = read(leader as *const u8, off!(task_start_time));
+    let key = [bpf_get_current_pid_tgid() >> 32, start];
+    if EXITED.insert(&key, &0, BPF_NOEXIST as u64).is_ok() {
+        emit(EventKind::Exit, current);
     }
-    let _ = EXITED.insert(&key, &0, 0);
-    emit(EventKind::Exit, current);
     0
 }

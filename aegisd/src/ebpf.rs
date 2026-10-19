@@ -56,6 +56,8 @@ fn kernel_offsets(btf: &btf::Btf) -> Result<KernelOffsets> {
         signal_tty: btf.offset("signal_struct", "tty")?,
         signal_live: btf.offset("signal_struct", "live")?,
         bprm_file: btf.offset("linux_binprm", "file")?,
+        bprm_filename: btf.offset("linux_binprm", "filename")?,
+        bprm_interp: btf.offset("linux_binprm", "interp")?,
         file_f_path: btf.offset("file", "f_path")?,
         file_f_inode: btf.offset("file", "f_inode")?,
         inode_i_sb: btf.offset("inode", "i_sb")?,

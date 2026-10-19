@@ -3,7 +3,9 @@ mod ebpf;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use aegis_common::{Event, EventKind, EXEC_FROM_TMP, EXEC_MEMFD, HAS_TTY, PATH_TRUNCATED};
+use aegis_common::{
+    Event, EventKind, EXEC_FALLBACK, EXEC_FROM_TMP, EXEC_MEMFD, HAS_TTY, PATH_TRUNCATED,
+};
 use anyhow::Result;
 use clap::Parser;
 use serde_json::{json, Value};
@@ -53,6 +55,7 @@ fn event_json(ev: &Event) -> Value {
         (EXEC_MEMFD, "exec_memfd"),
         (PATH_TRUNCATED, "path_truncated"),
         (HAS_TTY, "has_tty"),
+        (EXEC_FALLBACK, "exec_fallback"),
     ]
     .into_iter()
     .filter(|(bit, _)| ev.flags & bit != 0)
