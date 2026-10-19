@@ -3,15 +3,23 @@
 # End-to-end scenarios for `cargo xtask e2e`. Each one runs a command on
 # the test host, then the harness checks what aegisd recorded against
 # `expect`: "none" for no incident, or the verdict the single incident
-# must carry. `aegis-sim` is this repo's test-only simulator, copied to
-# /tmp/aegis-sim before the run.
+# must carry (exactly one incident). `aegis-sim` is this repo's test-only
+# simulator.
 #
-# Incidents are cleared between scenarios, so each is judged alone.
+# Incidents are cleared between scenarios, so each is judged alone. A
+# scenario whose command exits non-zero fails.
 #
 # The harness installs aegis-sim at two paths: /usr/local/bin/aegis-sim,
 # for scenarios that test a signal on its own, and /tmp/aegis-sim, so a
 # scenario that should also carry the "exec from a temp directory" signal
 # (25) gets it from its own exec.
+#
+# The ptrace steps use the real strace (a harness prerequisite), copied
+# to a fresh file under /tmp: a new inode, so it is unverified and its
+# exec comes from a temp directory. `timeout 2` stops it with SIGTERM,
+# on which strace detaches cleanly and timeout exits 124. The target is
+# the sshd listener, a system.slice service, so it counts as a system
+# daemon; the guard refuses pid 0 or 1.
 
 # --- Attack simulators ---------------------------------------------------
 
@@ -31,8 +39,12 @@ expect = "would_quarantine"
 
 [[scenario]]
 name = "ptrace-daemon"
-run = "/tmp/aegis-sim ptrace-daemon"
-# exec from /tmp (25) + ptrace a system daemon (45) = 70.
+run = """
+S=/tmp/aegis-strace.$$; P=$(systemctl show -p MainPID --value sshd)
+[ "$P" -gt 1 ] && cp /usr/bin/strace $S || exit 1
+timeout 2 $S -e trace=none -p $P; rc=$?; rm -f $S; [ $rc = 124 ]
+"""
+# The strace copy: exec from /tmp (25) + ptrace a system daemon (45) = 70.
 expect = "would_throttle"
 
 [[scenario]]
@@ -43,8 +55,14 @@ expect = "none"
 
 [[scenario]]
 name = "chain"
-run = "/tmp/aegis-sim chain"
-# exec from /tmp (25) + ptrace (45) + egress scan (40) = 110.
+run = """
+S=/tmp/aegis-strace.$$; P=$(systemctl show -p MainPID --value sshd)
+[ "$P" -gt 1 ] && cp /usr/bin/strace $S || exit 1
+/tmp/aegis-sim chain timeout 2 $S -e trace=none -p $P; rc=$?; rm -f $S; [ $rc = 124 ]
+"""
+# exec from /tmp (25) + egress scan (40) on aegis-sim, then the ptrace
+# step last, as its child: the strace copy's own tmp exec (25) + ptrace
+# a system daemon (45). One incident: 25 + 40 + 45 = 110.
 expect = "would_quarantine"
 
 # --- Benign activity that must not trip a detection ----------------------
