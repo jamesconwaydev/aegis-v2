@@ -37,6 +37,13 @@ pub enum Response {
         incidents_open: u64,
         /// `IncidentStore` writes that failed.
         incident_errors: u64,
+        /// Decisions dropped because the incident writer's queue was full.
+        incident_dropped: u64,
+        /// Execs left unverified because the verification backlog was full.
+        verify_skipped: u64,
+        /// Signals scored as unverified because a process's defer queue
+        /// overflowed.
+        deferred_overflow: u64,
         telemetry_dropped: TelemetryDropped,
     },
     Incidents(Vec<IncidentSummary>),
