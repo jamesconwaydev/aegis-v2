@@ -5,7 +5,9 @@
 //! loop over a channel and is answered there, so the daemon's state has
 //! one owner.
 
+use std::fs::File;
 use std::io::ErrorKind;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -25,9 +27,12 @@ pub type Call = (Request, oneshot::Sender<Response>);
 const IDLE: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 16;
 
-/// Binds `path`, mode 0600. A stale socket is removed; a live one, or
-/// anything that isn't a socket, is an error.
-pub fn bind(path: &Path) -> Result<UnixListener> {
+/// Binds `path`, mode 0600, holding a lock that keeps a second aegisd
+/// out. The returned `File` owns that lock: keep it for the daemon's
+/// life, and dropping it releases the lock. Any existing socket is stale
+/// once we hold the lock, so it's unlinked; a non-socket at the path is
+/// an error rather than something to clobber.
+pub fn bind(path: &Path) -> Result<(UnixListener, File)> {
     if let Some(dir) = path.parent() {
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -35,17 +40,22 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
             .create(dir)
             .with_context(|| format!("creating {}", dir.display()))?;
     }
+    let lock_path = path.with_file_name("aegisd.lock");
+    let lock =
+        File::create(&lock_path).with_context(|| format!("opening {}", lock_path.display()))?;
+    // SAFETY: flock on a valid fd; LOCK_NB makes it return instead of block.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!(
+            "another aegisd is running (lock held on {})",
+            lock_path.display()
+        );
+    }
     match std::fs::symlink_metadata(path) {
         Ok(md) if !md.file_type().is_socket() => {
             bail!("{} exists and is not a socket", path.display())
         }
-        Ok(_) => {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                bail!("another aegisd is listening on {}", path.display());
-            }
-            std::fs::remove_file(path)
-                .with_context(|| format!("removing stale {}", path.display()))?;
-        }
+        Ok(_) => std::fs::remove_file(path)
+            .with_context(|| format!("removing stale {}", path.display()))?,
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("checking {}", path.display())),
     }
@@ -53,7 +63,7 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
     // Between bind and here the socket has the umask's mode. That's
     // harmless: every peer is checked by uid before it is served.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(l)
+    Ok((l, lock))
 }
 
 /// Serves until the listener fails. Only peers with uid `allowed_uid`
@@ -107,7 +117,9 @@ async fn connection(
     let mut line = Vec::new();
     loop {
         line.clear();
-        // One byte over the limit tells a too-long line from one that fits.
+        // Read one byte past the limit (plus room for the newline), so a
+        // request of exactly MAX_REQUEST still fits and anything longer is
+        // caught whether or not its newline arrived.
         let mut capped = (&mut rd).take(MAX_REQUEST as u64 + 2);
         let n = match timeout(IDLE, capped.read_until(b'\n', &mut line)).await {
             Ok(r) => r?,
@@ -116,9 +128,13 @@ async fn connection(
         if n == 0 {
             return Ok(());
         }
-        if line.last() == Some(&b'\n') {
+        let had_newline = line.last() == Some(&b'\n');
+        if had_newline {
             line.pop();
-        } else if line.len() > MAX_REQUEST {
+        }
+        // Checked after stripping the newline, so MAX_REQUEST exactly is
+        // fine and MAX_REQUEST + 1 is rejected even with its newline read.
+        if line.len() > MAX_REQUEST {
             return reply(&mut wr, &err("request too long")).await;
         }
         let resp = match serde_json::from_slice::<Request>(&line) {
@@ -141,8 +157,12 @@ mod tests {
     use aegis_proto::{ProbeStatus, TelemetryDropped};
     use tokio::io::AsyncBufReadExt;
 
+    /// A socket in its own directory, so each test gets its own lock
+    /// file (`bind` locks `aegisd.lock` beside the socket).
     fn sock(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("aegis-ipc-{}-{name}.sock", std::process::id()))
+        let d = std::env::temp_dir().join(format!("aegis-ipc-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d.join("aegisd.sock")
     }
 
     fn status() -> Response {
@@ -158,16 +178,23 @@ mod tests {
             }],
             incidents_open: 0,
             incident_errors: 0,
+            incident_dropped: 0,
+            verify_skipped: 0,
+            deferred_overflow: 0,
             telemetry_dropped: TelemetryDropped::default(),
         }
     }
 
     /// Serves `path` for peers with `uid`, answering every call with
-    /// `status()`.
+    /// `status()`. The lock moves into the server task so it is held for
+    /// the test, as the daemon holds it for its life.
     fn start(path: &Path, uid: u32) {
-        let l = bind(path).unwrap();
+        let (l, lock) = bind(path).unwrap();
         let (tx, mut rx) = mpsc::channel::<Call>(4);
-        tokio::spawn(serve(l, tx, uid));
+        tokio::spawn(async move {
+            let _lock = lock;
+            serve(l, tx, uid).await;
+        });
         tokio::spawn(async move {
             while let Some((_, reply)) = rx.recv().await {
                 let _ = reply.send(status());
@@ -228,34 +255,39 @@ mod tests {
     async fn ipc_refuses_long_line_and_live_socket() {
         let p = sock("long");
         start(&p, me());
-        // A second daemon on the same path must not steal it.
+        // A second daemon on the same lock must not start.
         assert!(bind(&p).is_err());
+        // One byte over the limit, with its newline, is still refused.
         let mut s = UnixStream::connect(&p).await.unwrap();
-        s.write_all(&vec![b' '; MAX_REQUEST + 10]).await.unwrap();
+        let mut over = vec![b' '; MAX_REQUEST + 1];
+        over.push(b'\n');
+        s.write_all(&over).await.unwrap();
         let mut l = lines(s).await;
         assert_eq!(
             l.next_line().await.unwrap().as_deref(),
             Some(r#"{"error":"request too long"}"#)
         );
         assert!(!matches!(l.next_line().await, Ok(Some(_))));
-        // A request exactly at the limit is fine.
+        // A request of exactly the limit is fine.
         let mut s = UnixStream::connect(&p).await.unwrap();
         let mut req = vec![b' '; MAX_REQUEST - 8];
         req.extend_from_slice(b"\"Status\"\n");
+        assert_eq!(req.len() - 1, MAX_REQUEST);
         s.write_all(&req).await.unwrap();
         let mut l = lines(s).await;
         let r: Response = serde_json::from_str(&l.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(r, status());
-        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     #[tokio::test]
     async fn ipc_replaces_stale_socket() {
         let p = sock("stale");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         drop(std::os::unix::net::UnixListener::bind(&p).unwrap());
         assert!(p.exists());
         start(&p, me());
         assert!(UnixStream::connect(&p).await.is_ok());
-        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }
