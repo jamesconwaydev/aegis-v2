@@ -117,8 +117,10 @@ struct Deferred {
 }
 
 /// An environment read for the caller to run off the loop: the process,
-/// and the image (dev, ino) the answer must be about.
-pub type EnvJob = (ProcKey, (u64, u64));
+/// the image (dev, ino) the answer must be about, and the request's
+/// sequence number. A re-exec of the same file keeps the key and the
+/// image, so only the number tells a superseded answer from the current.
+pub type EnvJob = (ProcKey, (u64, u64), u64);
 
 #[cfg(test)]
 type EnvBytes = Vec<u8>;
@@ -160,7 +162,8 @@ pub struct Pipeline {
     held: HashMap<ProcKey, usize>,
     /// Environment reads in flight: the image each is about, and when it
     /// stops waiting and counts as unreadable.
-    env_reads: HashMap<ProcKey, ((u64, u64), Instant)>,
+    env_reads: HashMap<ProcKey, (EnvJob, Instant)>,
+    env_seq: u64,
     /// Environment reads for the caller to run.
     pub to_read_env: Vec<EnvJob>,
     /// Tests: answer every environment read at once, as an instant
@@ -217,6 +220,7 @@ impl Pipeline {
             by_env: HashMap::new(),
             held: HashMap::new(),
             env_reads: HashMap::new(),
+            env_seq: 0,
             to_read_env: Vec::new(),
             #[cfg(test)]
             env_auto: None,
@@ -357,21 +361,24 @@ impl Pipeline {
             return;
         }
         self.table.set_env(&key, None, true);
+        let job = (key, image, self.env_seq);
+        self.env_seq += 1;
         self.env_reads
-            .insert(key, (image, Instant::now() + ENV_DEADLINE));
-        self.to_read_env.push((key, image));
+            .insert(key, (job, Instant::now() + ENV_DEADLINE));
+        self.to_read_env.push(job);
         #[cfg(test)]
         if let Some(f) = self.env_auto {
             self.to_read_env.pop();
-            self.env_read(key, image, f(key));
+            self.env_read(job, f(key));
         }
     }
 
     /// The answer to a job queued in `to_read_env`: the environment, or
     /// None if it couldn't be read. Ignored if that read was superseded
     /// or timed out.
-    pub fn env_read(&mut self, key: ProcKey, image: (u64, u64), env: Option<Vec<u8>>) {
-        if self.env_reads.get(&key).map(|r| r.0) != Some(image) {
+    pub fn env_read(&mut self, job: EnvJob, env: Option<Vec<u8>>) {
+        let (key, image, _) = job;
+        if self.env_reads.get(&key).map(|r| r.0) != Some(job) {
             return;
         }
         let taint = env_taint(env.as_deref());
@@ -559,8 +566,8 @@ impl Pipeline {
             .map(|(k, _)| *k)
             .collect();
         for k in late {
-            let image = self.env_reads[&k].0;
-            self.env_read(k, image, None);
+            let job = self.env_reads[&k].0;
+            self.env_read(job, None);
         }
         let mut expired: Vec<(u64, u64)> = self
             .deferred
@@ -1198,7 +1205,7 @@ mod tests {
         p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
         p.handle(&ev(EventKind::MemfdCreate, 60));
         assert_eq!(p.deferred.len(), 1, "waits for the environment");
-        p.env_read(jobs[0].0, jobs[0].1, Some(b"PATH=/usr/bin\0".to_vec()));
+        p.env_read(jobs[0], Some(b"PATH=/usr/bin\0".to_vec()));
         assert_eq!(p.deferred.len(), 0);
         p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
         assert_eq!(p.store().open_count(), 0);
@@ -1222,9 +1229,29 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].verdict, "would_quarantine");
         // A late answer changes nothing.
-        let job = (key(60), (0, 0));
-        p.env_read(job.0, job.1, Some(b"PATH=/usr/bin\0".to_vec()));
+        p.env_read((key(60), (0, 0), 0), Some(b"PATH=/usr/bin\0".to_vec()));
         assert_eq!(p.store().list()[0].verdict, "would_quarantine");
+    }
+
+    #[test]
+    fn a_superseded_answer_for_the_same_image_is_ignored() {
+        let (mut p, _d) = pipeline("env-seq");
+        p.env_auto = None;
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        let old = std::mem::take(&mut p.to_read_env)[0];
+        // runc re-execs the very same file: same key, same image.
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        let new = std::mem::take(&mut p.to_read_env)[0];
+        assert_eq!((old.0, old.1), (new.0, new.1));
+        assert_ne!(old.2, new.2);
+        // The old read lands late, and clean. It must not count.
+        p.env_read(old, Some(b"PATH=/usr/bin\0".to_vec()));
+        let me = p.table.get(&key(60)).unwrap();
+        assert!(me.env_pending);
+        assert!(me.taint().is_some());
+        // The current one does.
+        p.env_read(new, Some(b"PATH=/usr/bin\0".to_vec()));
+        assert_eq!(p.table.get(&key(60)).unwrap().taint(), None);
     }
 
     #[test]
@@ -1239,7 +1266,7 @@ mod tests {
         let t = Instant::now();
         for i in 0..4 {
             let tx = tx.clone();
-            r.spawn((key(i), (0, 0)), move |j, env| {
+            r.spawn((key(i), (0, 0), 0), move |j, env| {
                 let _ = tx.send((j.0.tgid, env));
             });
         }

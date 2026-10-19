@@ -286,7 +286,7 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                 }
             }
             Some((path, v)) = done.recv() => pipe.verified(&path, v),
-            Some(((key, image), env)) = env_done.recv() => pipe.env_read(key, image, env),
+            Some((job, env)) = env_done.recv() => pipe.env_read(job, env),
             Some((req, reply)) = calls.recv() => match req {
                 // Disk reads: answer off the loop.
                 Request::IncidentShow { .. } | Request::IncidentTimeline { .. } => {
