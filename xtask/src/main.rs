@@ -131,10 +131,25 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// A hash of build/Containerfile, stamped on the image as a label so a
+/// changed Containerfile means a rebuild. DefaultHasher is only stable
+/// within one Rust release, and the toolchain is pinned; a new one at
+/// worst costs one extra rebuild.
+fn containerfile_hash() -> Result<String> {
+    use std::hash::{DefaultHasher, Hasher};
+    let body = std::fs::read(root().join("build/Containerfile"))?;
+    let mut h = DefaultHasher::new();
+    h.write(&body);
+    Ok(format!("{:016x}", h.finish()))
+}
+
+const LABEL: &str = "aegis.containerfile";
+
 fn container(engine: &str, arch: Arch) -> Result<()> {
     let dir = root().join("build");
     run(Command::new(engine)
         .args(["build", "--platform", arch.platform(), "-t", &arch.image()])
+        .args(["--label", &format!("{LABEL}={}", containerfile_hash()?)])
         .arg("-f")
         .arg(dir.join("Containerfile"))
         .arg(dir))
@@ -160,13 +175,18 @@ fn build(engine: &str, arch: Arch, release: bool) -> Result<()> {
 }
 
 /// Runs `script` in the build image with the repo at /src, building the
-/// image first if it's missing.
+/// image first if it's missing or older than build/Containerfile.
 fn in_container(engine: &str, arch: Arch, script: &str) -> Result<()> {
-    let image_exists = Command::new(engine)
-        .args(["image", "inspect", &arch.image()])
+    let label = Command::new(engine)
+        .args(["image", "inspect", "-f"])
+        .arg(format!("{{{{index .Config.Labels \"{LABEL}\"}}}}"))
+        .arg(arch.image())
         .output()
-        .is_ok_and(|o| o.status.success());
-    if !image_exists {
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    if label.as_deref() != Some(containerfile_hash()?.as_str()) {
+        eprintln!("{} is missing or stale; building it", arch.image());
         container(engine, arch)?;
     }
     // The target dir lives in a named volume rather than the bind-mounted

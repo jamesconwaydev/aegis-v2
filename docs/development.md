@@ -16,9 +16,11 @@ The binaries land in `dist/<arch>/aegisd` and `dist/<arch>/aegisctl`. Drop
 `--release` for a debug build.
 
 The first run builds the image, which takes a few minutes. After that a clean
-build is about 15 seconds on aarch64 and a minute on emulated x86_64. When you
-want a fresh image, say because you bumped a pinned version in the
-Containerfile, rebuild it:
+build is about 15 seconds on aarch64 and a minute on emulated x86_64.
+
+You don't have to remember to rebuild the image when the Containerfile
+changes. Each image carries a hash of the Containerfile it was built from,
+and xtask rebuilds when that no longer matches. To force a fresh one anyway:
 
 ```sh
 cargo xtask container --arch aarch64
