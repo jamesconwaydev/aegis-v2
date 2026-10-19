@@ -559,7 +559,7 @@ mod tests {
             e.message,
             "enforce mode is not available in this release (planned for v0.2.0)"
         );
-        assert_eq!(e.line_col, Some((2, 1)));
+        assert_eq!(e.line_col, Some((2, 8)));
     }
 
     #[test]
