@@ -1,25 +1,43 @@
 # Rocky Linux 10 build environment for Aegis. `cargo xtask container`
 # builds it; `cargo xtask build` runs every compile inside it.
-FROM rockylinux/rockylinux:10
+FROM docker.io/rockylinux/rockylinux:10.2@sha256:827d37bc128288ccf160ee318bb3cb92d591164cb217e92f8bc61e3982ae1834
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 RUN dnf -y install gcc clang llvm rpm-build selinux-policy-devel \
         systemd-rpm-macros git zstd \
     && dnf clean all
 
+# RUST_STABLE must match rust-toolchain.toml. aegisd/build.rs hands
+# AEGIS_EBPF_TOOLCHAIN to aya-build, so the eBPF crate always builds with
+# this nightly, and its LLVM must be one bpf-linker can read.
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
+    PATH=/usr/local/cargo/bin:$PATH \
+    RUST_STABLE=1.99.1 \
+    AEGIS_EBPF_TOOLCHAIN=nightly-2026-10-19
 
-# Stable builds and lints userspace; nightly with rust-src builds the eBPF crate
-# (aya-build runs it with -Z build-std=core).
+# Stable builds and lints userspace; the nightly with rust-src builds the
+# eBPF crate (aya-build runs it with -Z build-std=core).
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain stable \
-    && rustup component add rust-src clippy rustfmt \
-    && rustup toolchain install nightly --profile minimal --component rust-src
+        | sh -s -- -y --profile minimal --default-toolchain "$RUST_STABLE" \
+            --component rust-src,clippy,rustfmt \
+    && rustup toolchain install "$AEGIS_EBPF_TOOLCHAIN" --profile minimal \
+        --component rust-src
 
 # A source build of bpf-linker needs a system LLVM matching the one in
 # rustc nightly, which Rocky does not ship. Upstream's static release
 # binary bundles the right LLVM.
-RUN curl -sSfL "https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-$(uname -m)-unknown-linux-musl.tar.zst" \
-        | tar --zstd -xpf - -C /usr/local/cargo/bin \
+ARG BPF_LINKER=v0.12.0
+RUN arch=$(uname -m) \
+    && case "$arch" in \
+        x86_64) sha=6789717c8cb6a2a5d920f3b6bfac2bd7efc00f6228ecd149108a99699a75c679 ;; \
+        aarch64) sha=5e201e69dafac7af98f9788f1c68edd5ccc8fa0805093f899bf02bd2947b3935 ;; \
+        *) echo "no bpf-linker hash for $arch" >&2; exit 1 ;; \
+    esac \
+    && f=bpf-linker-$arch-unknown-linux-musl.tar.zst \
+    && curl -sSfLo "/tmp/$f" "https://github.com/aya-rs/bpf-linker/releases/download/$BPF_LINKER/$f" \
+    && echo "$sha  /tmp/$f" | sha256sum -c - \
+    && tar --zstd -xpf "/tmp/$f" -C /usr/local/cargo/bin \
+    && rm "/tmp/$f" \
     && bpf-linker --version

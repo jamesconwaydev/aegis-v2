@@ -3,6 +3,10 @@ use anyhow::{anyhow, Context as _};
 use aya_build::Toolchain;
 
 fn main() -> anyhow::Result<()> {
+    // The pinned nightly for the eBPF crate; build/Containerfile sets it.
+    println!("cargo:rerun-if-env-changed=AEGIS_EBPF_TOOLCHAIN");
+    let toolchain = std::env::var("AEGIS_EBPF_TOOLCHAIN")
+        .context("AEGIS_EBPF_TOOLCHAIN is unset; build with `cargo xtask build`")?;
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()
         .exec()
@@ -24,5 +28,5 @@ fn main() -> anyhow::Result<()> {
             .as_str(),
         ..Default::default()
     };
-    aya_build::build_ebpf([ebpf_package], Toolchain::default())
+    aya_build::build_ebpf([ebpf_package], Toolchain::Custom(&toolchain))
 }
