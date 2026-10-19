@@ -127,12 +127,15 @@ const MAX_EVIDENCE: usize = 32;
 /// stack (ruling: per-(process, kind) contribution = max(decayed, base)).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum SignalKind {
-    TmpExec,
+    TmpExec = 0,
     MemfdCreate,
     MemfdExec,
     Ptrace,
     EgressScan,
 }
+
+/// Number of signal kinds; the length of `Scorer::components`.
+pub const KINDS: usize = 5;
 
 impl SignalKind {
     fn of(s: &Signal) -> Self {
@@ -198,6 +201,29 @@ impl Scorer {
         self.throttle = cfg.general.score_threshold_throttle.into();
         self.quarantine = cfg.general.score_threshold_quarantine.into();
         self.allow = cfg.allowlist.clone();
+    }
+
+    pub fn tier(&self, score: f64) -> Tier {
+        if score >= self.quarantine {
+            Tier::Quarantine
+        } else if score >= self.throttle {
+            Tier::Throttle
+        } else {
+            Tier::Log
+        }
+    }
+
+    /// This process's live contribution per signal kind, decayed to
+    /// `now_ns`, indexed by kind. Zeros for a process we hold nothing on.
+    pub fn components(&self, key: &ProcKey, now_ns: u64) -> [f64; KINDS] {
+        let mut out = [0.0; KINDS];
+        if let Some(e) = self.scores.get(key) {
+            for (k, c) in &e.components {
+                out[*k as usize] = c.score
+                    * 0.5f64.powf(now_ns.saturating_sub(c.at_ns) as f64 / self.half_life_ns);
+            }
+        }
+        out
     }
 
     /// The child inherits the parent's kinds as they stand, each still
@@ -332,13 +358,7 @@ impl Scorer {
         });
         let score = e.components.values().map(|c| decay(c.score, c.at_ns)).sum();
         let evidence = e.evidence.clone();
-        let tier = if score >= self.quarantine {
-            Tier::Quarantine
-        } else if score >= self.throttle {
-            Tier::Throttle
-        } else {
-            Tier::Log
-        };
+        let tier = self.tier(score);
         Decision {
             key: proc.key,
             score,

@@ -31,7 +31,9 @@ use aegis_common::{Event, EventKind, EXEC_MEMFD, PATH_TRUNCATED};
 use crate::config::{Config, Mode};
 use crate::incident::{verdict, IncidentStore};
 use crate::proctable::{ProcInfo, ProcKey, ProcTable};
-use crate::scoring::{signals_for, DaemonClassifier, Decision, ScanDetector, Scorer, Signal};
+use crate::scoring::{
+    signals_for, DaemonClassifier, Decision, ScanDetector, Scorer, Signal, KINDS,
+};
 use crate::telemetry::{now_ns, Sinks, TelemetryRecord};
 use crate::verify::Verification;
 
@@ -98,6 +100,11 @@ pub struct Pipeline {
     /// waiting, and the exe each had when it asked.
     pending: HashMap<PathBuf, Vec<(ProcKey, PathBuf)>>,
     deferred: Vec<Deferred>,
+    /// Incident membership on the loop, by a local group number: the
+    /// same grouping rule the store applies, kept here so the incident
+    /// score can be computed without waiting on the writer thread.
+    groups: HashMap<ProcKey, u64>,
+    next_group: u64,
     /// Paths for the caller to verify. Each is queued once while in flight.
     pub to_verify: Vec<PathBuf>,
     pub events_total: u64,
@@ -127,6 +134,8 @@ impl Pipeline {
             resolve,
             pending: HashMap::new(),
             deferred: Vec::new(),
+            groups: HashMap::new(),
+            next_group: 0,
             to_verify: Vec::new(),
             events_total: 0,
             incident_dropped: 0,
@@ -343,6 +352,7 @@ impl Pipeline {
     fn forget(&mut self, key: &ProcKey) {
         self.scorer.on_exit(key);
         self.scan.on_exit(key);
+        self.groups.remove(key);
         for w in self.pending.values_mut() {
             w.retain(|(k, _)| k != key);
         }
@@ -367,22 +377,43 @@ impl Pipeline {
         ts_ns: u64,
     ) {
         let refs: Vec<&ProcInfo> = ancestors.iter().collect();
-        let d = self.scorer.observe(subject, &refs, sig, target, ts_ns);
-        if self.debug {
-            let last = d.evidence.last().map_or("", |e| e.reason.as_str());
-            eprintln!(
-                "aegisd: debug: tgid {} comm {} score {:.1} tier {:?}: {last}",
-                subject.key.tgid, subject.comm, d.score, d.tier
-            );
-        }
-        let Some(verdict) = verdict(d.tier) else {
-            return;
-        };
-        // pid 1 and 2 (kthreadd) are never incident subjects, and they
-        // never drag a child's incident into a kernel-rooted group.
+        let mut d = self.scorer.observe(subject, &refs, sig, target, ts_ns);
+        // pid 1 and 2 (kthreadd) are never incident subjects or members,
+        // and never drag a child's incident into a kernel-rooted group.
         if matches!(subject.key.tgid, 1 | 2) {
             return;
         }
+        // The incident this process belongs to: its own, else its nearest
+        // ancestor's. An incident is opened only by a process that reaches
+        // Throttle on its own score (inherited kinds included); a tree in
+        // which no single process does opens none.
+        let group = self.groups.get(&subject.key).copied().or_else(|| {
+            ancestors
+                .iter()
+                .find_map(|a| self.groups.get(&a.key).copied())
+        });
+        if group.is_none() && verdict(d.tier).is_none() {
+            self.debug_log(subject, &d);
+            return;
+        }
+        let g = group.unwrap_or_else(|| {
+            self.next_group += 1;
+            self.next_group
+        });
+        self.groups.insert(subject.key, g);
+        // Once an incident exists its tier follows the incident score: per
+        // kind, the strongest live member's component, summed. A chain
+        // split across processes (scan in the shell, ptrace in a child)
+        // is judged as one. Evidence stays per process.
+        let inc = self.incident_score(g, ts_ns);
+        if inc > d.score {
+            d.score = inc;
+            d.tier = self.scorer.tier(inc);
+        }
+        self.debug_log(subject, &d);
+        let Some(verdict) = verdict(d.tier) else {
+            return;
+        };
         let tree: Vec<ProcInfo> = std::iter::once(subject.clone())
             .chain(ancestors.iter().cloned())
             .filter(|p| !matches!(p.key.tgid, 1 | 2))
@@ -410,6 +441,30 @@ impl Pipeline {
                 .map(|e| e.as_os_str().as_encoded_bytes().to_vec()),
             reasons: d.evidence.iter().map(|e| e.reason.clone()).collect(),
         });
+    }
+
+    /// Sum over kinds of the max decayed component across the live
+    /// members of group `g`.
+    // ponytail: scans every member of every group; index by group if
+    // incidents ever hold thousands of processes.
+    fn incident_score(&self, g: u64, now_ns: u64) -> f64 {
+        let mut best = [0.0f64; KINDS];
+        for (k, _) in self.groups.iter().filter(|(_, &v)| v == g) {
+            for (b, c) in best.iter_mut().zip(self.scorer.components(k, now_ns)) {
+                *b = b.max(c);
+            }
+        }
+        best.iter().sum()
+    }
+
+    fn debug_log(&self, subject: &ProcInfo, d: &Decision) {
+        if self.debug {
+            let last = d.evidence.last().map_or("", |e| e.reason.as_str());
+            eprintln!(
+                "aegisd: debug: tgid {} comm {} score {:.1} tier {:?}: {last}",
+                subject.key.tgid, subject.comm, d.score, d.tier
+            );
+        }
     }
 
     fn record(&mut self, d: &Decision, tree: Vec<ProcInfo>) {
@@ -664,6 +719,99 @@ mod tests {
         }
         assert_eq!(p.deferred.len(), MAX_DEFERRED_PER_PROC);
         assert_eq!(p.deferred_overflow, 5);
+    }
+
+    fn connect(tgid: u32, port: u16) -> Event {
+        let mut e = ev(EventKind::Connect, tgid);
+        e.family = 2;
+        e.daddr[..4].copy_from_slice(&[127, 0, 0, 1]);
+        e.dport = port;
+        e.ret = -111;
+        e
+    }
+
+    fn ptrace_pid1(tgid: u32) -> Event {
+        let mut e = ev(EventKind::Ptrace, tgid);
+        e.ptrace_request = 16;
+        e.target_tgid = 1;
+        e
+    }
+
+    /// A shell `parent` (exec'd from /tmp by verified bash 79) and a child
+    /// `child` that execs /tmp/st and attaches to pid 1. The child forks
+    /// from `child_parent` before the shell scans, so it never inherits
+    /// the scan: no single process reaches quarantine.
+    fn split_chain(p: &mut Pipeline, parent: u32, child: u32, child_parent: u32) {
+        p.handle(&exec(79, "/usr/bin/bash", 0));
+        p.verified(Path::new("/usr/bin/bash"), rpm("bash"));
+        p.handle(&fork(79, parent));
+        p.handle(&exec(parent, "/tmp/xsh", EXEC_FROM_TMP));
+        p.verified(Path::new("/tmp/xsh"), Verification::Unverified);
+        p.handle(&fork(child_parent, child));
+        for port in 0..20 {
+            p.handle(&connect(parent, 40000 + port));
+        }
+        p.handle(&exec(child, "/tmp/st", EXEC_FROM_TMP));
+        p.verified(Path::new("/tmp/st"), Verification::Unverified);
+        p.handle(&ptrace_pid1(child));
+        p.to_verify.clear();
+        assert!(p.deferred.is_empty());
+    }
+
+    #[test]
+    fn chain_split_across_processes_is_judged_as_one_incident() {
+        let (mut p, _d) = pipeline("split");
+        // Shell: tmp exec 25 + scan 40 = 65. Child: tmp exec 25 (inherited
+        // from the shell before its scan) + ptrace 45 = 70. Incident: the
+        // strongest of each kind, 25 + 40 + 45 = 110.
+        split_chain(&mut p, 80, 81, 80);
+        let l = p.store().list();
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert_eq!(l[0].verdict, "would_quarantine");
+        assert_eq!(l[0].max_score, 110.0);
+        // Evidence keeps per-process attribution: the ptrace is the child's.
+        let inc = p
+            .store()
+            .get(&crate::incident::IncidentId(l[0].id.clone()))
+            .unwrap();
+        let tgids: Vec<u32> = inc.process_tree.iter().map(|m| m.tgid).collect();
+        assert_eq!(tgids, [80, 81]);
+    }
+
+    #[test]
+    fn unrelated_incidents_do_not_aggregate() {
+        let (mut p, _d) = pipeline("unrelated");
+        // The child forks from bash, not the shell: two separate trees.
+        split_chain(&mut p, 80, 81, 79);
+        let mut l = p.store().list();
+        l.sort_by_key(|i| i.root_tgid);
+        assert_eq!(l.len(), 2, "{l:?}");
+        assert_eq!(
+            (l[0].root_tgid, l[0].verdict.as_str()),
+            (80, "would_throttle")
+        );
+        assert_eq!(
+            (l[1].root_tgid, l[1].verdict.as_str()),
+            (81, "would_throttle")
+        );
+        assert_eq!((l[0].max_score, l[1].max_score), (65.0, 70.0));
+    }
+
+    #[test]
+    fn pid_1_is_never_an_incident_member() {
+        let (mut p, _d) = pipeline("pid1");
+        p.handle(&fork(1, 85));
+        p.handle(&exec(85, "/tmp/x", EXEC_FROM_TMP));
+        p.verified(Path::new("/tmp/x"), Verification::Unverified);
+        p.handle(&ptrace_pid1(85));
+        let l = p.store().list();
+        assert_eq!(l.len(), 1);
+        let inc = p
+            .store()
+            .get(&crate::incident::IncidentId(l[0].id.clone()))
+            .unwrap();
+        assert!(inc.process_tree.iter().all(|m| !matches!(m.tgid, 1 | 2)));
+        assert!(p.groups.keys().all(|k| !matches!(k.tgid, 1 | 2)));
     }
 
     #[test]
