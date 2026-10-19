@@ -208,13 +208,13 @@ pub fn new_incident_id() -> String {
 /// then random ids, retrying on a clash.
 fn create_incident_dir(
     root: &Path,
-    taken: &BTreeMap<String, Incident>,
+    taken: &dyn Fn(&str) -> bool,
     want: Option<&str>,
 ) -> Result<String> {
     let mut want = want.filter(|w| valid_id(w)).map(String::from);
     for _ in 0..32 {
         let id = want.take().unwrap_or_else(new_incident_id);
-        if taken.contains_key(&id) {
+        if taken(&id) {
             continue;
         }
         match DirBuilder::new().mode(0o700).create(root.join(&id)) {
@@ -334,27 +334,40 @@ impl IncidentStore {
             .iter()
             .find(|p| p.key == d.key)
             .context("decision process missing from tree")?;
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // The process's own membership wins; then the nearest ancestor's.
-        let existing = g.index.get(&d.key).cloned().or_else(|| {
-            tree.iter()
-                .filter(|p| p.key != d.key)
-                .find_map(|p| g.index.get(&p.key))
-                .cloned()
-        });
+        // The lock is held only to read and, at the end, to commit, never
+        // across the disk I/O in between: readers on the event loop (Status,
+        // IncidentsList) must not wait on an fsync. That is safe because
+        // one writer thread is the only caller of this method, so nothing
+        // else changes an incident between the read and the commit.
+        let (existing, boot_id) = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // The process's own membership wins; then the nearest ancestor's.
+            let existing = g.index.get(&d.key).cloned().or_else(|| {
+                tree.iter()
+                    .filter(|p| p.key != d.key)
+                    .find_map(|p| g.index.get(&p.key))
+                    .cloned()
+            });
+            let existing = existing.map(|id| g.incidents[&id].clone());
+            (existing, g.boot_id.clone().unwrap_or_default())
+        };
         let now = now_ns();
         let ts = rfc3339(now);
 
         let mut inc = match existing {
-            Some(id) => g.incidents[&id].clone(),
+            Some(inc) => inc,
             None => {
                 let root = ProcSummary::new(me);
+                let taken = |id: &str| {
+                    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    g.incidents.contains_key(id)
+                };
                 Incident {
-                    id: create_incident_dir(&self.dir, &g.incidents, want)?,
+                    id: create_incident_dir(&self.dir, &taken, want)?,
                     created: ts.clone(),
                     updated: ts.clone(),
                     updated_ns: now,
-                    boot_id: g.boot_id.clone().unwrap_or_default(),
+                    boot_id,
                     mode: mode_str(mode).into(),
                     verdict: verdict.into(),
                     max_score: d.score,
@@ -410,6 +423,7 @@ impl IncidentStore {
         writeln!(private_append(&dir.join("timeline.jsonl"))?, "{line}")?;
 
         let id = inc.id.clone();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.index.insert(d.key, id.clone());
         g.incidents.insert(id.clone(), inc);
         Ok(IncidentId(id))
@@ -430,12 +444,11 @@ impl IncidentStore {
             .collect()
     }
 
-    /// The incident this process already belongs to, if any. A cheap
-    /// lookup so telemetry on the event loop can name the incident the
-    /// writer thread is recording.
-    pub fn incident_for(&self, k: &ProcKey) -> Option<String> {
+    /// Process memberships loaded at open, for the event loop to seed
+    /// its own grouping from once at startup.
+    pub fn memberships(&self) -> Vec<(ProcKey, String)> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.index.get(k).cloned()
+        g.index.iter().map(|(k, v)| (*k, v.clone())).collect()
     }
 
     /// Every incident in memory is open: there is no close yet.
@@ -460,9 +473,13 @@ impl IncidentStore {
 
     /// Memory first, then disk (incidents older than the load window).
     pub fn get(&self, id: &IncidentId) -> Option<Incident> {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(i) = g.incidents.get(&id.0) {
-            return Some(i.clone());
+        // Memory under the lock; the disk read after it is released.
+        let hit = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.incidents.get(&id.0).cloned()
+        };
+        if hit.is_some() {
+            return hit;
         }
         if !valid_id(&id.0) {
             return None;

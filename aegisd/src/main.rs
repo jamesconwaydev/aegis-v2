@@ -326,6 +326,9 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
 
     sd_notify("STOPPING=1");
     eprintln!("aegisd: stopping");
+    // Anything still waiting on a verdict is scored now, as Unverified,
+    // and reaches the writer before its channel closes.
+    pipe.flush_all();
     server.abort();
     // Detaches every probe.
     drop(handle);

@@ -105,6 +105,10 @@ pub struct Pipeline {
     /// same grouping rule the store applies, kept here so the incident
     /// score can be computed without waiting on the writer thread.
     groups: HashMap<ProcKey, String>,
+    /// Exited processes whose deferred signals are still waiting. Their
+    /// scorer and group state is kept until those are scored.
+    exited: Vec<ProcKey>,
+    writer_gone_logged: bool,
     /// Paths for the caller to verify. Each is queued once while in flight.
     pub to_verify: Vec<PathBuf>,
     pub events_total: u64,
@@ -123,6 +127,7 @@ impl Pipeline {
         resolve: Resolve,
         debug: bool,
     ) -> Self {
+        let groups = incidents.store.memberships().into_iter().collect();
         Self {
             table: ProcTable::new(),
             scorer: Scorer::new(cfg),
@@ -134,7 +139,12 @@ impl Pipeline {
             resolve,
             pending: HashMap::new(),
             deferred: Vec::new(),
-            groups: HashMap::new(),
+            // Seeded once from what the store loaded, so an incident opened
+            // before a restart keeps its members. After this the store is
+            // never asked: its lock must stay off the event loop's path.
+            groups,
+            exited: Vec::new(),
+            writer_gone_logged: false,
             to_verify: Vec::new(),
             events_total: 0,
             incident_dropped: 0,
@@ -328,6 +338,7 @@ impl Pipeline {
                 d.ts_ns,
             );
         }
+        self.reap_exited();
     }
 
     /// Scores every signal whose deadline has passed as Unverified. The
@@ -345,18 +356,53 @@ impl Pipeline {
                 d.ts_ns,
             );
         }
+        self.reap_exited();
     }
 
     /// Drops a process from the scorer, scan detector and every queue.
+    ///
+    /// Deferred signals are kept: their snapshots don't need the table,
+    /// and a payload that exits before its verdict must still be scored.
+    /// Until they are, the process's scorer and group state stays too.
     fn forget(&mut self, key: &ProcKey) {
-        self.scorer.on_exit(key);
-        self.scan.on_exit(key);
-        self.groups.remove(key);
         for w in self.pending.values_mut() {
             w.retain(|(k, _)| k != key);
         }
         self.pending.retain(|_, w| !w.is_empty());
-        self.deferred.retain(|d| d.subject.key != *key);
+        if self.deferred.iter().any(|d| d.subject.key == *key) {
+            if !self.exited.contains(key) {
+                self.exited.push(*key);
+            }
+            return;
+        }
+        self.drop_state(key);
+    }
+
+    fn drop_state(&mut self, key: &ProcKey) {
+        self.scorer.on_exit(key);
+        self.scan.on_exit(key);
+        self.groups.remove(key);
+    }
+
+    /// Finishes forgetting exited processes once nothing of theirs is
+    /// deferred any more.
+    fn reap_exited(&mut self) {
+        let done: Vec<ProcKey> = self
+            .exited
+            .iter()
+            .copied()
+            .filter(|k| !self.deferred.iter().any(|d| d.subject.key == *k))
+            .collect();
+        self.exited.retain(|k| !done.contains(k));
+        for k in done {
+            self.drop_state(&k);
+        }
+    }
+
+    /// Scores every deferred signal now, as Unverified where its verdict
+    /// hasn't come. For shutdown, so nothing held back is lost.
+    pub fn flush_all(&mut self) {
+        self.flush_expired(Instant::now() + Duration::from_secs(365 * 86400));
     }
 
     /// Removes processes the kernel has reaped that we missed the exit
@@ -386,14 +432,9 @@ impl Pipeline {
         // ancestor's. An incident is opened only by a process that reaches
         // Throttle on its own score (inherited kinds included); a tree in
         // which no single process does opens none.
-        // The store is asked too, for incidents opened before a restart.
-        let store = &self.incidents.store;
-        let group = std::iter::once(subject).chain(ancestors).find_map(|p| {
-            self.groups
-                .get(&p.key)
-                .cloned()
-                .or_else(|| store.incident_for(&p.key))
-        });
+        let group = std::iter::once(subject)
+            .chain(ancestors)
+            .find_map(|p| self.groups.get(&p.key).cloned());
         if group.is_none() && verdict(d.tier).is_none() {
             self.debug_log(subject, &d);
             return;
@@ -448,9 +489,22 @@ impl Pipeline {
     // ponytail: scans every member of every group; index by group if
     // incidents ever hold thousands of processes.
     fn incident_score(&self, g: &str, now_ns: u64) -> f64 {
+        let members: Vec<&ProcKey> = self
+            .groups
+            .iter()
+            .filter(|(_, v)| *v == g)
+            .map(|(k, _)| k)
+            .collect();
+        // Decay everyone to the same instant, the latest any member has
+        // been scored at, so an older event for one member doesn't leave
+        // another's components looking fresher than they are.
+        let at = members
+            .iter()
+            .map(|k| self.scorer.last_ts(k))
+            .fold(now_ns, u64::max);
         let mut best = [0.0f64; KINDS];
-        for (k, _) in self.groups.iter().filter(|(_, v)| *v == g) {
-            for (b, c) in best.iter_mut().zip(self.scorer.components(k, now_ns)) {
+        for k in members {
+            for (b, c) in best.iter_mut().zip(self.scorer.components(k, at)) {
                 *b = b.max(c);
             }
         }
@@ -469,13 +523,20 @@ impl Pipeline {
 
     fn record(&mut self, d: &Decision, tree: Vec<ProcInfo>, id: &str) {
         match &self.incidents.tx {
-            Some(tx) => {
-                if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
-                    tx.try_send((d.clone(), tree, self.mode, id.to_string()))
-                {
+            Some(tx) => match tx.try_send((d.clone(), tree, self.mode, id.to_string())) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => self.incident_dropped += 1,
+                Err(TrySendError::Disconnected(_)) => {
                     self.incident_dropped += 1;
+                    if !self.writer_gone_logged {
+                        self.writer_gone_logged = true;
+                        eprintln!(
+                            "aegisd: error: incident writer thread is gone; \
+                                 incidents are no longer recorded"
+                        );
+                    }
                 }
-            }
+            },
             None => {
                 if let Err(e) = self
                     .incidents
@@ -505,16 +566,35 @@ fn exec_path(ev: &Event) -> PathBuf {
 ///
 /// The probe's start time is `CLOCK_MONOTONIC`; `/proc/<pid>/stat`
 /// field 22 is in clock ticks from boot, i.e. `CLOCK_BOOTTIME`. The two
-/// agree except for time the host spent suspended, so on a box that
-/// suspends this can read a live process as gone (then it stays
-/// Unverified, which is safe). Servers don't suspend.
+/// differ by the time the host spent suspended, which
+/// `boottime_offset_ns` corrects for.
 pub fn proc_start_matches(tgid: u32, start_time_ns: u64) -> bool {
     let Some(got) = proc_start_ns(tgid) else {
         return false;
     };
-    // One clock tick of slack, since the stat value is quantised to ticks.
+    // The probe's start is CLOCK_MONOTONIC; /proc's is CLOCK_BOOTTIME,
+    // which also counts time suspended. Shift by the current gap so a
+    // host that has slept still matches its live processes. One clock
+    // tick of slack, since the stat value is quantised to ticks.
+    let want = start_time_ns.saturating_add(boottime_offset_ns());
     let tick = 1_000_000_000 / clk_tck();
-    got.abs_diff(start_time_ns) <= tick
+    got.abs_diff(want) <= tick
+}
+
+/// CLOCK_BOOTTIME minus CLOCK_MONOTONIC, now: the time spent suspended
+/// since boot. Read fresh each call (two vDSO reads), so a suspend after
+/// startup is accounted for too.
+fn boottime_offset_ns() -> u64 {
+    let read = |clock| {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes one timespec we own.
+        unsafe { libc::clock_gettime(clock, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    };
+    read(libc::CLOCK_BOOTTIME).saturating_sub(read(libc::CLOCK_MONOTONIC))
 }
 
 fn clk_tck() -> u64 {
@@ -703,6 +783,43 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].verdict, "would_quarantine");
         assert_eq!((l[0].max_score, l[0].root_tgid), (80.0, 60));
+    }
+
+    #[test]
+    fn a_payload_that_exits_before_its_verdict_is_still_scored() {
+        let (mut p, _d) = pipeline("exit-early");
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        p.to_verify.clear();
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
+        assert_eq!(p.deferred.len(), 2);
+        // Gone before the verdict: its signals must not go with it.
+        p.handle(&ev(EventKind::Exit, 60));
+        assert!(p.table.get(&key(60)).is_none());
+        assert_eq!(p.deferred.len(), 2);
+        p.flush_expired(Instant::now() + Duration::from_secs(3));
+        let l = p.store().list();
+        assert_eq!(l.len(), 1);
+        assert_eq!(
+            (l[0].verdict.as_str(), l[0].max_score),
+            ("would_quarantine", 80.0)
+        );
+        // Scored, then forgotten: no state is left behind for the dead key.
+        assert!(p.exited.is_empty());
+        assert!(!p.groups.contains_key(&key(60)));
+        assert_eq!(p.scorer.last_ts(&key(60)), 0);
+    }
+
+    #[test]
+    fn shutdown_flush_scores_whatever_is_still_deferred() {
+        let (mut p, _d) = pipeline("flush-all");
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        p.to_verify.clear();
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
+        p.flush_all();
+        assert!(p.deferred.is_empty());
+        assert_eq!(p.store().open_count(), 1);
     }
 
     #[test]

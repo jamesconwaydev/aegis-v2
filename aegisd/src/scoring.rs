@@ -226,6 +226,14 @@ impl Scorer {
         out
     }
 
+    /// When this process was last scored, 0 if never.
+    pub fn last_ts(&self, key: &ProcKey) -> u64 {
+        self.scores
+            .get(key)
+            .and_then(|e| e.components.values().map(|c| c.at_ns).max())
+            .unwrap_or(0)
+    }
+
     /// The child inherits the parent's kinds as they stand, each still
     /// decaying from when it was last topped up.
     pub fn on_fork(&mut self, parent: &ProcKey, child: &ProcKey, _now_ns: u64) {
@@ -335,15 +343,15 @@ impl Scorer {
         let e = self.scores.entry(proc.key).or_default();
         // Topping a kind up never lowers it: max of what it has decayed to
         // and this event's contribution, so repeats don't stack.
-        let prev = e
-            .components
-            .get(&kind)
-            .map_or(0.0, |c| decay(c.score, c.at_ns));
+        let old = e.components.get(&kind);
+        let prev = old.map_or(0.0, |c| decay(c.score, c.at_ns));
+        // A late event (older timestamp) never winds a kind's clock back.
+        let at_ns = old.map_or(now_ns, |c| c.at_ns.max(now_ns));
         e.components.insert(
             kind,
             Component {
                 score: prev.max(contribution),
-                at_ns: now_ns,
+                at_ns,
             },
         );
         if e.evidence.len() == MAX_EVIDENCE {
@@ -777,6 +785,20 @@ mod tests {
         // 30 s on it has halved to 10; max(10, 20) = 20.
         let d = s.observe(&p, &[&b], Signal::MemfdCreate, None, S + 30 * S);
         assert!((d.score - 20.0).abs() < 0.01, "{}", d.score);
+    }
+
+    #[test]
+    fn a_late_event_never_winds_a_kind_back() {
+        let mut s = Scorer::new(&cfg());
+        let (p, b) = (evil(), bash());
+        s.observe(&p, &[&b], Signal::MemfdCreate, None, 10 * S);
+        // Stamped earlier than what we already hold.
+        s.observe(&p, &[&b], Signal::MemfdCreate, None, S);
+        assert_eq!(s.last_ts(&p.key), 10 * S);
+        assert_eq!(
+            s.components(&p.key, 10 * S)[SignalKind::MemfdCreate as usize],
+            20.0
+        );
     }
 
     #[test]
