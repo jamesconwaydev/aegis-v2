@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# End-to-end scenarios for `cargo xtask e2e`. Each one runs a command on
+# the test host, then the harness checks what aegisd recorded against
+# `expect`: "none" for no incident, or the verdict the single incident
+# must carry. `aegis-sim` is this repo's test-only simulator, copied to
+# /tmp/aegis-sim before the run.
+#
+# Incidents are cleared between scenarios, so each is judged alone.
+#
+# The harness installs aegis-sim at two paths: /usr/local/bin/aegis-sim,
+# for scenarios that test a signal on its own, and /tmp/aegis-sim, so a
+# scenario that should also carry the "exec from a temp directory" signal
+# (25) gets it from its own exec.
+
+# --- Attack simulators ---------------------------------------------------
+
+[[scenario]]
+name = "tmp-dropper"
+run = "/usr/local/bin/aegis-sim tmp-dropper"
+# The dropped payload execs from /tmp for a lone 25, below the throttle
+# threshold, so nothing is recorded.
+expect = "none"
+
+[[scenario]]
+name = "memfd-exec"
+run = "/usr/local/bin/aegis-sim memfd-exec"
+# memfd_create (20) + exec of a memfd (60) = 80 on one process.
+expect = "would_quarantine"
+
+[[scenario]]
+name = "ptrace-daemon"
+run = "/tmp/aegis-sim ptrace-daemon"
+# exec from /tmp (25) + ptrace a system daemon (45) = 70.
+expect = "would_throttle"
+
+[[scenario]]
+name = "port-scan"
+run = "/usr/local/bin/aegis-sim port-scan --target 127.0.0.0/8"
+# An egress scan alone is 40, below the throttle threshold.
+expect = "none"
+
+[[scenario]]
+name = "chain"
+run = "/tmp/aegis-sim chain"
+# exec from /tmp (25) + ptrace (45) + egress scan (40) = 110.
+expect = "would_quarantine"
+
+# --- Benign activity that must not trip a detection ----------------------
+
+[[scenario]]
+name = "dnf-install"
+run = "dnf -y install tree && dnf -y remove tree"
+# dnf is an allowlisted parent, so its temp-dir execs are forgiven.
+expect = "none"
+
+[[scenario]]
+name = "gdb-attach"
+# A real debugger attaching to sshd, as root at a terminal. gdb is an
+# allowlisted, RPM-verified tracer, so the ptrace is forgiven.
+run = "script -qec 'gdb -p $(pidof sshd | cut -d\" \" -f1) -batch -ex detach -ex quit' /dev/null"
+expect = "none"
+
+[[scenario]]
+name = "pip-download"
+run = "python3 -m pip download --no-input --dest /tmp/aegis-pipdl requests && rm -rf /tmp/aegis-pipdl"
+# A pure-wheel download execs nothing from a temp directory.
+expect = "none"
+
+[[scenario]]
+name = "podman-run"
+run = "podman run --rm registry.access.redhat.com/ubi10/ubi-micro true"
+# crun copies itself into a memfd on every start; it is allowlisted.
+expect = "none"
+
+[[scenario]]
+name = "ssh-login"
+# The harness runs every scenario over a fresh SSH connection, so this
+# command alone exercises a full sshd login and session.
+run = "true"
+expect = "none"

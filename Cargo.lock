@@ -27,6 +27,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-sim"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+]
+
+[[package]]
 name = "aegisctl"
 version = "0.1.0"
 dependencies = [
@@ -1561,6 +1569,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

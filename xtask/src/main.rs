@@ -8,6 +8,7 @@ use std::{env, path::PathBuf, process::Command};
 use anyhow::{bail, Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod e2e;
 mod rpm;
 
 #[derive(Parser)]
@@ -36,6 +37,9 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Arch::host())]
         arch: Arch,
     },
+    /// Build RPMs for a test host, install them, run every scenario in
+    /// tests/e2e/scenarios.toml, and assert what aegisd recorded.
+    E2e(e2e::Args),
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -84,6 +88,7 @@ fn main() -> Result<()> {
         Cmd::Container { arch } => container(&engine(arch)?, arch),
         Cmd::Build { arch, release } => build(&engine(arch)?, arch, release),
         Cmd::Rpm { arch } => rpm::rpm(&engine(arch)?, arch),
+        Cmd::E2e(args) => e2e::run(args),
     }
 }
 
