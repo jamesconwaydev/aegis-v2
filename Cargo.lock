@@ -19,6 +19,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aegisctl"
 version = "0.1.0"
 dependencies = [
@@ -31,6 +39,7 @@ version = "0.1.0"
 dependencies = [
  "aegis-common",
  "aegis-ebpf",
+ "aegis-proto",
  "anyhow",
  "aya",
  "aya-build",
@@ -1229,6 +1238,7 @@ version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
