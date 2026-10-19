@@ -25,7 +25,7 @@ and hands you a single incident with the evidence attached.
 
 ## What v0.1 does today
 
-v0.1 is an observer. It runs in **audit mode only**: it scores, records
+v0.1 is an observer. It runs in audit mode only: it scores, records
 and reports, and it changes nothing on the host. No process is stopped,
 throttled, moved or sandboxed. Ask for `mode = "enforce"` and aegisd
 refuses to start, saying it's planned for v0.2.0.

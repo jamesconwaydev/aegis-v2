@@ -108,16 +108,16 @@ One JSON object per line, appended to a file aegisd creates with mode
 0600:
 
 ```json
-{"ts": "2026-10-19T09:30:02Z",
+{"comm": "aegis-sim",
  "incident": "AEG-20261019-093000-0123456789abcdef",
- "verdict": "would_quarantine", "tier": "quarantine", "score": 85.0,
- "mode": "audit", "tgid": 4242, "comm": "aegis-sim",
- "path": "/usr/local/bin/aegis-sim",
+ "mode": "audit", "path": "/usr/local/bin/aegis-sim",
  "path_b64": "L3Vzci9sb2NhbC9iaW4vYWVnaXMtc2lt",
- "target": "/memfd:aegis-sim (deleted)",
- "target_b64": "L21lbWZkOmFlZ2lzLXNpbSAoZGVsZXRlZCk=",
  "reasons": ["memfd_create",
-             "exec of a memfd (/memfd:aegis-sim (deleted))"]}
+             "exec of a memfd (/memfd:aegis-sim (deleted))"],
+ "score": 85.0, "target": "/memfd:aegis-sim (deleted)",
+ "target_b64": "L21lbWZkOmFlZ2lzLXNpbSAoZGVsZXRlZCk=",
+ "tgid": 4242, "tier": "quarantine", "ts": "2026-10-19T09:30:02Z",
+ "verdict": "would_quarantine"}
 ```
 
 That's one line in the file, wrapped here to fit the page.

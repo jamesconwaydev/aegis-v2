@@ -1,7 +1,7 @@
 # Installation
 
-This page installs Aegis v0.1 from the release RPMs, starts it, and
-removes it again. It takes about five minutes.
+Installing Aegis v0.1 from the release RPMs and starting it takes
+about five minutes.
 
 ## Requirements
 

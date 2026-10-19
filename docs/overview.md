@@ -3,7 +3,7 @@
 Aegis v2 is a runtime threat detection daemon for Rocky Linux 10. It
 watches processes from the kernel with eBPF, scores how risky each one's
 behaviour looks, and records an incident when a score crosses a
-threshold. This page explains the ideas the other pages rely on.
+threshold.
 
 ## The problem it addresses
 

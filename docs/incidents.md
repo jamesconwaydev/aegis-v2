@@ -2,8 +2,7 @@
 
 An incident is aegisd's record of one process tree that reached the
 throttle tier: who was involved, what they did, and how high the score
-went. This page covers how incidents form, where they're stored, and
-every field in them.
+went.
 
 ## How an incident forms
 
@@ -77,10 +76,10 @@ no longer need them.
   "score": 85.0,
   "root": { "tgid": 4242, "…": "…" },
   "process_tree": [ { "tgid": 4242, "…": "…" } ],
-  "process_tree_truncated": false,
   "evidence": [ { "signal": "MemfdExec", "…": "…" } ],
   "evidence_truncated": false,
-  "timeline_lines": 2
+  "process_tree_truncated": false,
+  "timeline_lines": 1
 }
 ```
 
@@ -173,7 +172,7 @@ when `boot_id` matches the running boot, and otherwise prints
 One JSON object per line, one line per recorded decision:
 
 ```json
-{"ts":"2026-10-19T09:30:02Z","tgid":4242,"start_time_ns":81234567890,"tier":"quarantine","verdict":"would_quarantine","score":85.0,"evidence":[…]}
+{"evidence":[…],"score":85.0,"start_time_ns":81234567890,"tgid":4242,"tier":"quarantine","ts":"2026-10-19T09:30:02Z","verdict":"would_quarantine"}
 ```
 
 | Field           | Meaning                                    |
@@ -191,8 +190,8 @@ One marker line follows (shown wrapped here), and then nothing more is
 appended, though `incident.json` keeps updating:
 
 ```json
-{"ts": "2026-10-19T11:02:41Z", "truncated": true,
- "note": "timeline truncated at 10000 lines"}
+{"note": "timeline truncated at 10000 lines", "truncated": true,
+ "ts": "2026-10-19T11:02:41Z"}
 ```
 
 `aegisctl incidents timeline` prints the marker as a row.

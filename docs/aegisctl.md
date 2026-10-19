@@ -103,7 +103,7 @@ aegisctl incidents list
 
 <!-- markdownlint-disable MD013 -->
 ```text
-ID                        VERDICT           SCORE  ROOT PID  CREATED               UPDATED
+ID                                    VERDICT           SCORE  ROOT PID  CREATED               UPDATED
 AEG-20261019-093000-0123456789abcdef  would_quarantine  85.0   4242      2026-10-19T09:30:00Z  2026-10-19T09:30:02Z
 ```
 <!-- markdownlint-enable MD013 -->
@@ -164,11 +164,11 @@ even when it's too old for `list`.
 aegisctl incidents timeline AEG-20261019-093000-0123456789abcdef
 ```
 
-One line per recorded decision: time, process, the signals in its
-evidence, score, and tier.
+One line per recorded decision: time, process, the signal this decision
+added, score, and tier.
 
 ```text
-2026-10-19T09:30:02Z  aegis-sim (4242)  MemfdCreate,MemfdExec  85.0  quarantine
+2026-10-19T09:30:02Z  aegis-sim (4242)  MemfdExec  85.0  quarantine
 ```
 
 A timeline that reached its 10,000-line cap ends with a row saying

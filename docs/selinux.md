@@ -45,7 +45,7 @@ labels `/usr/bin/aegisd`.
 - **Read and hash executables:** any non-security file, with
   `dac_read_search` to open files whatever their mode. Shadow files,
   keys and other security types stay out of reach.
-- **Query the RPM database:** run `rpm` in its own domain and read the
+- **Query the RPM database:** run `rpm` inside `aegisd_t` and read the
   database, read-only.
 - **Read its config**, and manage its incidents, socket, lock file and
   log directory.

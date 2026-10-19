@@ -4,7 +4,7 @@
   <style>
     /* Mid-tone colours on a transparent background: they read on GitHub's
        light and dark themes alike, whatever the viewer's OS prefers. */
-    :root { --ink: #2f81f7; --muted: #8b949e; --accent: #2f81f7; --glow: #2da44e; --grid: #8b949e; }
+    :root { --ink: #2f81f7; --muted: #6e7781; --accent: #2f81f7; --glow: #2da44e; --grid: #8b949e; }
     .ink { fill: var(--ink); }
     .muted { fill: var(--muted); }
     .accent { fill: var(--accent); }

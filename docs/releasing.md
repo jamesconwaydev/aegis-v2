@@ -1,7 +1,7 @@
 # Releasing
 
-This page is for maintainers cutting a release. A release is a git tag
-on `main`; the Release workflow builds and publishes everything else.
+For maintainers. A release is a git tag on `main`; the Release workflow
+builds and publishes everything else.
 
 ## Versioning
 

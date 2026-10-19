@@ -1,8 +1,6 @@
 # Scoring
 
-Every process gets a risk score built from the signals it raises. This
-page gives the exact rules, the default numbers, and how to tune them
-for your hosts.
+Every process gets a risk score built from the signals it raises.
 
 ## Signals and weights
 
@@ -174,8 +172,10 @@ parent is what earns the modifier. The verification itself still shows
 as it is, and the evidence says what was withheld and why:
 
 ```text
-exec of a memfd; allowlist withheld: LD_PRELOAD is set
+exec of a memfd; allowlist withheld: LD_PRELOAD is set (/memfd:aegis-sim (deleted))
 ```
+
+For the two exec signals, the file that was run follows in brackets.
 
 On a host that sets `LD_LIBRARY_PATH` globally, every allowlisted tool
 loses its modifiers this way. Expect incidents from tools such as

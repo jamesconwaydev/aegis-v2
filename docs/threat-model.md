@@ -1,7 +1,6 @@
 # Threat model
 
-This page says what Aegis v0.1 is for, what it can see, and where it is
-blind. Read it before you rely on it.
+Read this before you rely on Aegis v0.1.
 
 ## What it's for
 

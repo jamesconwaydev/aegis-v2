@@ -1,7 +1,7 @@
 # Architecture
 
-This page follows one event from the kernel to an incident on disk. It's
-for contributors, and for operators who want to know what's running on
+Follow one event from the kernel to an incident on disk. Written for
+contributors, and for operators who want to know what's running on
 their host.
 
 ## Components
