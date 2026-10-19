@@ -15,5 +15,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Cargo workspace (`aegis-common`, `aegis-ebpf`, `aegisd`, `aegisctl`) and
   a Rocky Linux 10 build container driven by `cargo xtask build`.
+- eBPF probes for exec, fork, exit, ptrace attach, memfd_create and
+  outbound TCP connects, streamed to aegisd over a ring buffer. A hidden
+  `aegisd --dump-events` flag prints them as JSON lines.
 - Contributor scaffolding: issue forms, pull request template, security
   policy, code of conduct and contributing guide.
