@@ -11,7 +11,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use serde::Deserialize;
@@ -69,7 +69,7 @@ impl Remote {
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
-            "StrictHostKeyChecking=no".into(),
+            "StrictHostKeyChecking=accept-new".into(),
             "-o".into(),
             "ControlMaster=no".into(),
             "-o".into(),
@@ -98,7 +98,7 @@ impl Remote {
 
     fn ssh(&self) -> Command {
         let mut c = Command::new("ssh");
-        c.args(&self.opts).arg(&self.host);
+        c.args(&self.opts).arg("--").arg(&self.host);
         c
     }
 
@@ -142,14 +142,14 @@ impl Remote {
         let f = File::open(local).with_context(|| format!("opening {}", local.display()))?;
         let status = self
             .ssh()
-            .arg(format!("cat > {remote_path}"))
+            .arg(format!("cat > {}", shq(remote_path)))
             .stdin(Stdio::from(f))
             .status()
             .context("ssh upload")?;
         if !status.success() {
             bail!("uploading {} failed", local.display());
         }
-        self.check(&format!("chmod {mode} {remote_path}"))?;
+        self.check(&format!("chmod {mode} {}", shq(remote_path)))?;
         Ok(())
     }
 }
@@ -159,28 +159,50 @@ fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Strongest verdict in a `aegisctl incidents list --json` array, if any.
-fn strongest_verdict(json: &str) -> Result<Option<String>> {
+fn shq_all(v: &[String]) -> String {
+    v.iter().map(|s| shq(s)).collect::<Vec<_>>().join(" ")
+}
+
+/// What `aegisctl incidents list --json` holds, as the table shows it:
+/// "none", the single incident's verdict, or "N incidents: v1,v2".
+fn summarize(json: &str) -> Result<String> {
     let v: serde_json::Value = serde_json::from_str(json).context("incidents list --json")?;
     let arr = v.as_array().context("expected a JSON array")?;
-    let mut best: Option<String> = None;
-    for inc in arr {
-        let verdict = inc["verdict"].as_str().unwrap_or("");
-        let rank = |s: &str| match s {
-            "would_quarantine" => 2,
-            "would_throttle" => 1,
-            _ => 0,
-        };
-        if best.as_deref().is_none_or(|b| rank(verdict) > rank(b)) {
-            best = Some(verdict.to_string());
-        }
-    }
-    Ok(best)
+    let verdicts: Vec<&str> = arr
+        .iter()
+        .map(|i| i["verdict"].as_str().unwrap_or("?"))
+        .collect();
+    Ok(match verdicts.as_slice() {
+        [] => "none".into(),
+        [one] => (*one).into(),
+        many => format!("{} incidents: {}", many.len(), many.join(",")),
+    })
+}
+
+/// True if SELinux logged a denial mentioning aegis since `marker`
+/// (`date '+%x %T'` on the host). Fails closed: an ssh failure or a
+/// missing ausearch is an error, never a clean result.
+fn avc_since(remote: &Remote, marker: &str) -> Result<bool> {
+    // ausearch exits 1 on "no matches", so its status says nothing; the
+    // guard's exit 2 does.
+    let out = remote.check(&format!(
+        "command -v ausearch >/dev/null || {{ echo 'ausearch not found' >&2; exit 2; }}; \
+         ausearch -m AVC,USER_AVC,SELINUX_ERR -ts {marker} 2>/dev/null | grep -i aegis; exit 0"
+    ))?;
+    Ok(!out.trim().is_empty())
+}
+
+fn marker(remote: &Remote) -> Result<String> {
+    Ok(remote.check("date '+%x %T'")?.trim().to_string())
 }
 
 const SHA_ETC: &str = "find /etc -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum";
-const PREREQS: [&str; 3] = ["gdb", "podman", "python3-pip"];
+const PREREQS: [&str; 4] = ["gdb", "podman", "python3-pip", "strace"];
 const INCIDENTS: &str = "/var/lib/aegis-v2/incidents";
+/// How long "no incident" must hold before it counts.
+const SETTLE: Duration = Duration::from_secs(3);
+/// How long to wait for an expected incident to appear.
+const DEADLINE: Duration = Duration::from_secs(10);
 
 struct Row {
     name: String,
@@ -207,35 +229,53 @@ pub fn run(args: Args) -> Result<()> {
     rpm(&engine, arch)?; // builds release binaries into dist/<arch>/ too
     build_sim(&engine, arch)?;
 
-    // The RPMs for this arch (plus the noarch SELinux module).
-    let rpm_dir = root().join("dist/rpm");
-    let rpms = rpms_for(&rpm_dir, arch)?;
-    for r in &rpms {
-        let name = r.file_name().unwrap().to_string_lossy();
-        remote.upload(r, &format!("/tmp/{name}"), "0644")?;
-    }
-    // /tmp/aegis-sim carries the temp-dir exec signal for the scenarios
-    // that want it; /usr/local/bin/aegis-sim for the ones that don't.
-    remote.upload(&root().join(format!("dist/{arch}/aegis-sim")), "/tmp/aegis-sim", "0755")?;
-    remote.check("install -m 0755 /tmp/aegis-sim /usr/local/bin/aegis-sim")?;
+    // The RPMs for this arch and version (plus the noarch SELinux module).
+    let rpms = rpms_for(&root().join("dist/rpm"), arch)?;
+    let remote_rpms: Vec<String> = rpms
+        .iter()
+        .map(|r| format!("/tmp/{}", r.file_name().unwrap().to_string_lossy()))
+        .collect();
 
-    // Enforcing for the run; Lima boots permissive.
+    // Read-only facts cleanup needs; every change to the host happens
+    // inside the closure, so a failure part-way still cleans up.
     let orig_enforce = remote.check("getenforce")?.trim().to_string();
-    if orig_enforce == "Permissive" {
-        remote.check("setenforce 1")?;
-    }
-
-    // Record which prerequisites we add, so cleanup removes only those.
+    // Record which prerequisites we add, so cleanup removes only those
+    // (an unanswered query counts as present: never remove what we
+    // didn't add).
     let added: Vec<&str> = PREREQS
         .iter()
         .copied()
-        .filter(|p| !remote.try_run(&format!("rpm -q {p}")).map(|r| r.0).unwrap_or(false))
+        .filter(|p| {
+            !remote
+                .try_run(&format!("rpm -q {p}"))
+                .map(|r| r.0)
+                .unwrap_or(true)
+        })
         .collect();
 
-    let result = (|| -> Result<Vec<Row>> {
+    let result = (|| -> Result<(Vec<Row>, bool)> {
+        for (r, dest) in rpms.iter().zip(&remote_rpms) {
+            remote.upload(r, dest, "0644")?;
+        }
+        // /tmp/aegis-sim carries the temp-dir exec signal for the
+        // scenarios that want it; /usr/local/bin/aegis-sim for the ones
+        // that don't.
+        remote.upload(
+            &root().join(format!("dist/{arch}/aegis-sim")),
+            "/tmp/aegis-sim",
+            "0755",
+        )?;
+        remote.check("install -m 0755 /tmp/aegis-sim /usr/local/bin/aegis-sim")?;
+        // Enforcing for the run; Lima boots permissive.
+        if orig_enforce == "Permissive" {
+            remote.check("setenforce 1")?;
+        }
+
+        // Covers the whole run, installs included.
+        let run_marker = marker(&remote)?;
         remote.check(&format!("dnf -y install {}", PREREQS.join(" ")))?;
         remote.try_run("dnf -y remove aegis-v2 aegis-v2-selinux")?;
-        remote.check("dnf -y install /tmp/aegis-v2-*.rpm")?;
+        remote.check(&format!("dnf -y install {}", shq_all(&remote_rpms)))?;
         remote.check("systemctl enable --now aegisd")?;
 
         let scenarios = load_scenarios()?;
@@ -243,15 +283,24 @@ pub fn run(args: Args) -> Result<()> {
         for s in &scenarios {
             rows.push(run_scenario(&remote, s)?);
         }
-        Ok(rows)
+        let run_avc = avc_since(&remote, &run_marker)?;
+        Ok((rows, run_avc))
     })();
 
     // Always clean up, whatever happened above.
-    cleanup(&remote, &rpms, &added, &orig_enforce, args.keep);
+    cleanup(&remote, &remote_rpms, &added, &orig_enforce, args.keep);
 
-    let rows = result?;
+    let (rows, run_avc) = result?;
     print_table(&rows);
-    if rows.iter().any(|r| !r.pass) {
+    println!(
+        "whole-run AVC check: {}",
+        if run_avc {
+            "DENY (see ausearch on the host)"
+        } else {
+            "ok"
+        }
+    );
+    if run_avc || rows.iter().any(|r| !r.pass) {
         bail!("one or more scenarios failed");
     }
     println!("\nall scenarios passed");
@@ -271,13 +320,17 @@ fn build_sim(engine: &str, arch: Arch) -> Result<()> {
     Ok(())
 }
 
+/// This version's RPMs for `arch`, plus the noarch ones; stale builds of
+/// other versions in the same dir are left out.
 fn rpms_for(dir: &Path, arch: Arch) -> Result<Vec<PathBuf>> {
     let want_arch = format!(".{arch}.rpm");
+    let want_ver = format!("-{}-", env!("CARGO_PKG_VERSION"));
     let mut out = Vec::new();
     for ent in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let p = ent?.path();
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
-        if name.ends_with(&want_arch) || name.ends_with(".noarch.rpm") {
+        if name.contains(&want_ver) && (name.ends_with(&want_arch) || name.ends_with(".noarch.rpm"))
+        {
             out.push(p);
         }
     }
@@ -289,7 +342,8 @@ fn rpms_for(dir: &Path, arch: Arch) -> Result<Vec<PathBuf>> {
 
 fn load_scenarios() -> Result<Vec<Scenario>> {
     let path = root().join("tests/e2e/scenarios.toml");
-    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let s: Scenarios = toml::from_str(&text).context("parsing scenarios.toml")?;
     for sc in &s.scenario {
         if !matches!(
@@ -309,42 +363,45 @@ fn run_scenario(remote: &Remote, s: &Scenario) -> Result<Row> {
     remote.check("systemctl start aegisd")?;
 
     let etc_before = remote.check(SHA_ETC)?;
-    let marker = remote.check(r#"date '+%H:%M:%S'"#)?.trim().to_string();
+    let marker = marker(remote)?;
 
-    // Run the scenario itself. A non-zero exit is recorded but doesn't by
-    // itself fail the scenario; the detection check does.
+    // Run the scenario itself. A command that fails fails the scenario.
     let (ran, _out, err) = remote.try_run(&s.run)?;
     if !ran {
         eprintln!("  {}: command exited non-zero: {}", s.name, err.trim());
     }
 
-    // Let the probes drain and any deferred signal reach its deadline.
-    std::thread::sleep(Duration::from_secs(3));
+    // Poll until the expected result shows up or the deadline passes.
+    // An absence can't be seen early, so "none" is only taken once the
+    // settle time (probe drain plus the 2 s verification hold) is up.
+    let start = Instant::now();
+    let got = loop {
+        let got = summarize(&remote.check("aegisctl incidents list --json")?)?;
+        let settled = start.elapsed() >= SETTLE;
+        if (got == s.expect && (s.expect != "none" || settled)) || start.elapsed() >= DEADLINE {
+            break got;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
 
-    let json = remote.check("aegisctl incidents list --json")?;
-    let got = strongest_verdict(&json)?;
-
-    let avc_out = remote
-        .try_run(&format!(
-            "ausearch -m AVC,USER_AVC,SELINUX_ERR -ts {marker} 2>/dev/null | grep -i aegis || true"
-        ))?
-        .1;
-    let avc = !avc_out.trim().is_empty();
+    let avc = avc_since(remote, &marker).unwrap_or_else(|e| {
+        eprintln!(
+            "  {}: AVC check failed, counting it as a denial: {e:#}",
+            s.name
+        );
+        true
+    });
 
     let etc_after = remote.check(SHA_ETC)?;
     let etc_ok = etc_before == etc_after;
 
-    let got_s = got.clone().unwrap_or_else(|| "none".into());
-    let verdict_ok = match s.expect.as_str() {
-        "none" => got.is_none(),
-        want => got.as_deref() == Some(want),
-    };
-    let pass = verdict_ok && !avc && etc_ok;
+    let verdict_ok = got == s.expect;
+    let pass = ran && verdict_ok && !avc && etc_ok;
 
     Ok(Row {
         name: s.name.clone(),
         expect: s.expect.clone(),
-        got: got_s,
+        got,
         avc,
         etc_ok,
         ran,
@@ -352,7 +409,13 @@ fn run_scenario(remote: &Remote, s: &Scenario) -> Result<Row> {
     })
 }
 
-fn cleanup(remote: &Remote, rpms: &[PathBuf], added: &[&str], orig_enforce: &str, keep: bool) {
+fn cleanup(
+    remote: &Remote,
+    remote_rpms: &[String],
+    added: &[&str],
+    orig_enforce: &str,
+    keep: bool,
+) {
     if !keep {
         let _ = remote.try_run("systemctl stop aegisd");
         let _ = remote.try_run("dnf -y remove aegis-v2 aegis-v2-selinux");
@@ -361,13 +424,10 @@ fn cleanup(remote: &Remote, rpms: &[PathBuf], added: &[&str], orig_enforce: &str
         if !added.is_empty() {
             let _ = remote.try_run(&format!("dnf -y remove {}", added.join(" ")));
         }
-        let names: Vec<String> = rpms
-            .iter()
-            .map(|r| format!("/tmp/{}", r.file_name().unwrap().to_string_lossy()))
-            .collect();
         let _ = remote.try_run(&format!(
-            "rm -f /tmp/aegis-sim /usr/local/bin/aegis-sim /tmp/aegis-sim-dropped.sh {}",
-            names.join(" ")
+            "rm -f /tmp/aegis-sim /usr/local/bin/aegis-sim /tmp/aegis-sim-dropped.* \
+             /tmp/aegis-strace.* {}",
+            shq_all(remote_rpms)
         ));
     }
     if orig_enforce == "Permissive" {
