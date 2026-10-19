@@ -112,6 +112,9 @@ pub struct Incident {
     /// `updated` as Unix nanoseconds; the load window works from this.
     #[serde(default)]
     pub updated_ns: u64,
+    /// Boot the member `ProcKey`s belong to; empty when unknown.
+    #[serde(default)]
+    pub boot_id: String,
     pub mode: String,
     pub verdict: String,
     pub max_score: f64,
@@ -145,6 +148,7 @@ pub fn verdict(t: Tier) -> Option<&'static str> {
 
 #[derive(Default)]
 struct Inner {
+    boot_id: Option<String>,
     incidents: BTreeMap<String, Incident>,
     index: HashMap<ProcKey, String>,
 }
@@ -223,14 +227,12 @@ fn create_incident_dir(root: &Path, taken: &BTreeMap<String, Incident>) -> Resul
     bail!("could not find a free incident id")
 }
 
-/// Boot time as Unix seconds, from `/proc/stat`. `ProcKey` start times
-/// are relative to boot, so a member from an earlier boot says nothing
-/// about a process running now.
-pub fn boot_time_secs() -> Option<u64> {
-    fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
+/// Identity of the current boot. `ProcKey` start times only mean
+/// something within one boot, so incidents are matched by this, not by a
+/// clock comparison.
+pub fn current_boot_id() -> Option<String> {
+    let id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    Some(id.trim().to_string()).filter(|i| !i.is_empty())
 }
 
 const KEEP_SECS: u64 = 30 * 86400;
@@ -242,19 +244,23 @@ fn valid_id(id: &str) -> bool {
 impl IncidentStore {
     /// Create the directory if needed and reload recent incidents.
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_at(dir, boot_time_secs().unwrap_or(0), now_ns() / 1_000_000_000)
+        Self::open_at(dir, current_boot_id(), now_ns() / 1_000_000_000)
     }
 
-    /// `open` with the boot time and the current time injected.
+    /// `open` with the boot id and the current time injected.
     ///
     /// Only incidents updated in the last 30 days are loaded into memory,
-    /// and only those updated since boot feed the process index. Older
+    /// and only those from this boot (same `boot_id`) feed the process index. Older
     /// ones stay on disk: `get` still finds them, `list` does not.
     /// ponytail: no eviction while running and `list` is recent-only; add
     /// an eviction pass and a disk scan if either matters.
-    pub fn open_at(dir: &Path, boot_secs: u64, now_secs: u64) -> Result<Self> {
+    pub fn open_at(dir: &Path, boot_id: Option<String>, now_secs: u64) -> Result<Self> {
         private_dir(dir)?;
-        let mut inner = Inner::default();
+        let mut inner = Inner {
+            boot_id: boot_id.clone(),
+            ..Inner::default()
+        };
+        let (mut warned_ts, mut warned_boot) = (false, false);
         for ent in fs::read_dir(dir)? {
             let ent = ent?;
             let name = ent.file_name().to_string_lossy().into_owned();
@@ -273,11 +279,17 @@ impl IncidentStore {
                 eprintln!("aegisd: ignoring {name}: incident.json says id {}", inc.id);
                 continue;
             }
+            if inc.updated_ns == 0 && !std::mem::replace(&mut warned_ts, true) {
+                eprintln!("aegisd: {name}: no updated_ns, treating it (and any like it) as old");
+            }
             let updated = inc.updated_ns / 1_000_000_000;
             if updated + KEEP_SECS < now_secs {
                 continue;
             }
-            if updated >= boot_secs {
+            if inc.boot_id.is_empty() && !std::mem::replace(&mut warned_boot, true) {
+                eprintln!("aegisd: {name}: no boot_id, not indexing it (and any like it)");
+            }
+            if !inc.boot_id.is_empty() && Some(&inc.boot_id) == boot_id.as_ref() {
                 for m in &inc.process_tree {
                     inner.index.insert(m.key(), inc.id.clone());
                 }
@@ -324,6 +336,7 @@ impl IncidentStore {
                     created: ts.clone(),
                     updated: ts.clone(),
                     updated_ns: now,
+                    boot_id: g.boot_id.clone().unwrap_or_default(),
                     mode: mode_str(mode).into(),
                     verdict: verdict.into(),
                     max_score: d.score,
@@ -672,11 +685,11 @@ mod tests {
         .unwrap();
         let now = now_ns() / 1_000_000_000;
 
-        let st = IncidentStore::open_at(&dir, 0, now).unwrap();
+        let st = IncidentStore::open_at(&dir, current_boot_id(), now).unwrap();
         assert_eq!(st.list().len(), 1);
 
-        // Booted after the last update: listed, but not indexed.
-        let st = IncidentStore::open_at(&dir, now + 86400, now).unwrap();
+        // A different boot: listed, but not indexed.
+        let st = IncidentStore::open_at(&dir, Some("other-boot".into()), now).unwrap();
         assert_eq!(st.list().len(), 1);
         let again = st
             .record(
@@ -688,7 +701,7 @@ mod tests {
         assert_ne!(again, id);
 
         // Older than 30 days: not loaded, but get() still reads it.
-        let st = IncidentStore::open_at(&dir, 0, now + 31 * 86400).unwrap();
+        let st = IncidentStore::open_at(&dir, current_boot_id(), now + 31 * 86400).unwrap();
         assert!(st.list().is_empty());
         assert!(st.get(&id).is_some());
         assert!(st.get(&IncidentId("../x".into())).is_none());
@@ -725,5 +738,54 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn boot_id_gates_the_index() {
+        let dir = tmp("bootid");
+        let st = IncidentStore::open_at(&dir, Some("boot-a".into()), 1).unwrap();
+        let root = proc(10, None, b"/tmp/x");
+        let id = st
+            .record(
+                &dec(10, Tier::Throttle, 6.0),
+                std::slice::from_ref(&root),
+                Mode::Audit,
+            )
+            .unwrap();
+        assert_eq!(st.get(&id).unwrap().boot_id, "boot-a");
+        let now = now_ns() / 1_000_000_000;
+        let same = IncidentStore::open_at(&dir, Some("boot-a".into()), now).unwrap();
+        let again = same
+            .record(
+                &dec(10, Tier::Throttle, 6.0),
+                std::slice::from_ref(&root),
+                Mode::Audit,
+            )
+            .unwrap();
+        assert_eq!(again, id);
+        for boot in [Some("boot-b".to_string()), None] {
+            let st = IncidentStore::open_at(&dir, boot, now).unwrap();
+            let fresh = st
+                .record(
+                    &dec(10, Tier::Throttle, 6.0),
+                    std::slice::from_ref(&root),
+                    Mode::Audit,
+                )
+                .unwrap();
+            assert_ne!(fresh, id);
+        }
+        // An incident.json from before boot_id existed is never indexed.
+        let j = dir.join(&id.0).join("incident.json");
+        let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&j).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("boot_id");
+        fs::write(&j, v.to_string()).unwrap();
+        let old = tmp("bootid-old");
+        fs::create_dir_all(old.join(&id.0)).unwrap();
+        fs::copy(&j, old.join(&id.0).join("incident.json")).unwrap();
+        let st = IncidentStore::open_at(&old, Some("boot-a".into()), now).unwrap();
+        let fresh = st
+            .record(&dec(10, Tier::Throttle, 6.0), &[root], Mode::Audit)
+            .unwrap();
+        assert_ne!(fresh, id);
     }
 }

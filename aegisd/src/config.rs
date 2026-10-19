@@ -268,6 +268,12 @@ impl OtlpConfig {
             .strip_prefix("http://")
             .or_else(|| self.endpoint.strip_prefix("https://"))
             .ok_or("otlp endpoint must start with http:// or https://")?;
+        if host.split('/').next().is_some_and(|a| a.contains('@')) {
+            return Err(
+                "otlp endpoint must not carry user:pass@; put credentials in [telemetry.otlp.headers]"
+                    .into(),
+            );
+        }
         if host.is_empty() || bad(&self.endpoint) || self.endpoint.contains(' ') {
             return Err("otlp endpoint is empty or has control characters".into());
         }
@@ -591,6 +597,7 @@ mod tests {
         assert!(!format!("{o:?}").contains("s3cret"));
         for bad in [
             "endpoint = \"ftp://h\"",
+            "endpoint = \"https://user:pw@h:4318\"",
             "endpoint = \"http://h\\nX: y\"",
             "endpoint = \"http://h\"\ntimeout_secs = 0",
             "endpoint = \"http://h\"\n[telemetry.otlp.headers]\n\"Bad Name\" = \"v\"",

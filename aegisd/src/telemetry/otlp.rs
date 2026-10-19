@@ -26,6 +26,8 @@ const FLUSH: Duration = Duration::from_secs(1);
 #[derive(Default)]
 struct Counters {
     queue_full: AtomicU64,
+    /// Worker thread gone (it panicked); nothing will drain the queue.
+    disconnected: AtomicU64,
     export_failed: AtomicU64,
 }
 
@@ -90,7 +92,13 @@ impl Otlp {
 
     /// Records lost to a full queue or a failed export.
     pub fn dropped_records(&self) -> u64 {
-        self.dropped_queue_full() + self.counters.export_failed.load(Ordering::Relaxed)
+        self.dropped_queue_full()
+            + self.dropped_disconnected()
+            + self.counters.export_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped_disconnected(&self) -> u64 {
+        self.counters.disconnected.load(Ordering::Relaxed)
     }
 
     pub fn dropped_queue_full(&self) -> u64 {
@@ -102,8 +110,11 @@ impl Sink for Otlp {
     fn emit(&self, rec: &TelemetryRecord) {
         match self.tx.try_send(log_record(rec)) {
             Ok(()) => {}
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Full(_)) => {
                 self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.counters.disconnected.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
