@@ -168,8 +168,8 @@ included, when:
   exec clears it.
 
 For a temp-directory exec the parent's state counts too, since the
-parent is what earns the modifier. The verification itself still shows
-as it is, and the evidence says what was withheld and why:
+parent is what earns the modifier. Withholding doesn't change a
+binary's verification, and the evidence says what was withheld and why:
 
 ```text
 exec of a memfd; allowlist withheld: LD_PRELOAD is set (/memfd:aegis-sim (deleted))

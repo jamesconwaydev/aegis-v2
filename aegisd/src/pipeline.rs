@@ -110,6 +110,9 @@ struct Deferred {
     ancestors: Vec<ProcInfo>,
     signal: Signal,
     target: Option<PathBuf>,
+    /// For an exec, the process as the new image: what it is recorded as
+    /// in an incident, while `subject` stays the image that did the exec.
+    image: Option<ProcInfo>,
     ts_ns: u64,
     deadline: Instant,
     waits_exe: Option<ExeKey>,
@@ -286,8 +289,16 @@ impl Pipeline {
         // For an exec, the target is the new image; the subject stays the
         // pre-exec binary (allowlists judge what did the exec).
         let target = (kind == Some(EventKind::Exec)).then(|| exec_path(ev));
+        let image = match kind {
+            Some(EventKind::Exec) if !sigs.is_empty() => self.table.get(&key).map(|p| {
+                let mut p = p.clone();
+                p.apply_exec(ev);
+                p
+            }),
+            _ => None,
+        };
         for sig in sigs {
-            self.consider(key, sig, target.clone(), ev.ts_ns);
+            self.consider(key, sig, target.clone(), image.clone(), ev.ts_ns);
         }
         match kind {
             Some(EventKind::Exit) => self.forget(&key),
@@ -428,13 +439,21 @@ impl Pipeline {
             &d.ancestors,
             d.signal,
             d.target.as_deref(),
+            d.image.as_ref(),
             d.ts_ns,
         );
     }
 
     /// Scores a signal now, or defers it if the verdict it needs is still
     /// in flight.
-    fn consider(&mut self, key: ProcKey, sig: Signal, target: Option<PathBuf>, ts_ns: u64) {
+    fn consider(
+        &mut self,
+        key: ProcKey,
+        sig: Signal,
+        target: Option<PathBuf>,
+        image: Option<ProcInfo>,
+        ts_ns: u64,
+    ) {
         let Some(subject) = self.table.get(&key).cloned() else {
             return;
         };
@@ -480,6 +499,7 @@ impl Pipeline {
                         ancestors,
                         signal: sig,
                         target,
+                        image,
                         ts_ns,
                         deadline: Instant::now() + DEFER_DEADLINE,
                         waits_exe,
@@ -489,7 +509,14 @@ impl Pipeline {
                 return;
             }
         }
-        self.score(&subject, &ancestors, sig, target.as_deref(), ts_ns);
+        self.score(
+            &subject,
+            &ancestors,
+            sig,
+            target.as_deref(),
+            image.as_ref(),
+            ts_ns,
+        );
     }
 
     fn request_verification(&mut self, key: ProcKey) {
@@ -585,6 +612,7 @@ impl Pipeline {
                 &d.ancestors,
                 d.signal,
                 d.target.as_deref(),
+                d.image.as_ref(),
                 d.ts_ns,
             );
         }
@@ -665,6 +693,7 @@ impl Pipeline {
         ancestors: &[ProcInfo],
         sig: Signal,
         target: Option<&Path>,
+        image: Option<&ProcInfo>,
         ts_ns: u64,
     ) {
         let refs: Vec<&ProcInfo> = ancestors.iter().collect();
@@ -711,7 +740,7 @@ impl Pipeline {
             self.incident_suppressed += 1;
             return;
         }
-        let tree: Vec<ProcInfo> = std::iter::once(subject.clone())
+        let tree: Vec<ProcInfo> = std::iter::once(image.unwrap_or(subject).clone())
             .chain(ancestors.iter().cloned())
             .filter(|p| !matches!(p.key.tgid, 1 | 2))
             .collect();
@@ -1189,8 +1218,12 @@ mod tests {
             "{:?}",
             inc.evidence
         );
-        // Shown as verified all the same.
-        assert_eq!(inc.root.verification, "rpm_owned:runc");
+        // Recorded as the memfd it runs now, which nothing can verify.
+        assert_eq!(
+            inc.root.exe.as_deref(),
+            Some("/memfd:runc_cloned (deleted)")
+        );
+        assert_eq!(inc.root.verification, "unverified");
     }
 
     #[test]
@@ -1513,6 +1546,44 @@ mod tests {
             .unwrap();
         let tgids: Vec<u32> = inc.process_tree.iter().map(|m| m.tgid).collect();
         assert_eq!(tgids, [80, 81]);
+    }
+
+    #[test]
+    fn member_joining_at_its_exec_is_recorded_as_the_new_image() {
+        let (mut p, _d) = pipeline("image");
+        // The child joins on the tmp exec of /tmp/st. Its member entry is
+        // the image it runs from then on, not the shell it was forked as.
+        split_chain(&mut p, 80, 81, 80);
+        let l = p.store().list();
+        let inc = p
+            .store()
+            .get(&crate::incident::IncidentId(l[0].id.clone()))
+            .unwrap();
+        let exes: Vec<_> = inc
+            .process_tree
+            .iter()
+            .map(|m| m.exe.as_deref().unwrap())
+            .collect();
+        assert_eq!(exes, ["/tmp/xsh", "/tmp/st"]);
+        // Evidence names its signal by the stable weight key, and the
+        // detail a variant carries goes in the reason.
+        let ev: Vec<_> = inc
+            .evidence
+            .iter()
+            .map(|e| (e.signal.as_str(), e.reason.as_str()))
+            .collect();
+        assert_eq!(
+            ev,
+            [
+                ("tmp_exec", "exec from a temp directory (/tmp/xsh)"),
+                ("egress_scan", "egress scan (10 distinct targets)"),
+                ("tmp_exec", "exec from a temp directory (/tmp/st)"),
+                (
+                    "ptrace_system_daemon",
+                    "ptrace attach to a system daemon (pid 1)"
+                ),
+            ]
+        );
     }
 
     #[test]

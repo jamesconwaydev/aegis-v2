@@ -115,6 +115,10 @@ no longer need them.
 | `selinux_domain` | full SELinux context, if known                     |
 | `verification`   | see below                                          |
 
+Each entry is the process as it was when it joined. A process that
+joins at an exec is recorded as the image the exec started, not the one
+that did the exec.
+
 `verification` is one of:
 
 | Value                 | Meaning                                      |
@@ -148,19 +152,20 @@ bidirectional characters before printing either.
 | `reason`   | a readable explanation                               |
 | `ts_ns`    | when it happened, nanoseconds since boot (monotonic) |
 
-`signal` is one of:
-
-- `TmpExec`
-- `MemfdCreate`
-- `MemfdExec`
-- `PtraceSystemDaemon { target: ProcKey { tgid: <pid>, start_time_ns:
-  <ns> } }`: `start_time_ns` is 0 if aegisd never saw the target start
-- `EgressScan { distinct_targets: <n> }`
+`signal` is one of `tmp_exec`, `memfd_create`, `memfd_exec`,
+`ptrace_system_daemon` or `egress_scan`, the same names as the weights
+in `[scoring.weights]`. Incidents written by v0.1.0 used Rust-style
+names instead, such as `TmpExec`.
 
 `reason` reads like `exec of a memfd (/memfd:x (deleted))`,
 `memfd_create; caller is allowlisted`, or
-`memfd_create; allowlist withheld: LD_PRELOAD is set`. For the two
-exec signals, the path in brackets is the file that was executed.
+`memfd_create; allowlist withheld: LD_PRELOAD is set`. In brackets at
+the end:
+
+- for the two exec signals, the file that was executed;
+- for `ptrace_system_daemon`, the pid that was attached to;
+- for `egress_scan`, how many distinct (address, port) pairs the
+  process had connected to when the scan was flagged.
 
 `ts_ns` counts from boot, so it only converts to a wall-clock time
 within the same boot. `aegisctl incidents show` does that conversion

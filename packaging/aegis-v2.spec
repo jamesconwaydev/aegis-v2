@@ -121,5 +121,9 @@ systemctl try-restart aegisd.service 2>/dev/null || :
 %{_datadir}/selinux/packages/%{selinuxtype}/aegis.pp
 
 %changelog
+* Wed Oct 21 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.1.1-1
+- List a member that joined at an exec under the image it runs.
+- Record signals by their weight key, not a Rust debug string.
+
 * Mon Oct 19 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.1.0-1
 - First package: aegisd, aegisctl, the systemd unit and the SELinux module.

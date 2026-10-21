@@ -103,7 +103,7 @@ pub struct EvidenceRecord {
 impl EvidenceRecord {
     fn new(e: &Evidence) -> Self {
         Self {
-            signal: format!("{:?}", e.signal),
+            signal: e.signal.name().into(),
             base: e.base,
             modifier: e.modifier,
             reason: e.reason.clone(),

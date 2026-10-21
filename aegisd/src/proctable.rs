@@ -56,6 +56,27 @@ impl ProcInfo {
     }
 }
 
+impl ProcInfo {
+    /// Becomes the image an Exec event started.
+    pub fn apply_exec(&mut self, ev: &Event) {
+        let n = (ev.path_len as usize).min(ev.path.len());
+        // The new image's environment is the pipeline's to read.
+        self.env_taint = None;
+        self.env_pending = false;
+        // A tracer's hold on the old image doesn't carry over.
+        self.ptraced = false;
+        self.exe = Some(PathBuf::from(OsStr::from_bytes(&ev.path[..n])));
+        self.exe_id = Some(exe_id(ev));
+        self.comm = comm_str(&ev.comm);
+        self.has_tty = ev.flags & HAS_TTY != 0;
+        self.uid = ev.uid;
+        self.cgroup_id = ev.cgroup_id;
+        self.selinux_domain = selinux_domain(ev.tgid);
+        // The old image's verdict no longer applies.
+        self.verification = Verification::Unverified;
+    }
+}
+
 pub const UNREADABLE: &str = "its environment could not be read";
 
 pub struct ProcTable {
@@ -242,24 +263,7 @@ impl ProcTable {
         }
         self.ensure(ev);
         match kind {
-            Some(EventKind::Exec) => {
-                let n = (ev.path_len as usize).min(ev.path.len());
-                let p = self.procs.get_mut(&key).unwrap();
-                // The new image's environment is the pipeline's to read.
-                p.env_taint = None;
-                p.env_pending = false;
-                // A tracer's hold on the old image doesn't carry over.
-                p.ptraced = false;
-                p.exe = Some(PathBuf::from(OsStr::from_bytes(&ev.path[..n])));
-                p.exe_id = Some(exe_id(ev));
-                p.comm = comm_str(&ev.comm);
-                p.has_tty = ev.flags & HAS_TTY != 0;
-                p.uid = ev.uid;
-                p.cgroup_id = ev.cgroup_id;
-                p.selinux_domain = selinux_domain(ev.tgid);
-                // The old image's verdict no longer applies.
-                p.verification = Verification::Unverified;
-            }
+            Some(EventKind::Exec) => self.procs.get_mut(&key).unwrap().apply_exec(ev),
             Some(EventKind::Fork) => {
                 let ck = ProcKey {
                     tgid: ev.child_tgid,

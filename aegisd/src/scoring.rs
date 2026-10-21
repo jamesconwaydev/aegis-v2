@@ -27,6 +27,20 @@ pub enum Signal {
     },
 }
 
+impl Signal {
+    /// The stable name incidents and telemetry record, the same as the
+    /// signal's key in `[scoring.weights]`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Signal::TmpExec => "tmp_exec",
+            Signal::MemfdCreate => "memfd_create",
+            Signal::MemfdExec => "memfd_exec",
+            Signal::PtraceSystemDaemon { .. } => "ptrace_system_daemon",
+            Signal::EgressScan { .. } => "egress_scan",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     Log,
@@ -359,8 +373,17 @@ impl Scorer {
         now_ns: u64,
     ) -> Decision {
         let (base, modifier, mut reason) = self.weigh(proc, ancestors, &sig);
-        if let (Some(t), Signal::TmpExec | Signal::MemfdExec) = (target, &sig) {
-            reason = format!("{reason} ({})", t.display());
+        match (&sig, target) {
+            (Signal::TmpExec | Signal::MemfdExec, Some(t)) => {
+                reason = format!("{reason} ({})", t.display());
+            }
+            (Signal::PtraceSystemDaemon { target }, _) => {
+                reason = format!("{reason} (pid {})", target.tgid);
+            }
+            (Signal::EgressScan { distinct_targets }, _) => {
+                reason = format!("{reason} ({distinct_targets} distinct targets)");
+            }
+            _ => {}
         }
         // A modifier cancels this event's contribution, never more.
         let contribution = (base + modifier).max(0.0);
