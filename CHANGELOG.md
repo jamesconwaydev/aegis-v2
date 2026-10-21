@@ -25,6 +25,13 @@ Two fixes the new lab demo caught in the evidence v0.1.0 writes.
   should expect the new names; incidents already on disk keep the old
   ones.
 
+### Security
+
+- OTLP export over https now uses rustls-webpki 0.103.16 and
+  webpki-roots 1.0.10, for RUSTSEC-2026-0382 (certificate verification
+  could accept distrusted intermediates) and RUSTSEC-2026-0381 (bundled
+  roots trusted distrusted emSign intermediates).
+
 ## [0.1.0] - 2026-10-19
 
 The first release, and it watches without touching. Install it, run it in
