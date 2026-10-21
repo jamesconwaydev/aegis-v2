@@ -1,0 +1,76 @@
+{
+    "id": "AEG-20261021-233357-76d2c9b5faf63e86",
+    "created": "2026-10-21T23:33:57Z",
+    "updated": "2026-10-21T23:33:57Z",
+    "updated_ns": 1792625637312928428,
+    "boot_id": "0e936ba1-ae19-455e-b110-398972f54a07",
+    "mode": "audit",
+    "verdict": "would_quarantine",
+    "max_score": 109.97517265035032,
+    "score": 109.97517265035032,
+    "root": {
+        "tgid": 1653422,
+        "start_time_ns": 607337592318253,
+        "exe": "/tmp/aegis-lab.9mGtdQ/bash",
+        "exe_b64": "L3RtcC9hZWdpcy1sYWIuOW1HdGRRL2Jhc2g=",
+        "comm": "bash",
+        "uid": 0,
+        "selinux_domain": "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023",
+        "verification": "unverified"
+    },
+    "process_tree": [
+        {
+            "tgid": 1653422,
+            "start_time_ns": 607337592318253,
+            "exe": "/tmp/aegis-lab.9mGtdQ/bash",
+            "exe_b64": "L3RtcC9hZWdpcy1sYWIuOW1HdGRRL2Jhc2g=",
+            "comm": "bash",
+            "uid": 0,
+            "selinux_domain": "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023",
+            "verification": "unverified"
+        },
+        {
+            "tgid": 1653425,
+            "start_time_ns": 607337614604267,
+            "exe": "/tmp/aegis-lab.9mGtdQ/strace",
+            "exe_b64": "L3RtcC9hZWdpcy1sYWIuOW1HdGRRL3N0cmFjZQ==",
+            "comm": "strace",
+            "uid": 0,
+            "selinux_domain": "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023",
+            "verification": "unverified"
+        }
+    ],
+    "evidence": [
+        {
+            "signal": "tmp_exec",
+            "base": 25.0,
+            "modifier": 0.0,
+            "reason": "exec from a temp directory (/tmp/aegis-lab.9mGtdQ/bash)",
+            "ts_ns": 607337593608080
+        },
+        {
+            "signal": "egress_scan",
+            "base": 40.0,
+            "modifier": 0.0,
+            "reason": "egress scan (10 distinct targets)",
+            "ts_ns": 607337607538412
+        },
+        {
+            "signal": "tmp_exec",
+            "base": 25.0,
+            "modifier": 0.0,
+            "reason": "exec from a temp directory (/tmp/aegis-lab.9mGtdQ/strace)",
+            "ts_ns": 607337615729325
+        },
+        {
+            "signal": "ptrace_system_daemon",
+            "base": 45.0,
+            "modifier": 0.0,
+            "reason": "ptrace attach to a system daemon (pid 1653391)",
+            "ts_ns": 607337627223625
+        }
+    ],
+    "evidence_truncated": false,
+    "process_tree_truncated": false,
+    "timeline_lines": 3
+}

@@ -19,7 +19,7 @@ across a process tree, and only speaks up when the total is high.
 
 ## What v0.1 is
 
-v0.1.0 runs in **audit mode** only. It computes every decision, records
+v0.1 runs in **audit mode** only. It computes every decision, records
 it, and acts on none of them. The verdicts it records are
 `would_throttle` and `would_quarantine`: what a later release in
 enforce mode would do. Enforcement, quarantine and the honeypot are on

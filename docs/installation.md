@@ -32,8 +32,8 @@ them, and install both:
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-dnf install ./aegis-v2-0.1.0-1.el10.x86_64.rpm \
-    ./aegis-v2-selinux-0.1.0-1.el10.noarch.rpm
+dnf install ./aegis-v2-0.1.1-1.el10.x86_64.rpm \
+    ./aegis-v2-selinux-0.1.1-1.el10.noarch.rpm
 ```
 
 `dnf` pulls in `nftables` and `criu`, which the package requires. v0.1
