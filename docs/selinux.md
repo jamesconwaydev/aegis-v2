@@ -50,6 +50,11 @@ labels `/usr/bin/aegisd`.
 - **Read its config**, and manage its incidents, socket, lock file and
   log directory.
 - **Log to journald** and notify systemd.
+- **Act on an incident, in enforce mode:** run `busctl` and `systemctl`
+  inside `aegisd_t` to ask systemd for a transient scope, then to
+  freeze, thaw or kill it. systemd checks those calls as `start`,
+  `stop` and `status` on `init_t`. `nft` runs in its own domain,
+  `iptables_t`, to add and remove the egress block.
 
 It can't open network sockets, apart from Unix ones, unless you turn on
 the boolean below.
@@ -78,10 +83,14 @@ Root's usual `unconfined_t` shell needs nothing extra.
 ausearch -m AVC -ts recent | grep aegis
 ```
 
+Run over ssh or from a script, `ausearch` reads its standard input
+instead of the audit log and finds nothing. Add `--input-logs` there.
+
 Some harmless denials are hidden with `dontaudit` rules: rpm trying to
-open its database read-write before falling back to read-only, and its
-SELinux plugin looking at the policy store. To see everything while you
-investigate:
+open its database read-write before falling back to read-only, its
+SELinux plugin looking at the policy store, and `busctl` and
+`systemctl` asking for a forced socket buffer size they can do without.
+To see everything while you investigate:
 
 ```sh
 semodule -DB     # disable dontaudit rules

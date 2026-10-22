@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
-policy_module(aegis, 0.1.0)
+policy_module(aegis, 0.2.0)
 
 ########################################
 #
@@ -16,7 +16,8 @@ policy_module(aegis, 0.1.0)
 gen_tunable(aegisd_can_network_connect, false)
 
 gen_require(`
-	type tracefs_t, default_context_t, semanage_store_t;
+	type tracefs_t, default_context_t, semanage_store_t, iptables_t;
+	class process2 nnp_transition;
 ')
 
 type aegisd_t;
@@ -99,6 +100,23 @@ files_pid_filetrans(aegisd_t, aegis_var_run_t, dir)
 manage_dirs_pattern(aegisd_t, aegis_log_t, aegis_log_t)
 manage_files_pattern(aegisd_t, aegis_log_t, aegis_log_t)
 logging_log_filetrans(aegisd_t, aegis_log_t, dir)
+
+# Enforce mode: busctl (bin_t) and systemctl, run in our domain.
+corecmd_exec_bin(aegisd_t)
+systemd_exec_systemctl(aegisd_t)
+dbus_system_bus_client(aegisd_t)
+init_dbus_chat(aegisd_t)
+# systemd checks StartTransientUnit as system start on init_t, and
+# freeze and kill of the scope as system stop.
+init_start(aegisd_t)
+init_stop(aegisd_t)
+# systemctl reads the unit state back after freeze and thaw.
+init_status(aegisd_t)
+# nft runs in its own domain, which NoNewPrivileges must let us enter.
+iptables_domtrans(aegisd_t)
+allow aegisd_t iptables_t:process2 nnp_transition;
+# sd-bus asks for a forced socket buffer size and carries on without it.
+dontaudit aegisd_t self:capability net_admin;
 
 # journald. sd_notify needs nothing more: init_daemon_domain covers it.
 logging_send_syslog_msg(aegisd_t)

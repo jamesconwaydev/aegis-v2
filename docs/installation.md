@@ -88,7 +88,7 @@ allowlist the second kind.
 
 ## The systemd unit
 
-The unit runs aegisd as root with only five capabilities:
+The unit runs aegisd as root with only six capabilities:
 
 | Capability            | Why                                             |
 | --------------------- | ----------------------------------------------- |
@@ -97,6 +97,12 @@ The unit runs aegisd as root with only five capabilities:
 | `CAP_SYS_ADMIN`       | attach the BPF LSM programs                     |
 | `CAP_SYS_PTRACE`      | read `/proc/<pid>/exe` and pid 1's root         |
 | `CAP_DAC_READ_SEARCH` | open and hash any executable, whatever its mode |
+| `CAP_NET_ADMIN`       | enforce mode: let `nft` add the egress block    |
+
+In enforce mode aegisd asks systemd, over D-Bus, to move, freeze, thaw
+and kill a process tree, so it never writes to the cgroup tree itself
+and `ProtectControlGroups=yes` stays on. `nft` talks to the kernel over
+netlink, which is why `AF_NETLINK` is among the allowed socket families.
 
 It also sets `NoNewPrivileges=yes` and `ProtectSystem=strict`, so the
 filesystem is read-only to aegisd apart from `/var/lib/aegis-v2`,

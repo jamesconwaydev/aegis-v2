@@ -49,7 +49,7 @@ that `/etc` is byte-for-byte unchanged across every scenario.
 
 ## Self-protection
 
-aegisd runs confined: five capabilities, a read-only filesystem apart
+aegisd runs confined: six capabilities, a read-only filesystem apart
 from its own directories, and its own SELinux domain. The control socket
 answers root only.
 

@@ -105,11 +105,12 @@ The [threat model](docs/threat-model.md) has every known gap and why.
 
 ### What it needs, and what it can touch
 
-aegisd runs as root under systemd, but with five capabilities rather
+aegisd runs as root under systemd, but with six capabilities rather
 than all of them: `CAP_BPF` and `CAP_PERFMON` to load and attach the probes,
 `CAP_SYS_ADMIN` for the BPF LSM programs, `CAP_SYS_PTRACE` to read other
-processes' `/proc` entries, and `CAP_DAC_READ_SEARCH` to hash any
-executable. The filesystem is read-only to it apart from
+processes' `/proc` entries, `CAP_DAC_READ_SEARCH` to hash any
+executable, and `CAP_NET_ADMIN` so `nft` can block a quarantined tree's
+traffic in enforce mode. The filesystem is read-only to it apart from
 `/var/lib/aegis-v2` and `/run/aegis-v2`, it can't gain privileges, and
 SELinux confines it to its own `aegisd_t` domain. Its control socket
 answers root only.
