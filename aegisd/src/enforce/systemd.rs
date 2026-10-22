@@ -77,9 +77,17 @@ impl Systemd {
             "/sys/fs/cgroup/{}/cgroup.events",
             super::nft::Nft::scope_cgroup(slice, scope)
         );
-        Ok((self.events)(&path)?
-            .lines()
-            .any(|l| l.trim() == "frozen 1"))
+        match (self.events)(&path) {
+            Ok(t) => Ok(t.lines().any(|l| l.trim() == "frozen 1")),
+            // No cgroup: every process is gone, so nothing is frozen.
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Moves `pids` into a new transient scope under `slice`.
@@ -380,6 +388,16 @@ mod tests {
         assert!(s.is_frozen("s.slice", "u.scope").unwrap());
         let s = Systemd::with(ok, alive_10).with_events(thawed);
         assert!(!s.is_frozen("s.slice", "u.scope").unwrap());
+        fn gone(_: &str) -> Result<String> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+        }
+        fn denied(_: &str) -> Result<String> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        }
+        let s = Systemd::with(ok, alive_10).with_events(gone);
+        assert!(!s.is_frozen("s.slice", "u.scope").unwrap());
+        let s = Systemd::with(ok, alive_10).with_events(denied);
+        assert!(s.is_frozen("s.slice", "u.scope").is_err());
     }
 
     #[test]

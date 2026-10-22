@@ -583,6 +583,16 @@ mod tests {
         }
         fail_freeze(prog, a)
     }
+    fn fail_thaw_unloaded(prog: &str, a: &[String]) -> Result<String> {
+        if a.first().is_some_and(|s| s == "thaw") {
+            CALLS.with(|c| c.borrow_mut().push([&[prog.to_string()], a].concat()));
+            bail!("systemctl thaw: exit Some(5): Unit x.scope not loaded.")
+        }
+        ok(prog, a)
+    }
+    fn no_cgroup(_: &str) -> Result<String> {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+    }
     fn frozen(_: &str) -> Result<String> {
         Ok("populated 1\nfrozen 1\n".into())
     }
@@ -835,6 +845,26 @@ mod tests {
             take()[0][1..3],
             ["thaw".to_string(), format!("aegis-incident-{id}-q.scope")]
         );
+    }
+
+    #[test]
+    fn release_succeeds_when_the_scope_has_vanished() {
+        let mut f = fx("rel-gone", fail_thaw_unloaded);
+        f.e.sys = Systemd::with(fail_thaw_unloaded, alive).with_events(no_cgroup);
+        let id = f.id.clone();
+        f.e.run(EnforceJob::Quarantine {
+            id: id.clone(),
+            pids: vec![k(10)],
+        });
+        take();
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release {
+            id: id.clone(),
+            reply,
+        });
+        assert_eq!(r, Ok(format!("released {id}: thawed, network restored")));
+        let c = take();
+        assert_eq!(c[0][1], "thaw");
+        assert_eq!(c[1][1..3], ["delete".to_string(), "rule".into()]);
     }
 
     #[test]
