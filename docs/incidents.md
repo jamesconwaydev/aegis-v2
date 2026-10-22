@@ -18,8 +18,9 @@ went.
    recorded anything. Repeats are counted in `aegisctl status` as
    `incident repeats not recorded`, and nothing else. When a member
    exits, the signal kinds it showed are forgotten.
-4. The verdict only moves up: once an incident is `would_quarantine`, it
-   stays that way.
+4. The verdict only moves up, in this order: `would_throttle`,
+   `throttled`, `would_quarantine`, `quarantined`. Once an incident has
+   reached one, it never goes back.
 
 The rules for the incident score are in
 [scoring](scoring.md#incidents-and-process-trees).
@@ -79,7 +80,8 @@ no longer need them.
   "evidence": [ { "signal": "MemfdExec", "…": "…" } ],
   "evidence_truncated": false,
   "process_tree_truncated": false,
-  "timeline_lines": 1
+  "timeline_lines": 1,
+  "actions": []
 }
 ```
 
@@ -90,7 +92,7 @@ no longer need them.
 | `updated_ns`             | `updated` in Unix nanoseconds               |
 | `boot_id`                | the boot the process ids belong to          |
 | `mode`                   | `audit` in v0.1                             |
-| `verdict`                | `would_throttle` or `would_quarantine`      |
+| `verdict`                | see [Verdicts](#verdicts)                   |
 | `max_score`              | the highest score recorded                  |
 | `score`                  | the score at the last update                |
 | `root`                   | the process that opened the incident        |
@@ -99,6 +101,47 @@ no longer need them.
 | `evidence`               | every distinct piece of evidence, up to 256 |
 | `evidence_truncated`     | `true` once the 256 cap dropped something   |
 | `timeline_lines`         | lines in `timeline.jsonl`, marker included  |
+| `actions`                | what enforce mode did, see below            |
+
+### Verdicts
+
+`would_throttle` and `would_quarantine` are predictions: audit mode
+records what the tier called for and touches nothing. From v0.2.0,
+enforce mode can also write `throttled` and `quarantined`, and only
+after the action succeeded. If it failed, the verdict stays at
+`would_*` and the failure is in `actions`. A verdict never moves down.
+
+### Action entries
+
+From v0.2.0, each thing enforce mode does to an incident's processes is
+appended to `actions`, oldest first. The list is empty in audit mode,
+and in incidents written before v0.2.0. Releasing or killing an
+incident reads the unit names and nft handles from here, so they
+survive a restart.
+
+| Field        | Meaning                                              |
+| ------------ | ---------------------------------------------------- |
+| `kind`       | what was done, see below                             |
+| `ok`         | `true` if it worked                                  |
+| `unit`       | the systemd unit involved, if any                    |
+| `nft_handle` | the nftables rule handle involved, if any            |
+| `pids`       | the process ids it applied to                        |
+| `error`      | why it failed, when `ok` is `false`                  |
+| `ts`         | when it happened, UTC, RFC 3339                      |
+
+`kind` is one of:
+
+| Value         | Meaning                                     |
+| ------------- | ------------------------------------------- |
+| `hold`        | resource limits put on the processes        |
+| `scope`       | the processes moved into their own scope    |
+| `freeze`      | the processes frozen                        |
+| `nft_drop`    | an nftables rule dropping their traffic     |
+| `thaw`        | frozen processes resumed                    |
+| `unhold`      | resource limits removed                     |
+| `nft_remove`  | the nftables rule deleted                   |
+| `kill`        | the processes killed                        |
+| `lift_limits` | every limit lifted                          |
 
 ### Process entries
 
@@ -187,9 +230,12 @@ One JSON object per line, one line per recorded decision:
 | `tgid`          | the process the decision was about         |
 | `start_time_ns` | that process's start time                  |
 | `tier`          | `throttle` or `quarantine`                 |
-| `verdict`       | `would_throttle` or `would_quarantine`     |
+| `verdict`       | the incident's verdict after this line     |
 | `score`         | the decision's score                       |
 | `evidence`      | the one evidence entry this decision added |
+
+A line for actions has `ts`, `actions` (the entries added) and
+`verdict`, and no `tgid` or `evidence`.
 
 Earlier evidence is on earlier lines. A timeline stops at 10,000 lines.
 One marker line follows (shown wrapped here), and then nothing more is

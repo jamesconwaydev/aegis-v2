@@ -112,6 +112,26 @@ impl EvidenceRecord {
     }
 }
 
+/// One thing the enforcer did (or tried to do) to an incident's tree.
+/// Release and kill read these back, so the unit names and nft handles
+/// must survive a daemon restart.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionRecord {
+    /// "hold" | "scope" | "freeze" | "nft_drop" | "thaw" | "unhold" |
+    /// "nft_remove" | "kill" | "lift_limits"
+    pub kind: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub nft_handle: Option<u64>,
+    #[serde(default)]
+    pub pids: Vec<u32>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub ts: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Incident {
     pub id: String,
@@ -140,6 +160,22 @@ pub struct Incident {
     /// Lines in `timeline.jsonl`, the truncation marker included.
     #[serde(default)]
     pub timeline_lines: u64,
+    /// What enforce mode did, oldest first; empty in audit mode and in
+    /// incidents written before v0.2.
+    #[serde(default)]
+    pub actions: Vec<ActionRecord>,
+}
+
+/// Verdicts only move up. An action verdict outranks the `would_*` of
+/// the same tier, so a successful throttle beats a plain prediction.
+pub fn verdict_rank(v: &str) -> u8 {
+    match v {
+        "would_throttle" => 1,
+        "throttled" => 2,
+        "would_quarantine" => 3,
+        "quarantined" => 4,
+        _ => 0,
+    }
 }
 
 pub fn verdict(t: Tier) -> Option<&'static str> {
@@ -160,6 +196,10 @@ struct Inner {
 pub struct IncidentStore {
     dir: PathBuf,
     inner: Mutex<Inner>,
+    /// Held across a whole read-modify-write of an incident, so the
+    /// writer thread (`record_as`) and the enforcer (`add_actions`)
+    /// cannot overwrite each other's update. Readers only take `inner`.
+    write: Mutex<()>,
 }
 
 fn private_dir(p: &Path) -> Result<()> {
@@ -323,6 +363,7 @@ impl IncidentStore {
         Ok(Self {
             dir: dir.into(),
             inner: Mutex::new(inner),
+            write: Mutex::new(()),
         })
     }
 
@@ -355,11 +396,12 @@ impl IncidentStore {
             .iter()
             .find(|p| p.key == d.key)
             .context("decision process missing from tree")?;
-        // The lock is held only to read and, at the end, to commit, never
+        // `inner` is held only to read and, at the end, to commit, never
         // across the disk I/O in between: readers on the event loop (Status,
-        // IncidentsList) must not wait on an fsync. That is safe because
-        // one writer thread is the only caller of this method, so nothing
-        // else changes an incident between the read and the commit.
+        // IncidentsList) must not wait on an fsync. `write` is held for
+        // the whole call instead, so `add_actions` on another thread
+        // can't change this incident between the read and the commit.
+        let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let (existing, boot_id) = {
             let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             // The process's own membership wins; then the nearest ancestor's.
@@ -399,6 +441,7 @@ impl IncidentStore {
                     evidence_truncated: false,
                     process_tree_truncated: false,
                     timeline_lines: 0,
+                    actions: vec![],
                 }
             }
         };
@@ -411,8 +454,8 @@ impl IncidentStore {
                 inc.process_tree_truncated = true;
             }
         }
-        // Upgrade only: a quarantine verdict never goes back to throttle.
-        if verdict == "would_quarantine" {
+        // Upgrade only: a verdict never goes back down.
+        if verdict_rank(verdict) > verdict_rank(&inc.verdict) {
             inc.verdict = verdict.into();
         }
         inc.updated = ts.clone();
@@ -473,6 +516,52 @@ impl IncidentStore {
         Ok(IncidentId(id))
     }
 
+    /// Append what the enforcer did to an incident, and raise the verdict
+    /// if one is given (only after an action succeeded; a failed action
+    /// leaves the `would_*` verdict standing). Written like `record_as`:
+    /// `incident.json` atomically, then a timeline line.
+    // The enforcer is the only caller, and it lands in the next change.
+    #[allow(dead_code)]
+    pub fn add_actions(
+        &self,
+        id: &IncidentId,
+        acts: Vec<ActionRecord>,
+        verdict: Option<&'static str>,
+    ) -> Result<()> {
+        let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inc = self.get(id).with_context(|| format!("no incident {id}"))?;
+        let now = now_ns();
+        let ts = rfc3339(now);
+        inc.actions.extend(acts.iter().cloned());
+        if let Some(v) = verdict {
+            if verdict_rank(v) > verdict_rank(&inc.verdict) {
+                inc.verdict = v.into();
+            }
+        }
+        inc.updated = ts.clone();
+        inc.updated_ns = now;
+        let line = (inc.timeline_lines < MAX_TIMELINE)
+            .then(|| json!({"ts": ts, "actions": acts, "verdict": inc.verdict}));
+        if line.is_some() {
+            inc.timeline_lines += 1;
+        }
+        let dir = self.dir.join(&inc.id);
+        write_atomic(
+            &dir.join("incident.json"),
+            &serde_json::to_vec_pretty(&inc)?,
+        )?;
+        if let Some(line) = line {
+            writeln!(private_append(&dir.join("timeline.jsonl"))?, "{line}")?;
+        }
+        // Only an incident already in memory is updated there; one that
+        // came from disk (older than the load window) stays out of list().
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = g.incidents.get_mut(&inc.id) {
+            *m = inc;
+        }
+        Ok(())
+    }
+
     pub fn list(&self) -> Vec<IncidentSummary> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.incidents
@@ -484,6 +573,7 @@ impl IncidentStore {
                 verdict: i.verdict.clone(),
                 max_score: i.max_score,
                 root_tgid: i.root.tgid,
+                actions: i.actions.len(),
             })
             .collect()
     }
@@ -822,6 +912,105 @@ mod tests {
         assert!(st.list().is_empty());
         assert!(st.get(&id).is_some());
         assert!(st.get(&IncidentId("../x".into())).is_none());
+    }
+
+    fn act(kind: &str, ok: bool) -> ActionRecord {
+        ActionRecord {
+            kind: kind.into(),
+            ok,
+            unit: ok.then(|| "aegis-hold-1.scope".to_string()),
+            nft_handle: None,
+            pids: vec![10],
+            error: (!ok).then(|| "boom".to_string()),
+            ts: "2026-10-21T09:00:00Z".into(),
+        }
+    }
+
+    fn quarantine_incident(st: &IncidentStore) -> IncidentId {
+        st.record(
+            &dec(10, Tier::Quarantine, 12.0),
+            &[proc(10, None, b"/tmp/x")],
+            Mode::Audit,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn add_actions_appends_and_upgrades_verdict() {
+        let dir = tmp("act-up");
+        let st = IncidentStore::open_at(&dir, Some("boot".into()), 0).unwrap();
+        let id = quarantine_incident(&st);
+        let before = st.get(&id).unwrap().timeline_lines;
+        st.add_actions(&id, vec![act("freeze", true)], Some("quarantined"))
+            .unwrap();
+        let inc = st.get(&id).unwrap();
+        assert_eq!(inc.verdict, "quarantined");
+        assert_eq!(inc.actions.len(), 1);
+        assert_eq!(inc.timeline_lines, before + 1);
+        // On disk too, so a restart sees it.
+        let st = IncidentStore::open_at(&dir, Some("boot".into()), 0).unwrap();
+        let inc = st.get(&id).unwrap();
+        assert_eq!(inc.actions[0].unit.as_deref(), Some("aegis-hold-1.scope"));
+        let tl = st.timeline(&id).unwrap();
+        assert_eq!(tl.len() as u64, before + 1);
+        assert_eq!(tl.last().unwrap()["verdict"], "quarantined");
+    }
+
+    #[test]
+    fn failed_action_keeps_would_verdict() {
+        let dir = tmp("act-fail");
+        let st = IncidentStore::open_at(&dir, Some("boot".into()), 0).unwrap();
+        let id = quarantine_incident(&st);
+        st.add_actions(&id, vec![act("scope", false)], None)
+            .unwrap();
+        let inc = st.get(&id).unwrap();
+        assert_eq!(inc.verdict, "would_quarantine");
+        assert_eq!(inc.actions[0].error.as_deref(), Some("boom"));
+        assert!(!inc.actions[0].ok);
+    }
+
+    #[test]
+    fn verdict_never_downgrades() {
+        let dir = tmp("act-down");
+        let st = IncidentStore::open_at(&dir, Some("boot".into()), 0).unwrap();
+        let id = quarantine_incident(&st);
+        st.add_actions(&id, vec![act("freeze", true)], Some("quarantined"))
+            .unwrap();
+        st.record(
+            &dec(10, Tier::Throttle, 6.0),
+            &[proc(10, None, b"/tmp/x")],
+            Mode::Audit,
+        )
+        .unwrap();
+        assert_eq!(st.get(&id).unwrap().verdict, "quarantined");
+        assert_eq!(st.get(&id).unwrap().actions.len(), 1);
+    }
+
+    #[test]
+    fn v0_1_incident_without_actions_loads() {
+        let dir = tmp("act-v01");
+        let st = IncidentStore::open_at(&dir, Some("boot".into()), 0).unwrap();
+        let id = quarantine_incident(&st);
+        let p = dir.join(&id.0).join("incident.json");
+        let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("actions");
+        fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+        assert!(!fs::read_to_string(&p).unwrap().contains("\"actions\""));
+        let st = IncidentStore::open_at(&dir, Some("boot".into()), 0).unwrap();
+        assert!(st.get(&id).unwrap().actions.is_empty());
+    }
+
+    #[test]
+    fn verdict_rank_orders_the_verdicts() {
+        let r = [
+            "would_throttle",
+            "throttled",
+            "would_quarantine",
+            "quarantined",
+        ]
+        .map(verdict_rank);
+        assert_eq!(r, [1, 2, 3, 4]);
+        assert_eq!(verdict_rank("bogus"), 0);
     }
 
     #[test]

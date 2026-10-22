@@ -83,6 +83,9 @@ pub struct IncidentSummary {
     pub verdict: String,
     pub max_score: f64,
     pub root_tgid: u32,
+    /// Enforcer actions recorded so far; 0 from a pre-v0.2 daemon.
+    #[serde(default)]
+    pub actions: usize,
 }
 
 /// Whether `id` has the shape of an incident id,

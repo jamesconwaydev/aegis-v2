@@ -296,6 +296,36 @@ pub fn incident(v: &Value, cur_boot: Option<&str>) -> String {
         ]);
     }
     o += &table(&rows);
+    let acts = v.get("actions").and_then(Value::as_array).unwrap_or(&empty);
+    if !acts.is_empty() {
+        o += &format!("\nactions ({})\n", acts.len());
+        let rows: Vec<_> = acts
+            .iter()
+            .map(|a| {
+                let detail = [
+                    a.get("unit").and_then(Value::as_str).map(String::from),
+                    a.get("nft_handle")
+                        .and_then(Value::as_u64)
+                        .map(|h| format!("nft handle {h}")),
+                    a.get("error")
+                        .and_then(Value::as_str)
+                        .map(|e| format!("error: {e}")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("  ");
+                vec![
+                    String::new(),
+                    s(a, "ts").to_string(),
+                    s(a, "kind").to_string(),
+                    if a["ok"] == true { "ok" } else { "failed" }.to_string(),
+                    detail,
+                ]
+            })
+            .collect();
+        o += &table(&rows);
+    }
     o
 }
 
