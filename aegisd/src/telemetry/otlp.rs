@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! OTLP logs over HTTP(S) with a JSON body (`POST <endpoint>/v1/logs`).
+//! OTLP logs and metrics over HTTP(S) with a JSON body (`POST
+//! <endpoint>/v1/logs`, `/v1/metrics`).
 //!
 //! `emit` never blocks: records go through a bounded channel to one
 //! worker thread, which sends up to `BATCH` records (or one second's
 //! worth) per POST. When the channel is full the record is dropped and
-//! counted. TLS is rustls, trusting the system CA bundle (on Rocky,
+//! counted. A metrics snapshot rides the same channel and gets its own
+//! POST. TLS is rustls, trusting the system CA bundle (on Rocky,
 //! /etc/pki/tls/certs/ca-bundle.crt, or `SSL_CERT_FILE`).
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use ureq::tls::{RootCerts, TlsConfig};
@@ -31,9 +34,31 @@ struct Counters {
     export_failed: AtomicU64,
 }
 
+/// What the worker sends: a log record to batch, or a finished
+/// metrics body to post as is.
+enum Job {
+    Log(Value),
+    Metrics(Value),
+}
+
+/// Counters and gauges aegisd exports every 60 s.
+#[derive(Default, Clone, Debug)]
+pub struct MetricsSnapshot {
+    pub events_total: u64,
+    pub dropped_events: u64,
+    pub incidents_open: u64,
+    pub incidents_by_verdict: BTreeMap<String, u64>,
+    pub enforce_actions_ok: u64,
+    pub enforce_actions_failed: u64,
+    pub telemetry_dropped: u64,
+}
+
 pub struct Otlp {
-    tx: SyncSender<Value>,
+    tx: SyncSender<Job>,
     counters: Arc<Counters>,
+    resource: Value,
+    /// Cumulative sums count from here.
+    start_ns: u64,
 }
 
 impl Otlp {
@@ -42,7 +67,7 @@ impl Otlp {
     }
 
     pub fn with_roots(cfg: &OtlpConfig, roots: RootCerts) -> Self {
-        let (tx, rx) = sync_channel::<Value>(QUEUE);
+        let (tx, rx) = sync_channel::<Job>(QUEUE);
         let counters = Arc::new(Counters::default());
         let c = counters.clone();
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -50,27 +75,18 @@ impl Otlp {
             .tls_config(TlsConfig::builder().root_certs(roots).build())
             .build()
             .into();
-        let url = if cfg.endpoint.trim_end_matches('/').ends_with("/v1/logs") {
-            cfg.endpoint.clone()
-        } else {
-            format!("{}/v1/logs", cfg.endpoint.trim_end_matches('/'))
-        };
+        // The endpoint may be given as the logs URL; metrics sit beside it.
+        let base = cfg.endpoint.trim_end_matches('/');
+        let base = base.strip_suffix("/v1/logs").unwrap_or(base);
+        let url = format!("{base}/v1/logs");
+        let metrics_url = format!("{base}/v1/metrics");
         let headers = cfg.headers.clone();
         let resource = resource();
+        let worker_resource = resource.clone();
         std::thread::spawn(move || {
             let mut failing = false;
-            while let Ok(first) = rx.recv() {
-                let mut batch = vec![first];
-                let deadline = Instant::now() + FLUSH;
-                while batch.len() < BATCH {
-                    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                        Ok(r) => batch.push(r),
-                        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-                let n = batch.len() as u64;
-                let body = envelope(&resource, batch).to_string();
-                let mut req = agent.post(&url).header("Content-Type", "application/json");
+            let mut post = |url: &str, body: String, n: u64| {
+                let mut req = agent.post(url).header("Content-Type", "application/json");
                 for (k, v) in &headers {
                     req = req.header(k, v);
                 }
@@ -88,9 +104,37 @@ impl Otlp {
                         failing = true;
                     }
                 }
+            };
+            while let Ok(first) = rx.recv() {
+                let mut batch = Vec::new();
+                let mut metrics = Vec::new();
+                let mut take = |j, batch: &mut Vec<Value>| match j {
+                    Job::Log(r) => batch.push(r),
+                    Job::Metrics(m) => metrics.push(m),
+                };
+                take(first, &mut batch);
+                let deadline = Instant::now() + FLUSH;
+                while batch.len() < BATCH {
+                    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(j) => take(j, &mut batch),
+                        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                for m in metrics {
+                    post(&metrics_url, m.to_string(), 1);
+                }
+                if !batch.is_empty() {
+                    let n = batch.len() as u64;
+                    post(&url, envelope(&worker_resource, batch).to_string(), n);
+                }
             }
         });
-        Self { tx, counters }
+        Self {
+            tx,
+            counters,
+            resource,
+            start_ns: now_ns(),
+        }
     }
 
     /// Records lost to a full queue or a failed export.
@@ -114,9 +158,25 @@ impl Otlp {
     }
 }
 
+impl Otlp {
+    /// Queues a metrics snapshot; shares the logs' queue and drop counts.
+    pub fn metrics(&self, s: &MetricsSnapshot) {
+        let body = metrics_body(&self.resource, self.start_ns, now_ns(), s);
+        match self.tx.try_send(Job::Metrics(body)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.counters.disconnected.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 impl Sink for Otlp {
     fn emit(&self, rec: &TelemetryRecord) {
-        match self.tx.try_send(log_record(rec)) {
+        match self.tx.try_send(Job::Log(log_record(rec))) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -146,6 +206,68 @@ fn resource() -> Value {
         kv("service.version", env!("CARGO_PKG_VERSION").into()),
         kv("host.name", host),
     ]})
+}
+
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// OTLP/JSON: int64 values travel as strings, enum 2 is cumulative.
+fn metrics_body(resource: &Value, start_ns: u64, now_ns: u64, s: &MetricsSnapshot) -> Value {
+    let point = |v: u64, attrs: Vec<Value>| {
+        json!({
+            "attributes": attrs,
+            "startTimeUnixNano": start_ns.to_string(),
+            "timeUnixNano": now_ns.to_string(),
+            "asInt": v.to_string(),
+        })
+    };
+    let sum = |name: &str, points: Vec<Value>| {
+        json!({"name": name, "sum": {
+            "dataPoints": points,
+            "aggregationTemporality": 2,
+            "isMonotonic": true,
+        }})
+    };
+    let gauge =
+        |name: &str, points: Vec<Value>| json!({"name": name, "gauge": {"dataPoints": points}});
+    let by_verdict = s
+        .incidents_by_verdict
+        .iter()
+        .map(|(v, n)| point(*n, vec![kv("verdict", v.clone())]))
+        .collect();
+    let metrics = vec![
+        sum("aegis.events", vec![point(s.events_total, vec![])]),
+        sum(
+            "aegis.events.dropped",
+            vec![point(s.dropped_events, vec![])],
+        ),
+        sum(
+            "aegis.enforce.actions",
+            vec![
+                point(s.enforce_actions_ok, vec![kv("result", "ok".into())]),
+                point(
+                    s.enforce_actions_failed,
+                    vec![kv("result", "failed".into())],
+                ),
+            ],
+        ),
+        sum(
+            "aegis.telemetry.dropped",
+            vec![point(s.telemetry_dropped, vec![])],
+        ),
+        gauge(
+            "aegis.incidents.open",
+            vec![point(s.incidents_open, vec![])],
+        ),
+        gauge("aegis.incidents", by_verdict),
+    ];
+    json!({"resourceMetrics": [{
+        "resource": resource,
+        "scopeMetrics": [{"scope": {"name": "aegisd"}, "metrics": metrics}],
+    }]})
 }
 
 fn envelope(resource: &Value, records: Vec<Value>) -> Value {
@@ -190,7 +312,6 @@ pub fn log_record(rec: &TelemetryRecord) -> Value {
 mod tests {
     use super::*;
     use crate::config::Mode;
-    use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -244,6 +365,89 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with(" target /tmp/p"));
+    }
+
+    #[test]
+    fn metrics_body_has_sums_and_gauges() {
+        // Plain HTTP server that hands back the first request it gets.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = c.read(&mut chunk).unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let t = String::from_utf8_lossy(&buf).into_owned();
+                if let Some((h, b)) = t.split_once("\r\n\r\n") {
+                    let len: usize = h
+                        .lines()
+                        .find_map(|l| {
+                            l.to_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_owned)
+                        })
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if b.len() >= len {
+                        let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                        tx.send((h.to_string(), b.to_string())).unwrap();
+                        return;
+                    }
+                }
+            }
+        });
+        let sink = Otlp::new(&cfg(format!("http://127.0.0.1:{port}/v1/logs")));
+        sink.metrics(&MetricsSnapshot {
+            events_total: 7,
+            dropped_events: 1,
+            incidents_open: 2,
+            incidents_by_verdict: BTreeMap::from([("would_throttle".into(), 2)]),
+            enforce_actions_ok: 3,
+            enforce_actions_failed: 4,
+            telemetry_dropped: 5,
+        });
+        let (head, body) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(head.starts_with("POST /v1/metrics "), "{head}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let ms = v["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .unwrap();
+        let m = |n: &str| {
+            ms.iter()
+                .find(|m| m["name"] == n)
+                .unwrap_or_else(|| panic!("{n}"))
+        };
+        for n in [
+            "aegis.events",
+            "aegis.events.dropped",
+            "aegis.enforce.actions",
+            "aegis.telemetry.dropped",
+        ] {
+            assert_eq!(m(n)["sum"]["isMonotonic"], true, "{n}");
+            assert_eq!(m(n)["sum"]["aggregationTemporality"], 2, "{n}");
+        }
+        let ev = &m("aegis.events")["sum"]["dataPoints"][0];
+        assert_eq!(ev["asInt"], "7");
+        assert!(ev["startTimeUnixNano"].is_string() && ev["timeUnixNano"].is_string());
+        let acts = m("aegis.enforce.actions")["sum"]["dataPoints"].to_string();
+        assert!(
+            acts.contains(r#""stringValue":"ok""#) && acts.contains(r#""stringValue":"failed""#),
+            "{acts}"
+        );
+        assert_eq!(
+            m("aegis.incidents.open")["gauge"]["dataPoints"][0]["asInt"],
+            "2"
+        );
+        let by = &m("aegis.incidents")["gauge"]["dataPoints"][0];
+        assert_eq!(by["attributes"][0]["key"], "verdict");
+        assert_eq!(
+            by["attributes"][0]["value"]["stringValue"],
+            "would_throttle"
+        );
+        assert_eq!(sink.dropped_records(), 0);
     }
 
     #[test]

@@ -43,6 +43,8 @@ const INCIDENT_QUEUE: usize = 256;
 /// How often the loop flushes expired deferred signals.
 const TICK: Duration = Duration::from_millis(500);
 /// Every this many ticks, sweep the process table (so ~60 s).
+/// How often counters go out as OTLP metrics.
+const METRICS_EVERY: Duration = Duration::from_secs(60);
 const SWEEP_TICKS: u64 = 120;
 
 /// sysexits.h EX_CONFIG.
@@ -283,6 +285,8 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
 
     let mut ticker = tokio::time::interval(TICK);
     let mut ticks: u64 = 0;
+    let mut metrics_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + METRICS_EVERY, METRICS_EVERY);
     // Ok on SIGTERM or SIGINT. Anything else that ends the loop is a
     // failure, so systemd restarts us.
     let mut outcome = Ok(());
@@ -326,6 +330,11 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                 ticks += 1;
                 if ticks.is_multiple_of(SWEEP_TICKS) {
                     pipe.sweep();
+                }
+            }
+            _ = metrics_tick.tick() => {
+                if pipe.sinks.exports_metrics() {
+                    pipe.sinks.metrics(&metrics_snapshot(&pipe, &handle, &enforcer));
                 }
             }
             _ = hup.recv() => {
@@ -387,6 +396,35 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     let _ = writer.join();
     let _ = std::fs::remove_file(&cli.socket);
     outcome
+}
+
+/// Cheap enough for the loop: atomics, a count, and one pass over the
+/// incident summaries. The POST happens on the exporter thread.
+fn metrics_snapshot(
+    pipe: &Pipeline,
+    probes: &ebpf::EbpfHandle,
+    enforcer: &EnforcerHandle,
+) -> telemetry::otlp::MetricsSnapshot {
+    let mut by_verdict = std::collections::BTreeMap::new();
+    let list = pipe.store().list();
+    for i in &list {
+        *by_verdict.entry(i.verdict.clone()).or_insert(0u64) += 1;
+    }
+    let d = pipe.sinks.dropped();
+    telemetry::otlp::MetricsSnapshot {
+        events_total: pipe.events_total,
+        dropped_events: probes.dropped_events(),
+        incidents_open: list.len() as u64,
+        incidents_by_verdict: by_verdict,
+        enforce_actions_ok: enforcer.actions_ok.load(Ordering::Relaxed),
+        enforce_actions_failed: enforcer.actions_failed.load(Ordering::Relaxed),
+        telemetry_dropped: d.journald
+            + d.otlp_queue_full
+            + d.otlp_export_failed
+            + d.otlp_disconnected
+            + d.webhook_queue_full
+            + d.webhook_failed,
+    }
 }
 
 fn answer(

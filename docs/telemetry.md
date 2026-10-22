@@ -11,7 +11,7 @@ decisions below the throttle tier produce none.
 | ---------- | ------------- | ----------------------- |
 | journald   | always        | nothing to configure    |
 | JSON lines | no            | `[telemetry] jsonl`     |
-| OTLP logs  | no            | `[telemetry.otlp]`      |
+| OTLP       | no            | `[telemetry.otlp]`      |
 | Webhooks   | no            | `[[telemetry.webhook]]` |
 
 Webhooks are the odd one out: they hear about fewer records, not more.
@@ -214,9 +214,24 @@ and stays quiet until an export succeeds again. There's no retry.
 
 ### Metrics
 
-OTLP metrics aren't in v0.1; they're planned for v0.2.0 (see the
-[roadmap](roadmap.md)). Until then, `aegisctl status --json` gives you
-the counters to scrape.
+Every 60 seconds aegisd also sends its counters to
+`<endpoint>/v1/metrics`, with the same headers and resource attributes.
+They share the logs' queue, so a failed or dropped metrics POST is
+counted in the same `otlp` drop counts, and metrics go out only when
+`[telemetry.otlp]` is set. The first batch arrives 60 seconds after
+start.
+
+Sums are cumulative and monotonic, counting from daemon start. Gauges
+are the value at that moment.
+
+- `aegis.events` (sum): probe events processed.
+- `aegis.events.dropped` (sum): events lost before aegisd read them.
+- `aegis.enforce.actions` (sum): enforcement actions, with a `result`
+  attribute of `ok` or `failed`.
+- `aegis.telemetry.dropped` (sum): records lost across all sinks.
+- `aegis.incidents.open` (gauge): incidents currently open.
+- `aegis.incidents` (gauge): open incidents, with a `verdict` attribute
+  such as `would_throttle`.
 
 ## Webhooks
 

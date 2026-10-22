@@ -153,6 +153,17 @@ impl Sinks {
         }
     }
 
+    /// True when metrics have somewhere to go.
+    pub fn exports_metrics(&self) -> bool {
+        self.otlp.is_some()
+    }
+
+    pub fn metrics(&self, s: &otlp::MetricsSnapshot) {
+        if let Some(o) = &self.otlp {
+            o.metrics(s);
+        }
+    }
+
     pub fn dropped(&self) -> aegis_proto::TelemetryDropped {
         let o = self.otlp.as_ref();
         aegis_proto::TelemetryDropped {

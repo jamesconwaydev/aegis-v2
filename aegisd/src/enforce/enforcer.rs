@@ -48,9 +48,7 @@ pub struct EnforcerHandle {
     /// Jobs dropped: the queue was full, or a reload to audit came
     /// while they waited.
     pub dropped: Arc<AtomicU64>,
-    #[allow(dead_code)] // exported with the metrics
     pub actions_ok: Arc<AtomicU64>,
-    #[allow(dead_code)]
     pub actions_failed: Arc<AtomicU64>,
 }
 
