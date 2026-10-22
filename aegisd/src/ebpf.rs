@@ -9,11 +9,13 @@
 
 mod btf;
 
+use std::collections::BTreeMap;
+
 use aegis_common::{Event, KernelOffsets};
 use aegis_proto::ProbeStatus;
 use anyhow::{anyhow, Context as _, Result};
 use aya::{
-    maps::{MapData, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf},
     programs::{BtfTracePoint, Lsm, TracePoint},
     Ebpf, EbpfLoader,
 };
@@ -21,6 +23,8 @@ use tokio::{
     io::{unix::AsyncFd, Interest},
     sync::mpsc,
 };
+
+use crate::proctable::ProcKey;
 
 const BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
 
@@ -36,6 +40,56 @@ pub struct EbpfHandle {
     _ebpf: Ebpf,
     dropped: PerCpuArray<MapData, u64>,
     probes: Vec<ProbeStatus>,
+    // Unused until the enforcer lands.
+    #[allow(dead_code)]
+    pub holds: Holds,
+}
+
+/// Processes the kernel's hold hooks refuse to let act. The kernel drops
+/// an entry itself when the process exits.
+#[derive(Default)]
+pub struct Holds {
+    map: Option<HashMap<MapData, u32, u64>>,
+    /// Stands in for the map when there is none (tests).
+    mem: BTreeMap<u32, u64>,
+}
+
+// Unused until the enforcer lands.
+#[allow(dead_code)]
+impl Holds {
+    pub fn hold(&mut self, k: ProcKey) -> Result<()> {
+        match &mut self.map {
+            Some(m) => m
+                .insert(k.tgid, k.start_time_ns, 0)
+                .with_context(|| format!("holding {}", k.tgid))?,
+            None => {
+                self.mem.insert(k.tgid, k.start_time_ns);
+            }
+        }
+        Ok(())
+    }
+
+    /// Releasing a process that has already exited is not an error.
+    pub fn release(&mut self, tgid: u32) -> Result<()> {
+        match &mut self.map {
+            Some(m) => match m.remove(&tgid) {
+                Err(MapError::SyscallError(e))
+                    if e.io_error.kind() == std::io::ErrorKind::NotFound => {}
+                r => r.with_context(|| format!("releasing {tgid}"))?,
+            },
+            None => {
+                self.mem.remove(&tgid);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn held(&self) -> usize {
+        match &self.map {
+            Some(m) => m.keys().filter(Result::is_ok).count(),
+            None => self.mem.len(),
+        }
+    }
 }
 
 impl EbpfHandle {
@@ -93,6 +147,11 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
         )))
         .context("loading eBPF object")?;
 
+    // Before anything attaches, so self-protection has no gap.
+    let mut aegisd: Array<_, u32> =
+        Array::try_from(ebpf.map_mut("AEGISD").context("no AEGISD map")?)?;
+    aegisd.set(0, std::process::id(), 0)?;
+
     let mut probes = Vec::new();
     let mut attached = |name: &str, hook: String| {
         probes.push(ProbeStatus {
@@ -111,6 +170,30 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
     lsm.load("bprm_committed_creds", &kernel_btf)?;
     lsm.attach()?;
     attached("aegis_exec", "lsm/bprm_committed_creds".into());
+
+    // The hold. Each refuses a held task; ptrace also guards aegisd.
+    for (name, hook) in [
+        ("aegis_hold_fork", "task_alloc"),
+        ("aegis_hold_connect", "socket_connect"),
+        ("aegis_hold_sendmsg", "socket_sendmsg"),
+        ("aegis_hold_mount", "sb_mount"),
+        ("aegis_hold_move_mount", "move_mount"),
+        ("aegis_hold_bpf", "bpf"),
+        ("aegis_hold_modreq", "kernel_module_request"),
+        ("aegis_hold_modread", "kernel_read_file"),
+        ("aegis_hold_modload", "kernel_load_data"),
+        ("aegis_hold_ptrace", "ptrace_access_check"),
+        ("aegis_hold_write", "file_permission"),
+        ("aegis_hold_userns", "userns_create"),
+        ("aegis_hold_kill", "task_kill"),
+    ] {
+        let p: &mut Lsm = prog(&mut ebpf, name)?;
+        p.load(hook, &kernel_btf)
+            .with_context(|| format!("loading lsm/{hook}"))?;
+        p.attach()
+            .with_context(|| format!("attaching lsm/{hook}"))?;
+        attached(name, format!("lsm/{hook}"));
+    }
 
     let fork: &mut BtfTracePoint = prog(&mut ebpf, "aegis_fork")?;
     fork.load("sched_process_fork", &kernel_btf)?;
@@ -137,6 +220,12 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
         attached(name, format!("tracepoint/{category}/{tracepoint}"));
     }
 
+    let holds = Holds {
+        map: Some(HashMap::try_from(
+            ebpf.take_map("HELD").context("no HELD map")?,
+        )?),
+        mem: BTreeMap::new(),
+    };
     let dropped = PerCpuArray::try_from(ebpf.take_map("DROPPED").context("no DROPPED map")?)?;
     let ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("no EVENTS map")?)?;
     // SAFETY: the ring buffer owns its map fd, and it moves into the
@@ -183,6 +272,7 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
             _ebpf: ebpf,
             dropped,
             probes,
+            holds,
         },
         rx,
     ))
@@ -196,4 +286,25 @@ where
         .program_mut(name)
         .with_context(|| format!("no program {name}"))?;
     Ok(p.try_into()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proctable::ProcKey;
+
+    #[test]
+    fn holds_round_trip_in_map_wrapper() {
+        let mut h = Holds::default();
+        let k = ProcKey {
+            tgid: 4242,
+            start_time_ns: 7,
+        };
+        h.hold(k).unwrap();
+        assert_eq!(h.held(), 1);
+        h.release(k.tgid).unwrap();
+        assert_eq!(h.held(), 0);
+        // Releasing a task the kernel already dropped on exit is fine.
+        h.release(k.tgid).unwrap();
+    }
 }

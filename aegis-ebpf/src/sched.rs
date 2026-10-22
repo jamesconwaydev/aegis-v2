@@ -11,7 +11,7 @@ use aya_ebpf::{
     programs::{BtfTracePointContext, TracePointContext},
 };
 
-use crate::{current, emit, off, read};
+use crate::{current, emit, hold::HELD, off, read};
 
 /// Processes we've already emitted an Exit for, so a race between the
 /// last threads can't double-report one. Keyed by (tgid, leader
@@ -49,11 +49,15 @@ pub fn aegis_exit(_ctx: TracePointContext) -> u32 {
     if live != 0 {
         return 0;
     }
+    let tgid = bpf_get_current_pid_tgid() >> 32;
+    // The process is gone, so its hold is too; a later process reusing
+    // the tgid must start unheld.
+    let _ = HELD.remove(&(tgid as u32));
     // BPF_NOEXIST makes the check-and-claim atomic: only the first thread
     // to insert this process's key emits.
     let leader: u64 = read(task, off!(task_group_leader));
     let start: u64 = read(leader as *const u8, off!(task_start_time));
-    let key = [bpf_get_current_pid_tgid() >> 32, start];
+    let key = [tgid, start];
     if EXITED.insert(&key, &0, BPF_NOEXIST as u64).is_ok() {
         emit(EventKind::Exit, current);
     }

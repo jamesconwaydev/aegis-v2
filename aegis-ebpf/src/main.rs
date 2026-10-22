@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Observe-only probes. Each one writes an `aegis_common::Event` to the
+//! Probes. The observers each write an `aegis_common::Event` to the
 //! `EVENTS` ring buffer; when the buffer is full the event is counted in
 //! `DROPPED` instead.
 //!
@@ -12,6 +12,7 @@
 mod connect;
 mod env;
 mod exec;
+mod hold;
 mod sched;
 mod syscalls;
 
