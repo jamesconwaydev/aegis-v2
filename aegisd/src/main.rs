@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aegis_common::{
-    Event, EventKind, EXEC_FALLBACK, EXEC_FROM_TMP, EXEC_MEMFD, HAS_TTY, PATH_TRUNCATED,
+    Event, EventKind, ENV_LOADER_VAR, ENV_TRUNCATED, ENV_UNREADABLE, EXEC_FALLBACK, EXEC_FROM_TMP,
+    EXEC_MEMFD, HAS_TTY, PATH_TRUNCATED,
 };
 use aegis_proto::{Request, Response};
 use anyhow::{Context as _, Result};
@@ -224,8 +225,8 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
         cli.debug,
     );
     let (done_tx, mut done) = mpsc::unbounded_channel();
-    // Environment reads can block for good; they run on their own
-    // threads and answer here.
+    // /proc environment reads, for processes that predate us, can block
+    // for good; they run on their own threads and answer here.
     let env_readers = EnvReaders::new();
     let (env_tx, mut env_done) = mpsc::unbounded_channel();
     let mut verifying = Verifying {
@@ -428,6 +429,9 @@ fn event_json(ev: &Event) -> Value {
         (PATH_TRUNCATED, "path_truncated"),
         (HAS_TTY, "has_tty"),
         (EXEC_FALLBACK, "exec_fallback"),
+        (ENV_LOADER_VAR, "env_loader_var"),
+        (ENV_TRUNCATED, "env_truncated"),
+        (ENV_UNREADABLE, "env_unreadable"),
     ]
     .into_iter()
     .filter(|(bit, _)| ev.flags & bit != 0)
@@ -455,6 +459,7 @@ fn event_json(ev: &Event) -> Value {
             }),
         ),
         Ok(EventKind::Exit) => ("exit", json!({})),
+        Ok(EventKind::ExecEnv) => ("exec_env", json!({})),
         Ok(EventKind::Ptrace) => (
             "ptrace",
             json!({ "target_tgid": ev.target_tgid, "request": ev.ptrace_request }),

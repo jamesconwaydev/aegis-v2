@@ -66,10 +66,11 @@ const _: () = assert!(DEFER_DEADLINE.as_secs() > 2 * RPM_TIMEOUT.as_secs());
 const MAX_DEFERRED_PER_PROC: usize = 64;
 /// Deferred signals across every process; past this they score at once.
 const MAX_DEFERRED: usize = 8192;
-/// How long an environment read may take before it counts as unreadable.
-/// A process can make the read block for good, so it never runs here.
+/// How long an environment answer may take before it counts as
+/// unreadable: the kernel's ExecEnv (lost if the ring buffer was full),
+/// or a /proc read, which a process can make block for good.
 const ENV_DEADLINE: Duration = Duration::from_secs(1);
-/// Environment reads in flight; past this a process is tainted at once.
+/// Environment answers awaited; past this a process is tainted at once.
 const MAX_ENV_READS: usize = 256;
 /// Inside an incident, the longest it stays quiet while decisions keep
 /// coming that add nothing new.
@@ -119,10 +120,11 @@ struct Deferred {
     waits_env: Vec<ProcKey>,
 }
 
-/// An environment read for the caller to run off the loop: the process,
-/// the image (dev, ino) the answer must be about, and the request's
-/// sequence number. A re-exec of the same file keeps the key and the
-/// image, so only the number tells a superseded answer from the current.
+/// An awaited environment answer, and for a /proc read the job the
+/// caller runs off the loop: the process, the image (dev, ino) the
+/// answer must be about, and the request's sequence number. A re-exec
+/// of the same file keeps the key and the image, so only the number
+/// tells a superseded answer from the current.
 pub type EnvJob = (ProcKey, (u64, u64), u64);
 
 #[cfg(test)]
@@ -163,9 +165,10 @@ pub struct Pipeline {
     by_env: HashMap<ProcKey, Vec<u64>>,
     /// Signals in `deferred`, per subject process.
     held: HashMap<ProcKey, usize>,
-    /// Environment reads in flight: the image each is about, and when it
-    /// stops waiting and counts as unreadable.
-    env_reads: HashMap<ProcKey, (EnvJob, Instant)>,
+    /// Environment answers awaited: the image each is about, when it
+    /// stops waiting and counts as unreadable, and whether the answer is
+    /// a /proc read (else the kernel's ExecEnv).
+    env_reads: HashMap<ProcKey, (EnvJob, Instant, bool)>,
     env_seq: u64,
     /// Environment reads for the caller to run.
     pub to_read_env: Vec<EnvJob>,
@@ -278,9 +281,13 @@ impl Pipeline {
         };
         let kind = EventKind::try_from(ev.kind).ok();
         if kind != Some(EventKind::Exit) && self.table.ensure(ev) && kind != Some(EventKind::Exec) {
-            // Found late, with its exe read from /proc: verify that.
+            // Found late, with its exe read from /proc: verify that. It
+            // predates us, so no ExecEnv will come: read /proc for that
+            // too. Unless this is the ExecEnv, which `apply` takes below.
             self.request_verification(key);
-            self.request_env(key);
+            if kind != Some(EventKind::ExecEnv) {
+                self.request_env(key, true);
+            }
         }
         let mut sigs = signals_for(ev, &self.table, &*self.daemons);
         if kind == Some(EventKind::Connect) {
@@ -329,24 +336,38 @@ impl Pipeline {
                 if ev.flags & (EXEC_MEMFD | PATH_TRUNCATED) == 0 {
                     self.request_verification(key);
                 }
-                self.request_env(key);
+                // The kernel's verdict follows in this exec's ExecEnv.
+                self.request_env(key, false);
+            }
+            // `apply` has put the kernel's verdict on the table.
+            Some(EventKind::ExecEnv) if self.env_reads.contains_key(&key) => {
+                let taint = self.table.get(&key).and_then(|p| p.env_taint);
+                self.env_resolve(&key, taint);
             }
             // The child has its parent's environment, but if that is still
-            // being read, the child needs its own answer.
+            // awaited, the child needs its own answer, from the same place.
             Some(EventKind::Fork) if self.env_reads.contains_key(&key) => {
-                self.request_env(ProcKey {
-                    tgid: ev.child_tgid,
-                    start_time_ns: ev.child_start_time_ns,
-                });
+                let from_proc = self.env_reads[&key].2;
+                self.request_env(
+                    ProcKey {
+                        tgid: ev.child_tgid,
+                        start_time_ns: ev.child_start_time_ns,
+                    },
+                    from_proc,
+                );
             }
             _ => {}
         }
     }
 
-    /// Queues a read of this process's environment, if anything it could
-    /// be trusted for depends on it: an allowlisted or pinned exe, or an
+    /// Waits for this process's environment, if anything it could be
+    /// trusted for depends on it: an allowlisted or pinned exe, or an
     /// excluded SELinux domain. Until the answer lands it is tainted.
-    fn request_env(&mut self, key: ProcKey) {
+    ///
+    /// The answer is the kernel's ExecEnv for an exec we saw, or with
+    /// `from_proc` a /proc read queued in `to_read_env`, for a process
+    /// that started before us.
+    fn request_env(&mut self, key: ProcKey, from_proc: bool) {
         let Some(p) = self.table.get(&key) else {
             return;
         };
@@ -375,18 +396,20 @@ impl Pipeline {
         let job = (key, image, self.env_seq);
         self.env_seq += 1;
         self.env_reads
-            .insert(key, (job, Instant::now() + ENV_DEADLINE));
-        self.to_read_env.push(job);
+            .insert(key, (job, Instant::now() + ENV_DEADLINE, from_proc));
         #[cfg(test)]
         if let Some(f) = self.env_auto {
-            self.to_read_env.pop();
             self.env_read(job, f(key));
+            return;
+        }
+        if from_proc {
+            self.to_read_env.push(job);
         }
     }
 
     /// The answer to a job queued in `to_read_env`: the environment, or
     /// None if it couldn't be read. Ignored if that read was superseded
-    /// or timed out.
+    /// or timed out. Also how a wait past its deadline is given up.
     pub fn env_read(&mut self, job: EnvJob, env: Option<Vec<u8>>) {
         let (key, image, _) = job;
         if self.env_reads.get(&key).map(|r| r.0) != Some(job) {
@@ -589,7 +612,7 @@ impl Pipeline {
         let late: Vec<ProcKey> = self
             .env_reads
             .iter()
-            .filter(|(_, (_, at))| *at <= cutoff)
+            .filter(|(_, (_, at, _))| *at <= cutoff)
             .map(|(k, _)| *k)
             .collect();
         for k in late {
@@ -991,7 +1014,7 @@ fn proc_start_ns(tgid: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_common::EXEC_FROM_TMP;
+    use aegis_common::{ENV_LOADER_VAR, ENV_TRUNCATED, ENV_UNREADABLE, EXEC_FROM_TMP};
 
     struct Pid1;
     impl DaemonClassifier for Pid1 {
@@ -1068,6 +1091,12 @@ mod tests {
         e
     }
 
+    fn exec_env(tgid: u32, flags: u32) -> Event {
+        let mut e = ev(EventKind::ExecEnv, tgid);
+        e.flags = flags;
+        e
+    }
+
     fn fork(parent: u32, child: u32) -> Event {
         let mut e = ev(EventKind::Fork, parent);
         e.child_tgid = child;
@@ -1096,6 +1125,12 @@ mod tests {
     /// and execs it, as on every container start. The memfd events arrive
     /// before runc's verdict does, so the signals are deferred.
     fn runc_self_clone(p: &mut Pipeline, runc_verdict: Option<Verification>) {
+        runc_self_clone_env(p, runc_verdict, None);
+    }
+
+    /// The same flow, with the kernel's environment verdict for runc's
+    /// exec, if `env` is given, landing right behind it as it does live.
+    fn runc_self_clone_env(p: &mut Pipeline, runc_verdict: Option<Verification>, env: Option<u32>) {
         p.handle(&exec(50, "/usr/bin/bash", 0));
         assert_eq!(
             lookups(&std::mem::take(&mut p.to_verify)),
@@ -1104,6 +1139,9 @@ mod tests {
         p.verified(&exe_key("/usr/bin/bash"), rpm("bash"));
         p.handle(&fork(50, 60));
         p.handle(&exec(60, "/usr/bin/runc", 0));
+        if let Some(flags) = env {
+            p.handle(&exec_env(60, flags));
+        }
         assert_eq!(
             lookups(&std::mem::take(&mut p.to_verify)),
             paths(&["/usr/bin/runc"])
@@ -1117,13 +1155,17 @@ mod tests {
         ));
         assert!(p.to_verify.is_empty(), "a memfd is not verified");
         assert_eq!(p.deferred.len(), 2, "memfd_create and memfd exec deferred");
+        let flushed = runc_verdict.is_none();
         if let Some(v) = runc_verdict {
             p.verified(&exe_key("/usr/bin/runc"), v);
         } else {
             // Verdict never comes: the deadline fires them as Unverified.
             p.flush_expired(Instant::now() + DEFER_DEADLINE + Duration::from_secs(1));
         }
-        assert_eq!(p.deferred.len(), 0);
+        // Without an environment verdict the signals still wait for one.
+        if p.env_auto.is_some() || env.is_some() || flushed {
+            assert_eq!(p.deferred.len(), 0);
+        }
     }
 
     #[test]
@@ -1212,9 +1254,9 @@ mod tests {
             .get(&crate::incident::IncidentId(l[0].id.clone()))
             .unwrap();
         assert!(
-            inc.evidence
-                .iter()
-                .any(|e| e.reason.ends_with("allowlist withheld: LD_PRELOAD is set")),
+            inc.evidence.iter().any(|e| e
+                .reason
+                .ends_with("allowlist withheld: LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH is set")),
             "{:?}",
             inc.evidence
         );
@@ -1226,26 +1268,106 @@ mod tests {
         assert_eq!(inc.root.verification, "unverified");
     }
 
+    fn evidence(p: &Pipeline) -> Vec<String> {
+        let l = p.store().list();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].verdict, "would_quarantine");
+        let inc = p
+            .store()
+            .get(&crate::incident::IncidentId(l[0].id.clone()))
+            .unwrap();
+        inc.evidence.iter().map(|e| e.reason.clone()).collect()
+    }
+
     #[test]
-    fn signals_wait_for_the_environment_read_off_the_loop() {
-        // Nothing answers by itself: the read is the caller's job.
+    fn preload_flag_on_exec_env_withholds_allowlist() {
+        let (mut p, _d) = pipeline("exec-env-preload");
+        p.env_auto = None;
+        runc_self_clone_env(&mut p, Some(rpm("runc")), Some(ENV_LOADER_VAR));
+        let ev = evidence(&p);
+        assert!(
+            ev.iter().any(|r| r
+                .ends_with("allowlist withheld: LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH is set")),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn clean_exec_env_forgives_verified_runc() {
+        let (mut p, _d) = pipeline("exec-env-clean");
+        p.env_auto = None;
+        runc_self_clone_env(&mut p, Some(rpm("runc")), Some(0));
+        assert_eq!(p.store().open_count(), 0);
+    }
+
+    #[test]
+    fn missing_exec_env_fails_closed_at_deadline() {
+        let (mut p, _d) = pipeline("exec-env-missing");
+        p.env_auto = None;
+        runc_self_clone_env(&mut p, Some(rpm("runc")), None);
+        assert_eq!(p.deferred.len(), 2, "still waiting for the environment");
+        p.flush_all();
+        let ev = evidence(&p);
+        assert!(ev.iter().any(|r| r.contains("could not be read")), "{ev:?}");
+    }
+
+    #[test]
+    fn a_truncated_or_unreadable_exec_env_fails_closed() {
+        for flags in [ENV_TRUNCATED, ENV_UNREADABLE] {
+            let (mut p, _d) = pipeline(&format!("exec-env-{flags}"));
+            p.env_auto = None;
+            runc_self_clone_env(&mut p, Some(rpm("runc")), Some(flags));
+            let ev = evidence(&p);
+            assert!(ev.iter().any(|r| r.contains("could not be read")), "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn live_exec_never_reads_proc_env() {
+        let (mut p, _d) = pipeline("exec-env-noproc");
+        p.env_auto = None;
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        assert!(p.table.get(&key(60)).unwrap().env_pending);
+        p.handle(&exec_env(60, 0));
+        assert!(p.to_read_env.is_empty());
+        let me = p.table.get(&key(60)).unwrap();
+        assert!(!me.env_pending);
+        assert_eq!(me.taint(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn late_found_process_still_reads_proc_env() {
+        // This test process stands in for one that predates the daemon:
+        // its exe is on the verify list, and no ExecEnv will come for it.
+        let (mut p, _d) = pipeline("late-env");
+        p.env_auto = None;
+        let me = std::process::id();
+        let mut e = ev(EventKind::MemfdCreate, me);
+        e.start_time_ns = proc_start_ns(me).unwrap();
+        p.handle(&e);
+        let jobs = std::mem::take(&mut p.to_read_env);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].0.tgid, me);
+    }
+
+    #[test]
+    fn signals_wait_for_the_kernels_environment_verdict() {
         let (mut p, _d) = pipeline("env-async");
         p.env_auto = None;
         p.handle(&exec(60, "/usr/bin/runc", 0));
-        let jobs = std::mem::take(&mut p.to_read_env);
-        assert_eq!(jobs.len(), 1);
         assert!(p.table.get(&key(60)).unwrap().env_pending);
         p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
         p.handle(&ev(EventKind::MemfdCreate, 60));
         assert_eq!(p.deferred.len(), 1, "waits for the environment");
-        p.env_read(jobs[0], Some(b"PATH=/usr/bin\0".to_vec()));
+        p.handle(&exec_env(60, 0));
         assert_eq!(p.deferred.len(), 0);
         p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
         assert_eq!(p.store().open_count(), 0);
     }
 
     #[test]
-    fn an_environment_read_that_never_answers_taints_after_its_deadline() {
+    fn an_environment_verdict_that_never_comes_taints_after_its_deadline() {
         let (mut p, _d) = pipeline("env-stuck");
         p.env_auto = None;
         p.handle(&exec(60, "/usr/bin/runc", 0));
@@ -1262,29 +1384,42 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].verdict, "would_quarantine");
         // A late answer changes nothing.
-        p.env_read((key(60), (0, 0), 0), Some(b"PATH=/usr/bin\0".to_vec()));
+        p.handle(&exec_env(60, 0));
         assert_eq!(p.store().list()[0].verdict, "would_quarantine");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn a_superseded_answer_for_the_same_image_is_ignored() {
+    fn a_superseded_proc_read_for_the_same_image_is_ignored() {
         let (mut p, _d) = pipeline("env-seq");
         p.env_auto = None;
-        p.handle(&exec(60, "/usr/bin/runc", 0));
+        let me = std::process::id();
+        let st = proc_start_ns(me).unwrap();
+        let mut e = ev(EventKind::MemfdCreate, me);
+        e.start_time_ns = st;
+        p.handle(&e);
         let old = std::mem::take(&mut p.to_read_env)[0];
-        // runc re-execs the very same file: same key, same image.
-        p.handle(&exec(60, "/usr/bin/runc", 0));
-        let new = std::mem::take(&mut p.to_read_env)[0];
-        assert_eq!((old.0, old.1), (new.0, new.1));
-        assert_ne!(old.2, new.2);
+        // It re-execs the very same file: same key, same image, and the
+        // kernel answers for the new image instead.
+        let exe = std::env::current_exe().unwrap();
+        let md = std::fs::metadata(&exe).unwrap();
+        let mut x = exec(me, exe.to_str().unwrap(), 0);
+        x.start_time_ns = st;
+        x.exe_ino = std::os::unix::fs::MetadataExt::ino(&md);
+        let dev = std::os::unix::fs::MetadataExt::dev(&md);
+        x.exe_dev = (libc::major(dev) << 20) | libc::minor(dev);
+        p.handle(&x);
+        assert!(p.to_read_env.is_empty());
+        let k = old.0;
+        assert_eq!(p.env_reads[&k].0 .1, old.1, "same image");
         // The old read lands late, and clean. It must not count.
         p.env_read(old, Some(b"PATH=/usr/bin\0".to_vec()));
-        let me = p.table.get(&key(60)).unwrap();
-        assert!(me.env_pending);
-        assert!(me.taint().is_some());
-        // The current one does.
-        p.env_read(new, Some(b"PATH=/usr/bin\0".to_vec()));
-        assert_eq!(p.table.get(&key(60)).unwrap().taint(), None);
+        assert!(p.table.get(&k).unwrap().env_pending);
+        // The kernel's does.
+        let mut v = exec_env(me, 0);
+        v.start_time_ns = st;
+        p.handle(&v);
+        assert_eq!(p.table.get(&k).unwrap().taint(), None);
     }
 
     #[test]

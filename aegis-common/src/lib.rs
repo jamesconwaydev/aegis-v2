@@ -14,6 +14,10 @@ pub enum EventKind {
     Ptrace = 4,
     MemfdCreate = 5,
     Connect = 6,
+    /// The environment a just-committed exec started with, read at
+    /// `sched_process_exec`. Carries only `tgid`, `start_time_ns` and the
+    /// `ENV_*` flags.
+    ExecEnv = 7,
 }
 
 impl TryFrom<u32> for EventKind {
@@ -27,6 +31,7 @@ impl TryFrom<u32> for EventKind {
             4 => Self::Ptrace,
             5 => Self::MemfdCreate,
             6 => Self::Connect,
+            7 => Self::ExecEnv,
             _ => return Err(v),
         })
     }
@@ -40,6 +45,12 @@ pub const HAS_TTY: u32 = 8;
 /// Exec: no depth-0 record matched, so the path and flags describe the
 /// file the commit hook saw (for a script, its interpreter).
 pub const EXEC_FALLBACK: u32 = 16;
+/// ExecEnv: LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH is set.
+pub const ENV_LOADER_VAR: u32 = 32;
+/// ExecEnv: the environment runs past what the probe reads (32 KiB).
+pub const ENV_TRUNCATED: u32 = 64;
+/// ExecEnv: the environment could not be read.
+pub const ENV_UNREADABLE: u32 = 128;
 
 /// One record on the `EVENTS` ring buffer. Fields after `flags` are only
 /// meaningful for the kind named beside them; the rest are zero.
@@ -116,6 +127,9 @@ pub struct KernelOffsets {
     pub sock_sk_err: u32,
     pub inode_i_ino: u32,
     pub super_block_s_dev: u32,
+    pub task_mm: u32,
+    pub mm_env_start: u32,
+    pub mm_env_end: u32,
 }
 
 #[cfg(feature = "user")]

@@ -36,7 +36,7 @@ or a missing program. Run `aegisctl preflight`:
   offsets it needs.
 - **`kernel` FAIL:** the kernel is older than 6.12.
 
-aegisd attaches all eight probes or none, and won't run with a partial
+aegisd attaches all nine probes or none, and won't run with a partial
 set.
 
 ### It keeps restarting with `probe event stream ended`
@@ -116,15 +116,18 @@ Look at each incident's evidence and member verification:
   verifies.
 - Look for `allowlist withheld:` in the evidence reason. It means the
   binary verified but the process wasn't trusted:
-  - `LD_PRELOAD is set`, `LD_AUDIT is set` or `LD_LIBRARY_PATH is set`:
-    the process was started with that loader variable. On a host that
+  - `LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH is set`: the process was
+    started with one of those loader variables. On a host that
     sets `LD_LIBRARY_PATH` globally (in `/etc/environment` or a profile
     script, say), every allowlisted tool hits this. Remove the global
     setting, or expect these incidents.
-  - `its environment could not be read`: aegisd couldn't read
-    `/proc/<pid>/environ` within 1 second, often because the process
-    exited first. If it happens for every allowlisted process until a
-    restart, see [stuck environment reads](#every-allowlisted-process-loses-its-allowlist).
+  - `its environment could not be read`: the kernel couldn't read the
+    environment at exec, it was longer than 32 KiB, or no answer came
+    within 1 second. For a process that was already running when aegisd
+    started, the answer is a read of `/proc/<pid>/environ`, often lost
+    because the process exited first. If it happens for every one of
+    those until a restart, see
+    [stuck environment reads](#every-allowlisted-process-loses-its-allowlist).
   - `it was the target of a ptrace attach`: a debugger attached to it,
     or to its parent before the fork. The mark clears at the next exec.
 - For `excluded_parent_processes`, only the immediate parent of the
@@ -135,8 +138,9 @@ Look at each incident's evidence and member verification:
 
 ### Every allowlisted process loses its allowlist
 
-If every allowlisted process shows `its environment could not be read`
-until aegisd restarts, environment reads are stuck. A read of a process
+If every allowlisted process that was running before aegisd started
+shows `its environment could not be read` until aegisd restarts,
+`/proc` environment reads are stuck. A read of a process
 whose memory is backed by something that never answers, such as a hung
 FUSE filesystem, can block for good, and after 16 of those every
 further read is refused. That gives false positives, not missed

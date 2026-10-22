@@ -159,7 +159,8 @@ names instead, such as `TmpExec`.
 
 `reason` reads like `exec of a memfd (/memfd:x (deleted))`,
 `memfd_create; caller is allowlisted`, or
-`memfd_create; allowlist withheld: LD_PRELOAD is set`. In brackets at
+`memfd_create; allowlist withheld: LD_PRELOAD, LD_AUDIT or
+LD_LIBRARY_PATH is set`. In brackets at
 the end:
 
 - for the two exec signals, the file that was executed;

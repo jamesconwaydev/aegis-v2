@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
-use aegis_common::{Event, EventKind, HAS_TTY};
+use aegis_common::{Event, EventKind, ENV_LOADER_VAR, ENV_TRUNCATED, ENV_UNREADABLE, HAS_TTY};
 
 use crate::verify::Verification;
 
@@ -34,8 +34,9 @@ pub struct ProcInfo {
     /// Why the environment it was exec'd with voids allowlist trust
     /// (a loader variable, or no readable environment at all).
     pub env_taint: Option<&'static str>,
-    /// Its environment is being read off the event loop. Until it lands
-    /// the process counts as tainted.
+    /// Its environment's verdict is still to come: the kernel's, for an
+    /// exec we saw, or a /proc read for a process that predates us.
+    /// Until it lands the process counts as tainted.
     pub env_pending: bool,
     /// It was the target of a ptrace attach or seize. Inherited at
     /// fork, cleared at exec.
@@ -60,7 +61,7 @@ impl ProcInfo {
     /// Becomes the image an Exec event started.
     pub fn apply_exec(&mut self, ev: &Event) {
         let n = (ev.path_len as usize).min(ev.path.len());
-        // The new image's environment is the pipeline's to read.
+        // The new image's environment comes in its own ExecEnv event.
         self.env_taint = None;
         self.env_pending = false;
         // A tracer's hold on the old image doesn't carry over.
@@ -77,7 +78,23 @@ impl ProcInfo {
     }
 }
 
+impl ProcInfo {
+    /// Takes the kernel's verdict on the environment its exec started
+    /// with: an `ExecEnv` event's flags.
+    pub fn apply_env(&mut self, flags: u32) {
+        self.env_taint = if flags & ENV_LOADER_VAR != 0 {
+            Some(LOADER_VAR)
+        } else if flags & (ENV_TRUNCATED | ENV_UNREADABLE) != 0 {
+            Some(UNREADABLE)
+        } else {
+            None
+        };
+        self.env_pending = false;
+    }
+}
+
 pub const UNREADABLE: &str = "its environment could not be read";
+const LOADER_VAR: &str = "LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH is set";
 
 pub struct ProcTable {
     procs: HashMap<ProcKey, ProcInfo>,
@@ -107,30 +124,18 @@ pub fn in_host_pidns(tgid: u32) -> bool {
     }
 }
 
-/// `/proc/<tgid>/environ`, once the start time shows the pid hasn't been
-/// reused and that it still runs `image`: after a later exec the
-/// environment is the new image's. Blocking, and a process can make it
-/// block for good (environment pages backed by FUSE), so it only ever
-/// runs off the event loop.
-///
-/// At an exec's commit the kernel hasn't laid the new environment out
-/// yet, so an empty read is retried for a little while.
+/// `/proc/<tgid>/environ`, for a process that started before aegisd:
+/// no ExecEnv will ever come for it. Read only once the start time shows
+/// the pid hasn't been reused, and only if it still runs `image`.
+/// Blocking, and a process can make it block for good (environment pages
+/// backed by FUSE), so it only ever runs off the event loop.
 pub fn read_environ(tgid: u32, start_time_ns: u64, image: (u64, u64)) -> Option<Vec<u8>> {
-    for _ in 0..10 {
-        if !crate::pipeline::proc_start_matches(tgid, start_time_ns) {
-            return None;
-        }
-        let env = std::fs::read(format!("/proc/{tgid}/environ")).ok()?;
-        let md = std::fs::metadata(format!("/proc/{tgid}/exe")).ok()?;
-        if (md.dev(), md.ino()) != image {
-            return None;
-        }
-        if !env.is_empty() {
-            return Some(env);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    if !crate::pipeline::proc_start_matches(tgid, start_time_ns) {
+        return None;
     }
-    None
+    let env = std::fs::read(format!("/proc/{tgid}/environ")).ok()?;
+    let md = std::fs::metadata(format!("/proc/{tgid}/exe")).ok()?;
+    ((md.dev(), md.ino()) == image).then_some(env)
 }
 
 /// Why an environment (NUL-separated `NAME=value` entries) voids
@@ -141,17 +146,10 @@ pub fn env_taint(environ: Option<&[u8]>) -> Option<&'static str> {
     let Some(env) = environ.filter(|e| !e.is_empty()) else {
         return Some(UNREADABLE);
     };
-    const LOADER: [(&[u8], &str); 3] = [
-        (b"LD_PRELOAD=", "LD_PRELOAD is set"),
-        (b"LD_AUDIT=", "LD_AUDIT is set"),
-        (b"LD_LIBRARY_PATH=", "LD_LIBRARY_PATH is set"),
-    ];
-    env.split(|&b| b == 0).find_map(|v| {
-        LOADER
-            .iter()
-            .find(|(name, _)| v.starts_with(name))
-            .map(|(_, why)| *why)
-    })
+    const LOADER: [&[u8]; 3] = [b"LD_PRELOAD=", b"LD_AUDIT=", b"LD_LIBRARY_PATH="];
+    env.split(|&b| b == 0)
+        .any(|v| LOADER.iter().any(|name| v.starts_with(name)))
+        .then_some(LOADER_VAR)
 }
 
 /// The exec'd file's (dev, ino) from the event. The kernel's `s_dev` is
@@ -264,6 +262,7 @@ impl ProcTable {
         self.ensure(ev);
         match kind {
             Some(EventKind::Exec) => self.procs.get_mut(&key).unwrap().apply_exec(ev),
+            Some(EventKind::ExecEnv) => self.procs.get_mut(&key).unwrap().apply_env(ev.flags),
             Some(EventKind::Fork) => {
                 let ck = ProcKey {
                     tgid: ev.child_tgid,
@@ -424,19 +423,14 @@ mod tests {
 
     #[test]
     fn loader_variables_and_unreadable_environments_taint() {
+        let set = Some("LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH is set");
         assert_eq!(env_taint(Some(b"PATH=/usr/bin\0HOME=/root\0")), None);
         assert_eq!(
             env_taint(Some(b"PATH=/usr/bin\0LD_PRELOAD=/tmp/x.so\0")),
-            Some("LD_PRELOAD is set")
+            set
         );
-        assert_eq!(
-            env_taint(Some(b"LD_AUDIT=/tmp/a.so")),
-            Some("LD_AUDIT is set")
-        );
-        assert_eq!(
-            env_taint(Some(b"A=1\0LD_LIBRARY_PATH=/tmp\0")),
-            Some("LD_LIBRARY_PATH is set")
-        );
+        assert_eq!(env_taint(Some(b"LD_AUDIT=/tmp/a.so")), set);
+        assert_eq!(env_taint(Some(b"A=1\0LD_LIBRARY_PATH=/tmp\0")), set);
         // A value that merely mentions one is not one.
         assert_eq!(env_taint(Some(b"X=LD_PRELOAD=/tmp/x.so\0")), None);
         assert_eq!(env_taint(None), Some("its environment could not be read"));
@@ -444,6 +438,31 @@ mod tests {
             env_taint(Some(b"")),
             Some("its environment could not be read")
         );
+    }
+
+    #[test]
+    fn exec_env_flags_set_the_taint_and_end_the_wait() {
+        let mut t = table();
+        t.apply(&ev(EventKind::Exec, 10, 1));
+        let k = ProcKey {
+            tgid: 10,
+            start_time_ns: 1,
+        };
+        for (flags, want) in [
+            (ENV_LOADER_VAR, Some(LOADER_VAR)),
+            (ENV_LOADER_VAR | ENV_TRUNCATED, Some(LOADER_VAR)),
+            (ENV_TRUNCATED, Some(UNREADABLE)),
+            (ENV_UNREADABLE, Some(UNREADABLE)),
+            (HAS_TTY, None),
+        ] {
+            let mut e = ev(EventKind::ExecEnv, 10, 1);
+            e.flags = flags;
+            t.set_env(&k, None, true);
+            t.apply(&e);
+            let p = t.get(&k).unwrap();
+            assert!(!p.env_pending);
+            assert_eq!(p.env_taint, want, "flags {flags}");
+        }
     }
 
     fn table() -> ProcTable {

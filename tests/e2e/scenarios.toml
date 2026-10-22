@@ -91,9 +91,8 @@ systemctl reload aegisd && sleep 2
 rm -f $D; systemctl reload aegisd; [ $rc = 0 ]
 """
 # The same, without the preload: the control for the scenario above.
-# Both wait 500 ms before the memfd, so aegisd reads the environment
-# while the process is alive. A process that is gone first reads as
-# tainted (fail closed) and would quarantine here; that is by design.
+# The kernel reads the environment at exec, so this passes however
+# quickly the process exits. Both still wait 500 ms before the memfd.
 expect = "none"
 
 # --- Benign activity that must not trip a detection ----------------------

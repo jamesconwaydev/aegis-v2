@@ -72,6 +72,9 @@ fn kernel_offsets(btf: &btf::Btf) -> Result<KernelOffsets> {
         sock_sk_err: btf.offset("sock", "sk_err")?,
         inode_i_ino: btf.offset("inode", "i_ino")?,
         super_block_s_dev: btf.offset("super_block", "s_dev")?,
+        task_mm: btf.offset("task_struct", "mm")?,
+        mm_env_start: btf.offset("mm_struct", "env_start")?,
+        mm_env_end: btf.offset("mm_struct", "env_end")?,
     })
 }
 
@@ -113,6 +116,12 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
     fork.load("sched_process_fork", &kernel_btf)?;
     fork.attach()?;
     attached("aegis_fork", "tp_btf/sched_process_fork".into());
+
+    // Reads the new image's environment once the exec has set it up.
+    let env: &mut BtfTracePoint = prog(&mut ebpf, "aegis_exec_env")?;
+    env.load("sched_process_exec", &kernel_btf)?;
+    env.attach()?;
+    attached("aegis_exec_env", "tp_btf/sched_process_exec".into());
 
     for (name, category, tracepoint) in [
         ("aegis_exit", "sched", "sched_process_exit"),

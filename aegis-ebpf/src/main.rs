@@ -10,6 +10,7 @@
 #![no_main]
 
 mod connect;
+mod env;
 mod exec;
 mod sched;
 mod syscalls;
@@ -49,6 +50,9 @@ static OFFSETS: KernelOffsets = KernelOffsets {
     sock_sk_err: 0,
     inode_i_ino: 0,
     super_block_s_dev: 0,
+    task_mm: 0,
+    mm_env_start: 0,
+    mm_env_end: 0,
 };
 
 /// Volatile, so the compiler can't fold the zero the object ships with.

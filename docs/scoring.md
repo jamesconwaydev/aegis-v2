@@ -160,9 +160,10 @@ process gets no allowlist modifier at all, the SELinux-domain one
 included, when:
 
 - its environment at exec holds `LD_PRELOAD`, `LD_AUDIT` or
-  `LD_LIBRARY_PATH`;
-- its environment couldn't be read within 1 second (this fails closed);
-  or
+  `LD_LIBRARY_PATH`, as the kernel read it before the new image ran;
+- its environment couldn't be read, ran past the 32 KiB the kernel
+  reads, or hadn't been read within 1 second (all of these fail
+  closed); or
 - a tracer in the host's pid namespace attached to it with ptrace and
   the attach succeeded. Its children inherit that at fork, and its next
   exec clears it.
@@ -172,7 +173,7 @@ parent is what earns the modifier. Withholding doesn't change a
 binary's verification, and the evidence says what was withheld and why:
 
 ```text
-exec of a memfd; allowlist withheld: LD_PRELOAD is set (/memfd:aegis-sim (deleted))
+memfd_create; allowlist withheld: LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH is set
 ```
 
 For the two exec signals, the file that was run follows in brackets.
@@ -180,7 +181,7 @@ For the two exec signals, the file that was run follows in brackets.
 On a host that sets `LD_LIBRARY_PATH` globally, every allowlisted tool
 loses its modifiers this way. Expect incidents from tools such as
 `runc` or `dnf` there, and look for `allowlist withheld:` in their
-evidence. These checks are best effort; the
+evidence. These checks still have gaps; the
 [threat model](threat-model.md#the-injection-checks-are-best-effort)
 explains how they can be beaten.
 

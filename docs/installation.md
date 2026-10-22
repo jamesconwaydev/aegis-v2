@@ -69,7 +69,7 @@ systemctl enable --now aegisd
 aegisctl status
 ```
 
-`status` shows `mode audit`, lists eight probes, and has an `events`
+`status` shows `mode audit`, lists nine probes, and has an `events`
 counter that climbs. If it says aegisd isn't running, see
 [troubleshooting](troubleshooting.md#aegisd-wont-start).
 

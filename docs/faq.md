@@ -43,7 +43,8 @@ so allowlists don't apply to them. See the
 Overhead hasn't been measured for v0.1, so there are no numbers to
 quote yet. Measuring it is on the roadmap for v1.0.0. aegisd does its
 own work in one event loop, with up to four threads verifying binaries,
-up to 16 reading process environments, one writing incidents, and one
+up to 16 reading the environments of processes that predate it, one
+writing incidents, and one
 sending OTLP batches when that sink is on.
 
 ## Will an update to a package cause false positives?

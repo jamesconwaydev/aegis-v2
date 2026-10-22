@@ -25,7 +25,7 @@ into `aegisd`, so there's nothing else to deploy.
 flowchart TD
     subgraph kernel
         E1["lsm/bprm_check_security<br/>lsm/bprm_committed_creds"]
-        E2["tp_btf/sched_process_fork<br/>sched/sched_process_exit"]
+        E2["tp_btf/sched_process_fork<br/>tp_btf/sched_process_exec<br/>sched/sched_process_exit"]
         E3["syscalls/sys_enter_ptrace<br/>syscalls/sys_exit_ptrace<br/>syscalls/sys_enter_memfd_create"]
         E4["sock/inet_sock_set_state"]
         RB[("EVENTS ring buffer<br/>4 MiB")]
@@ -35,7 +35,7 @@ flowchart TD
     L --> PT["process table"]
     L --> V["verifier<br/>(4 threads)"]
     V --> L
-    L --> EN["environment reads<br/>(up to 16 threads)"]
+    L --> EN["/proc environment reads<br/>(up to 16 threads)"]
     EN --> L
     L --> SC["scorer + scan detector"]
     SC --> W["incident writer thread"]
@@ -47,7 +47,7 @@ flowchart TD
 
 ## Kernel side
 
-The probes attach at startup. aegisd fails to start unless all eight
+The probes attach at startup. aegisd fails to start unless all nine
 attach. The last five are ordinary tracepoints; `aegisctl status` shows
 them with a `tracepoint/` prefix.
 
@@ -56,6 +56,7 @@ them with a `tracepoint/` prefix.
 | `aegis_exec_check`  | `lsm/bprm_check_security`         | nothing     |
 | `aegis_exec`        | `lsm/bprm_committed_creds`        | Exec        |
 | `aegis_fork`        | `tp_btf/sched_process_fork`       | Fork        |
+| `aegis_exec_env`    | `tp_btf/sched_process_exec`       | ExecEnv     |
 | `aegis_exit`        | `sched/sched_process_exit`        | Exit        |
 | `aegis_ptrace`      | `syscalls/sys_enter_ptrace`       | nothing     |
 | `aegis_ptrace_exit` | `syscalls/sys_exit_ptrace`        | Ptrace      |
@@ -161,16 +162,25 @@ ahead of time so the first exec of it is a cache hit.
 A verified binary can still run someone else's code, through the
 dynamic loader or a debugger. So for a process whose executable is
 allowlisted or pinned, or whose SELinux type is in
-`excluded_selinux_domains`, aegisd reads `/proc/<pid>/environ` after
-the exec. `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in it marks the
+`excluded_selinux_domains`, aegisd waits for its environment before it
+trusts it. `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in it marks the
 process as tainted, and so does an environment that can't be read.
 
-The reads run on their own threads, at most 16 at once, because a
-process can make one block for good. A read must answer within
-1 second, and only about the image the process still runs. One that
-times out, finds a different image, or still reads empty after a few
-retries counts as unreadable, as does any read refused because 16 are
-already running or 256 are queued.
+For every exec, the `sched_process_exec` tracepoint reads the new
+image's environment (`mm->env_start` to `env_end`) before any of the
+image's code runs, 256 bytes at a time up to 32 KiB, and sends the
+verdict as its own event. Only the flags cross to userspace, never the
+environment. Past 32 KiB, or on a failed read, it counts as unreadable.
+
+A process that was running before aegisd started has no exec to catch,
+so aegisd reads its `/proc/<pid>/environ` instead. Those reads run on
+their own threads, at most 16 at once, because a process can make one
+block for good. One that finds a different image, or reads empty,
+counts as unreadable, as does any read refused because 16 are already
+running.
+
+Either way the answer must land within 1 second, and at most 256 can
+be awaited at once. Past either limit the process counts as tainted.
 
 A process that a host-side tracer attached to with ptrace is tainted
 too. Its children inherit the mark at fork, and its next exec clears
@@ -181,7 +191,7 @@ A tainted process gets no allowlist modifier at all; see
 
 ### Holding signals
 
-A signal that needs a verdict or an environment read still in progress
+A signal that needs a verdict or an environment still being read
 is held for up to 6 seconds, then scored with whatever is known by
 then: `unverified` for a missing verdict, tainted for a missing
 environment. That's two `rpm` calls at their timeout plus the hash.

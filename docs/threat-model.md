@@ -79,33 +79,37 @@ a `#!` line run directly is caught.
 ### The injection checks are best effort
 
 Allowlist credit is withheld from a process that shows `LD_PRELOAD`,
-`LD_AUDIT` or `LD_LIBRARY_PATH`, or that a debugger attached to. In
-v0.1 those checks can be beaten:
+`LD_AUDIT` or `LD_LIBRARY_PATH`, or that a debugger attached to. The
+kernel reads the environment at every exec, when the new image is in
+place but before any of its code has run. A preloaded library can't
+scrub its own entry before that read, because it hasn't been loaded
+yet. The checks can still be beaten:
 
-- aegisd reads the environment from `/proc/<pid>/environ` a few
-  milliseconds after the exec. That's the process's own memory, and a
-  preloaded library can scrub its `LD_PRELOAD` entry before aegisd reads
-  it.
 - A process can exec onward with a clean environment, and the next
   image starts out trusted.
+- Only the first 32 KiB of the environment is read. A longer one counts
+  as unreadable, so it fails closed: the process gets no allowlist
+  credit.
+- Processes already running when aegisd starts never exec in front of
+  it, so their environment is read from `/proc/<pid>/environ`, the v0.1
+  way. That read sees the process's memory as it is now, and a library
+  already loaded could have scrubbed its `LD_PRELOAD` entry by then.
 - A ptrace attach is only seen when another process attaches to the
   target. `PTRACE_TRACEME`, or a seize set up before the exec, isn't
   seen.
-- A process can re-exec the same file without the loader variable in
-  the moment before aegisd reads its environment, and the read then
-  sees the clean one.
 
-They stop careless injection and inherited environments, not an
-attacker who knows about them. Capturing the environment in the kernel
-at exec is planned for v0.2.0.
+They stop careless injection and inherited environments. An attacker
+who knows about them still has the gaps above.
 
 ### Environment reads can get stuck
 
-A read of `/proc/<pid>/environ` can block for good, for example when a
-process's memory is backed by a hung FUSE filesystem. aegisd runs at
-most 16 reads at once. Once 16 are stuck, every later read is refused,
-and every allowlisted process counts as untrusted until aegisd
-restarts. That causes false positives, not missed detections.
+This only touches processes that were running before aegisd started,
+the ones whose environment comes from `/proc/<pid>/environ`. That read
+can block for good, for example when a process's memory is backed by a
+hung FUSE filesystem. aegisd runs at most 16 reads at once. Once 16 are
+stuck, every later one is refused, and those processes count as
+untrusted until aegisd restarts. That causes false positives, not
+missed detections.
 
 ### A broken RPM database sticks
 
