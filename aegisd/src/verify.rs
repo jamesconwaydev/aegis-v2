@@ -203,18 +203,23 @@ pub const RPM_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What one rpm run left: exit code (None when it died on a signal),
 /// stdout and stderr.
-type RpmRun = (Option<i32>, Vec<u8>, Vec<u8>);
+pub type RpmRun = (Option<i32>, Vec<u8>, Vec<u8>);
 
-/// Runs `rpm args`, or None on spawn failure or timeout.
-fn rpm(args: &[&std::ffi::OsStr]) -> Option<RpmRun> {
-    let mut child = Command::new(RPM)
+/// Runs `prog args` with every pipe drained and a hard deadline, or
+/// None on spawn failure or timeout (the child is killed).
+pub fn run_bounded<S: AsRef<std::ffi::OsStr>>(
+    prog: &str,
+    args: &[S],
+    timeout: Duration,
+) -> Option<RpmRun> {
+    let mut child = Command::new(prog)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
-    // One reader per pipe, so neither can fill up and stall rpm.
+    // One reader per pipe, so neither can fill up and stall the child.
     let drain = |mut p: Box<dyn Read + Send>| {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -226,7 +231,7 @@ fn rpm(args: &[&std::ffi::OsStr]) -> Option<RpmRun> {
     };
     let out = drain(Box::new(child.stdout.take()?));
     let err = drain(Box::new(child.stderr.take()?));
-    let deadline = Instant::now() + RPM_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let left = || deadline.saturating_duration_since(Instant::now());
     if let (Ok(Some(o)), Ok(Some(e))) = (out.recv_timeout(left()), err.recv_timeout(left())) {
         // EOF doesn't mean exited; don't block on wait() forever.
@@ -240,6 +245,11 @@ fn rpm(args: &[&std::ffi::OsStr]) -> Option<RpmRun> {
     let _ = child.kill();
     let _ = child.wait();
     None
+}
+
+/// Runs `rpm args`, or None on spawn failure or timeout.
+fn rpm(args: &[&std::ffi::OsStr]) -> Option<RpmRun> {
+    run_bounded(RPM, args, RPM_TIMEOUT)
 }
 
 impl RpmDb for Rpm {

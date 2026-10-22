@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use crate::proctable::ProcKey;
+use crate::verify::run_bounded;
 
 /// A hung systemd or nft must not wedge the enforcer thread.
 const CMD_TIMEOUT: Duration = Duration::from_secs(5);
+
+const BUSCTL: &str = "/usr/bin/busctl";
+const SYSTEMCTL: &str = "/usr/bin/systemctl";
 
 /// Runs a command: program, args. Tests pass a fake.
 pub type Run = fn(&str, &[String]) -> Result<String>;
@@ -19,45 +20,16 @@ pub type Alive = fn(u32, u64) -> bool;
 /// Runs `prog args`, returning stdout; errors on spawn failure, timeout
 /// or a non-zero exit (with stderr).
 pub fn run_cmd(prog: &str, args: &[String]) -> Result<String> {
-    let mut child = Command::new(prog)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawning {prog}"))?;
-    // One reader per pipe, so neither can fill up and stall the child.
-    let drain = |mut p: Box<dyn Read + Send>| {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut s = Vec::new();
-            let _ = p.read_to_end(&mut s);
-            let _ = tx.send(s);
-        });
-        rx
-    };
-    let out = drain(Box::new(child.stdout.take().context("no stdout")?));
-    let err = drain(Box::new(child.stderr.take().context("no stderr")?));
-    let deadline = Instant::now() + CMD_TIMEOUT;
-    let left = || deadline.saturating_duration_since(Instant::now());
-    if let (Ok(o), Ok(e)) = (out.recv_timeout(left()), err.recv_timeout(left())) {
-        while Instant::now() < deadline {
-            if let Some(st) = child.try_wait()? {
-                if st.success() {
-                    return Ok(String::from_utf8_lossy(&o).into_owned());
-                }
-                bail!(
-                    "{prog} {}: {st}: {}",
-                    args.join(" "),
-                    String::from_utf8_lossy(&e).trim()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+    let cmd = || format!("{prog} {}", args.join(" "));
+    match run_bounded(prog, args, CMD_TIMEOUT) {
+        None => bail!("{}: failed to run or timed out", cmd()),
+        Some((Some(0), out, _)) => Ok(String::from_utf8_lossy(&out).into_owned()),
+        Some((code, _, err)) => bail!(
+            "{}: exit {code:?}: {}",
+            cmd(),
+            String::from_utf8_lossy(&err).trim()
+        ),
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    bail!("{prog} {}: timed out", args.join(" "))
 }
 
 pub struct Limits {
@@ -89,6 +61,9 @@ impl Systemd {
         pids: &[ProcKey],
         limits: Option<Limits>,
     ) -> Result<()> {
+        if pids.is_empty() {
+            bail!("no processes to move into {name}");
+        }
         let first = self.call_start(name, slice, pids, &limits);
         let Err(e) = first else { return Ok(()) };
         let live: Vec<ProcKey> = pids
@@ -141,12 +116,12 @@ impl Systemd {
         a.extend(["Description", "s"].map(String::from));
         a.push(format!("Aegis incident {id}"));
         a.push("0".into());
-        (self.run)("busctl", &a).map(drop)
+        (self.run)(BUSCTL, &a).map(drop)
     }
 
     fn ctl(&self, args: &[&str]) -> Result<()> {
         let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        (self.run)("systemctl", &a).map(drop)
+        (self.run)(SYSTEMCTL, &a).map(drop)
     }
 
     pub fn freeze(&self, unit: &str) -> Result<()> {
@@ -176,6 +151,7 @@ impl Systemd {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::time::Instant;
 
     thread_local! { static CALLS: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) }; }
 
@@ -216,6 +192,23 @@ mod tests {
         "aegis-incident-AEG-x-q.scope",
         "fail",
     ];
+
+    #[test]
+    fn run_bounded_kills_a_child_past_the_deadline() {
+        let t = Instant::now();
+        let r = run_bounded("/bin/sleep", &["5"], Duration::from_millis(100));
+        assert!(r.is_none());
+        assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn start_scope_rejects_empty_pids() {
+        take();
+        assert!(Systemd::with(ok, alive_10)
+            .start_scope("n.scope", "s", &[], None)
+            .is_err());
+        assert!(take().is_empty());
+    }
 
     #[test]
     fn start_scope_builds_busctl_argv() {

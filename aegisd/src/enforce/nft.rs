@@ -3,6 +3,8 @@ use anyhow::{anyhow, Context, Result};
 
 use super::systemd::{run_cmd, Run};
 
+const NFT: &str = "/usr/sbin/nft";
+
 pub struct Nft {
     run: Run,
 }
@@ -18,7 +20,7 @@ impl Nft {
 
     fn nft(&self, args: &[&str]) -> Result<String> {
         let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        (self.run)("nft", &a)
+        (self.run)(NFT, &a)
     }
 
     /// `add` is a no-op when the table and chain already exist.
