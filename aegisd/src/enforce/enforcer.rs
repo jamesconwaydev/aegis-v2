@@ -329,8 +329,14 @@ impl Enforcer {
         let mut now_frozen = frozen;
         if moved && !frozen {
             let r = self.sys.freeze(&unit);
-            now_frozen = r.is_ok();
-            acts.push(act("freeze", Some(&unit), vec![], r.map(|_| None)));
+            // The command can fail after the freeze took effect; the
+            // kernel has the last word. The error stays on the record.
+            let mut a = act("freeze", Some(&unit), vec![], r.map(|_| None));
+            if !a.ok {
+                a.ok = matches!(self.sys.is_frozen(QUARANTINE_SLICE, &unit), Ok(true));
+            }
+            now_frozen = a.ok;
+            acts.push(a);
         }
         if moved && !ruled {
             let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &unit);
@@ -354,9 +360,15 @@ impl Enforcer {
         let mut acts = Vec::new();
         let mut done = format!("released {id}: limits lifted");
         if quarantined {
-            if prior.iter().any(|a| a.ok && a.kind == "freeze") {
+            // Always thaw: a freeze recorded as failed may still have
+            // taken effect, and thawing an unfrozen unit is harmless.
+            if prior.iter().any(|a| a.ok && a.kind == "scope") {
                 let r = self.sys.thaw(&unit);
-                acts.push(act("thaw", Some(&unit), vec![], r.map(|_| None)));
+                let mut a = act("thaw", Some(&unit), vec![], r.map(|_| None));
+                if !a.ok {
+                    a.ok = matches!(self.sys.is_frozen(QUARANTINE_SLICE, &unit), Ok(false));
+                }
+                acts.push(a);
             }
             let pids: BTreeSet<u32> = prior
                 .iter()
@@ -431,7 +443,11 @@ impl Enforcer {
         acts: Vec<ActionRecord>,
         done: String,
     ) -> Result<String, String> {
-        let errs: Vec<String> = acts.iter().filter_map(|a| a.error.clone()).collect();
+        let errs: Vec<String> = acts
+            .iter()
+            .filter(|a| !a.ok)
+            .filter_map(|a| a.error.clone())
+            .collect();
         self.finish(id, acts, None);
         if errs.is_empty() {
             Ok(done)
@@ -447,7 +463,11 @@ impl Enforcer {
         self.ok.fetch_add(n_ok, Ordering::Relaxed);
         self.failed
             .fetch_add(acts.len() as u64 - n_ok, Ordering::Relaxed);
-        let failures: Vec<String> = acts.iter().filter_map(|a| a.error.clone()).collect();
+        let failures: Vec<String> = acts
+            .iter()
+            .filter(|a| !a.ok)
+            .filter_map(|a| a.error.clone())
+            .collect();
         let (mut all, earlier) = self.unsaved.remove(id).unwrap_or_default();
         all.extend(acts);
         let verdict = verdict.or(earlier);
@@ -555,6 +575,16 @@ mod tests {
             bail!("systemctl freeze: exit Some(1): no such unit")
         }
         ok(prog, a)
+    }
+    fn fail_freeze_and_thaw(prog: &str, a: &[String]) -> Result<String> {
+        if a.first().is_some_and(|s| s == "thaw") {
+            CALLS.with(|c| c.borrow_mut().push([&[prog.to_string()], a].concat()));
+            bail!("systemctl thaw: exit Some(1): timed out")
+        }
+        fail_freeze(prog, a)
+    }
+    fn frozen(_: &str) -> Result<String> {
+        Ok("populated 1\nfrozen 1\n".into())
     }
     fn alive(_: u32, _: u64) -> bool {
         true
@@ -761,6 +791,68 @@ mod tests {
             log.contains("enforcement failed: systemctl freeze"),
             "{log}"
         );
+    }
+
+    #[test]
+    fn freeze_error_but_frozen_counts_as_frozen() {
+        let mut f = fx("qfrozen", fail_freeze);
+        f.e.sys = Systemd::with(fail_freeze, alive).with_events(frozen);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let inc = f.incident();
+        assert_eq!(inc.verdict, "quarantined");
+        let freeze = inc.actions.iter().find(|a| a.kind == "freeze").unwrap();
+        assert!(freeze.ok);
+        assert!(freeze.error.as_deref().unwrap().contains("no such unit"));
+        assert_eq!(f.e.failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn release_thaws_even_when_freeze_was_recorded_failed() {
+        let mut f = fx("rel-nofreeze", fail_freeze);
+        let id = f.id.clone();
+        f.e.run(EnforceJob::Quarantine {
+            id: id.clone(),
+            pids: vec![k(10)],
+        });
+        assert_eq!(
+            f.kinds()[..3],
+            [
+                ("hold".into(), true),
+                ("scope".into(), true),
+                ("freeze".into(), false)
+            ]
+        );
+        take();
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release {
+            id: id.clone(),
+            reply,
+        });
+        assert_eq!(r, Ok(format!("released {id}: thawed, network restored")));
+        assert_eq!(
+            take()[0][1..3],
+            ["thaw".to_string(), format!("aegis-incident-{id}-q.scope")]
+        );
+    }
+
+    #[test]
+    fn release_reports_error_when_still_frozen() {
+        let mut f = fx("rel-stuck", fail_freeze_and_thaw);
+        f.e.sys = Systemd::with(fail_freeze_and_thaw, alive).with_events(frozen);
+        let id = f.id.clone();
+        f.e.run(EnforceJob::Quarantine {
+            id: id.clone(),
+            pids: vec![k(10)],
+        });
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release {
+            id: id.clone(),
+            reply,
+        });
+        let e = r.unwrap_err();
+        assert!(e.contains("systemctl thaw"), "{e}");
+        assert!(!e.contains("thawed"), "{e}");
     }
 
     #[test]
