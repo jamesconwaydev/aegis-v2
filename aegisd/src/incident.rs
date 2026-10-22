@@ -522,7 +522,8 @@ impl IncidentStore {
     /// Append what the enforcer did to an incident, and raise the verdict
     /// if one is given (only after an action succeeded; a failed action
     /// leaves the `would_*` verdict standing). Written like `record_as`:
-    /// `incident.json` atomically, then a timeline line.
+    /// `incident.json` atomically, then a timeline line. Ok once
+    /// `incident.json` is saved, even if the timeline line is lost.
     pub fn add_actions(
         &self,
         id: &IncidentId,
@@ -562,8 +563,15 @@ impl IncidentStore {
                 *m = inc;
             }
         }
+        // incident.json holds the actions now, and release reads them from
+        // there. A lost timeline line is logged, not a failed write: the
+        // caller would otherwise keep and replay actions already saved.
         if let Some(line) = line {
-            writeln!(private_append(&dir.join("timeline.jsonl"))?, "{line}")?;
+            let r = private_append(&dir.join("timeline.jsonl"))
+                .and_then(|mut f| Ok(writeln!(f, "{line}")?));
+            if let Err(e) = r {
+                eprintln!("aegisd: incident {id}: timeline line lost: {e:#}");
+            }
         }
         Ok(())
     }
@@ -1015,10 +1023,11 @@ mod tests {
         let tl = dir.join(&id.0).join("timeline.jsonl");
         fs::remove_file(&tl).unwrap();
         fs::create_dir(&tl).unwrap();
-        assert!(st.add_actions(&id, vec![act("hold", true)], None).is_err());
-        assert!(st
-            .add_actions(&id, vec![act("freeze", true)], None)
-            .is_err());
+        // Saved in incident.json is saved: a lost timeline line is not
+        // a failed write.
+        st.add_actions(&id, vec![act("hold", true)], None).unwrap();
+        st.add_actions(&id, vec![act("freeze", true)], None)
+            .unwrap();
         let raw = fs::read(dir.join(&id.0).join("incident.json")).unwrap();
         let on_disk: Incident = serde_json::from_slice(&raw).unwrap();
         let kinds: Vec<_> = on_disk.actions.iter().map(|a| a.kind.as_str()).collect();

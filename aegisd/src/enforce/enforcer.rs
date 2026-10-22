@@ -213,16 +213,7 @@ impl Enforcer {
     pub fn run(&mut self, job: EnforceJob) {
         match job {
             EnforceJob::Throttle { id, .. } | EnforceJob::Quarantine { id, .. }
-                if !self.enforcing.load(Ordering::Relaxed) =>
-            {
-                eprintln!("aegisd: audit mode now; enforcement for {id} dropped");
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            EnforceJob::Throttle { id, .. } | EnforceJob::Quarantine { id, .. }
-                if !self.recorded(&id) =>
-            {
-                self.report(&id, "enforcement skipped: incident not recorded".into());
-            }
+                if !self.ready(&id) => {}
             EnforceJob::Throttle { id, pids } => self.throttle(&id, &pids),
             EnforceJob::Quarantine { id, pids } => self.quarantine(&id, &pids),
             EnforceJob::Release { id, reply } => {
@@ -238,6 +229,28 @@ impl Enforcer {
                 }
             }
         }
+    }
+
+    /// Whether a throttle or quarantine for `id` may act now: still in
+    /// enforce mode, and the incident recorded. The mode is read again
+    /// after the wait, since a reload to audit can land during it.
+    fn ready(&self, id: &str) -> bool {
+        let enforcing = || {
+            let on = self.enforcing.load(Ordering::Relaxed);
+            if !on {
+                eprintln!("aegisd: audit mode now; enforcement for {id} dropped");
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            on
+        };
+        if !enforcing() {
+            return false;
+        }
+        if !self.recorded(id) {
+            self.report(id, "enforcement skipped: incident not recorded".into());
+            return false;
+        }
+        enforcing()
     }
 
     /// Whether the incident exists, waiting for the writer thread if it
@@ -1039,5 +1052,61 @@ mod tests {
                 f.id
             ))
         );
+    }
+
+    #[test]
+    fn a_reload_to_audit_during_the_incident_wait_stops_the_job() {
+        let mut f = fx("late", ok);
+        f.e.wait = Duration::from_secs(3);
+        // The incident lands late, and audit mode came while it waited.
+        let id = "AEG-20261021-000000-00000000000000aa".to_string();
+        let (store, enforcing, want) = (f.e.store.clone(), f.e.enforcing.clone(), id.clone());
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            enforcing.store(false, Ordering::Relaxed);
+            let d = Decision {
+                key: k(20),
+                score: 90.0,
+                tier: Tier::Quarantine,
+                evidence: vec![],
+            };
+            store
+                .record_as(&d, &[proc(20)], Mode::Enforce, Some(&want))
+                .unwrap();
+        });
+        f.e.run(EnforceJob::Quarantine {
+            id,
+            pids: vec![k(20)],
+        });
+        t.join().unwrap();
+        assert!(take().is_empty());
+        assert_eq!(f.e.holds.held(), 0);
+        assert_eq!(f.e.dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_lost_timeline_line_does_not_double_the_release() {
+        let mut f = fx("tl", ok);
+        // A directory where the timeline belongs: every append fails, but
+        // incident.json is still written.
+        let tl = f.dir.join(&f.id).join("timeline.jsonl");
+        std::fs::remove_file(&tl).unwrap();
+        std::fs::create_dir(&tl).unwrap();
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        assert!(f.e.unsaved.is_empty());
+        assert!(!f.log().contains("recording actions"), "{}", f.log());
+        assert_eq!(f.kinds().len(), 4);
+        take();
+        let (r, mut rx) = reply();
+        f.e.run(EnforceJob::Release {
+            id: f.id.clone(),
+            reply: r,
+        });
+        assert!(rx.try_recv().unwrap().is_ok());
+        let deletes = take().iter().filter(|a| a[1] == "delete").count();
+        assert_eq!(deletes, 1);
     }
 }
