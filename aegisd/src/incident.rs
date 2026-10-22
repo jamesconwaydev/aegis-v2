@@ -370,9 +370,9 @@ impl IncidentStore {
     /// `tree` holds the decision's process and its ancestors, nearest
     /// first, as `ProcTable::parent_chain` returns them.
     ///
-    /// Order on failure: `incident.json` is written first, then the
-    /// timeline line, and memory is updated last. A failed call leaves
-    /// disk at worst one step ahead; the next record rewrites it.
+    /// Order on failure: `incident.json` is written first, then memory
+    /// is updated, then the timeline line. A failed call leaves the
+    /// timeline at worst one line behind; memory matches the file.
     #[cfg(test)]
     pub fn record(&self, d: &Decision, tree: &[ProcInfo], mode: Mode) -> Result<IncidentId> {
         self.record_as(d, tree, mode, None)
@@ -505,14 +505,17 @@ impl IncidentStore {
             &dir.join("incident.json"),
             &serde_json::to_vec_pretty(&inc)?,
         )?;
+        // Memory is committed as soon as incident.json is: a timeline
+        // failure below must not leave memory behind the file.
+        let id = inc.id.clone();
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.index.insert(d.key, id.clone());
+            g.incidents.insert(id.clone(), inc);
+        }
         if let Some(line) = line {
             writeln!(private_append(&dir.join("timeline.jsonl"))?, "{line}")?;
         }
-
-        let id = inc.id.clone();
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.index.insert(d.key, id.clone());
-        g.incidents.insert(id.clone(), inc);
         Ok(IncidentId(id))
     }
 
@@ -550,14 +553,19 @@ impl IncidentStore {
             &dir.join("incident.json"),
             &serde_json::to_vec_pretty(&inc)?,
         )?;
+        // Commit to memory before the fallible timeline append: if that
+        // fails, the next call must not start from a copy that lacks
+        // actions already in incident.json (release needs their handles).
+        // Only an incident already in memory is updated; one from disk
+        // (older than the load window) stays out of list().
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(m) = g.incidents.get_mut(&inc.id) {
+                *m = inc;
+            }
+        }
         if let Some(line) = line {
             writeln!(private_append(&dir.join("timeline.jsonl"))?, "{line}")?;
-        }
-        // Only an incident already in memory is updated there; one that
-        // came from disk (older than the load window) stays out of list().
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(m) = g.incidents.get_mut(&inc.id) {
-            *m = inc;
         }
         Ok(())
     }
@@ -998,6 +1006,26 @@ mod tests {
         assert!(!fs::read_to_string(&p).unwrap().contains("\"actions\""));
         let st = IncidentStore::open_at(&dir, Some("boot".into()), 0).unwrap();
         assert!(st.get(&id).unwrap().actions.is_empty());
+    }
+
+    #[test]
+    fn timeline_failure_does_not_lose_earlier_actions() {
+        let dir = tmp("act-tlfail");
+        let st = IncidentStore::open_at(&dir, Some("boot".into()), 0).unwrap();
+        let id = quarantine_incident(&st);
+        // A directory where the timeline file belongs: every append fails.
+        let tl = dir.join(&id.0).join("timeline.jsonl");
+        fs::remove_file(&tl).unwrap();
+        fs::create_dir(&tl).unwrap();
+        assert!(st.add_actions(&id, vec![act("hold", true)], None).is_err());
+        assert!(st
+            .add_actions(&id, vec![act("freeze", true)], None)
+            .is_err());
+        let raw = fs::read(dir.join(&id.0).join("incident.json")).unwrap();
+        let on_disk: Incident = serde_json::from_slice(&raw).unwrap();
+        let kinds: Vec<_> = on_disk.actions.iter().map(|a| a.kind.as_str()).collect();
+        assert_eq!(kinds, ["hold", "freeze"]);
+        assert_eq!(st.get(&id).unwrap().actions.len(), 2);
     }
 
     #[test]
