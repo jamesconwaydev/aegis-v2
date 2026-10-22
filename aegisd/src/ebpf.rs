@@ -57,7 +57,19 @@ pub struct Holds {
 // Unused until the enforcer lands.
 #[allow(dead_code)]
 impl Holds {
+    /// Refuses pid 0-2 and aegisd itself, which must never be held, and
+    /// a zero start time, which the kernel would never match.
     pub fn hold(&mut self, k: ProcKey) -> Result<()> {
+        anyhow::ensure!(
+            k.tgid > 2 && k.tgid != std::process::id(),
+            "refusing to hold {}: pid 0, 1, 2 or aegisd",
+            k.tgid
+        );
+        anyhow::ensure!(
+            k.start_time_ns != 0,
+            "refusing to hold {}: no start time",
+            k.tgid
+        );
         match &mut self.map {
             Some(m) => m
                 .insert(k.tgid, k.start_time_ns, 0)
@@ -291,7 +303,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proctable::ProcKey;
 
     #[test]
     fn holds_round_trip_in_map_wrapper() {
@@ -306,5 +317,21 @@ mod tests {
         assert_eq!(h.held(), 0);
         // Releasing a task the kernel already dropped on exit is fine.
         h.release(k.tgid).unwrap();
+    }
+
+    #[test]
+    fn hold_refuses_pid1_pid2_self_and_zero_start() {
+        let mut h = Holds::default();
+        for (tgid, start_time_ns) in [(0, 7), (1, 7), (2, 7), (std::process::id(), 7), (4242, 0)] {
+            assert!(
+                h.hold(ProcKey {
+                    tgid,
+                    start_time_ns
+                })
+                .is_err(),
+                "{tgid}"
+            );
+        }
+        assert_eq!(h.held(), 0);
     }
 }
