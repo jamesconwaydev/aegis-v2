@@ -77,7 +77,8 @@ What each row means, with its key in `--json` output:
   inside an open incident that weren't recorded or sent to telemetry,
   because they added nothing new. This one grows in normal use.
 - **enforce jobs dropped** (`enforce_dropped`): throttle or quarantine
-  jobs lost to a full enforcer queue. Always 0 in audit mode.
+  jobs lost to a full enforcer queue, or still queued when a reload
+  switched to audit mode.
 - **telemetry dropped: ...** (`telemetry_dropped`): records each sink
   lost.
 - **probes** (`probes`): each probe's name and hook.

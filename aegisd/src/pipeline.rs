@@ -158,6 +158,9 @@ pub struct Pipeline {
     /// Shared with the enforcer, which reports its failures here too.
     pub sinks: Arc<Sinks>,
     mode: Mode,
+    /// `mode` for the enforcer thread, so a job queued before a reload
+    /// to audit is dropped rather than run.
+    pub enforcing: Arc<std::sync::atomic::AtomicBool>,
     /// Verifications in flight, by what is being verified: who is
     /// waiting, and the exe each had when it asked.
     pending: HashMap<ExeKey, Vec<(ProcKey, PathBuf)>>,
@@ -230,6 +233,7 @@ impl Pipeline {
             incidents,
             sinks: Arc::new(sinks),
             mode: cfg.general.mode,
+            enforcing: Arc::new((cfg.general.mode == Mode::Enforce).into()),
             pending: HashMap::new(),
             deferred: HashMap::new(),
             next_id: 0,
@@ -274,6 +278,8 @@ impl Pipeline {
         self.scorer.set_config(cfg);
         self.scan.set_config(cfg.scoring.scan.clone());
         self.mode = cfg.general.mode;
+        self.enforcing
+            .store(self.mode == Mode::Enforce, Ordering::Relaxed);
         self.verify_paths = cfg.allowlist.verify_paths();
     }
 
@@ -822,6 +828,8 @@ impl Pipeline {
                 .filter(|k| !covered.contains(k))
                 .collect();
             if !pids.is_empty() {
+                // ponytail: covered before the job reaches the queue, so a
+                // dropped newcomer job (counted) is never retried.
                 covered.extend(&pids);
                 self.to_enforce
                     .push(EnforceJob::Quarantine { id: g.into(), pids });

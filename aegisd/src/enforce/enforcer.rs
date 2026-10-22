@@ -4,8 +4,8 @@
 //! every step on the incident. The event loop only queues jobs here, so
 //! a slow systemd never holds up detection.
 
-use std::collections::{BTreeSet, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +27,9 @@ use crate::telemetry::{now_ns, rfc3339, Sinks, TelemetryRecord};
 const QUEUE: usize = 256;
 const QUARANTINE_SLICE: &str = "aegis-quarantine.slice";
 const THROTTLE_SLICE: &str = "aegis-throttle.slice";
+/// How long a throttle or quarantine waits for the writer thread to
+/// create its incident. Nothing is done to a tree that has no record.
+const INCIDENT_WAIT: Duration = Duration::from_secs(5);
 
 /// Where a release or kill answers: Ok with a message, or Err with why.
 pub type Reply = tokio::sync::oneshot::Sender<Result<String, String>>;
@@ -56,7 +59,8 @@ pub enum EnforceJob {
 
 pub struct EnforcerHandle {
     pub tx: SyncSender<EnforceJob>,
-    /// Jobs the loop dropped because the queue was full.
+    /// Jobs dropped: the queue was full, or a reload to audit came
+    /// while they waited.
     pub dropped: Arc<AtomicU64>,
     #[allow(dead_code)] // exported with the metrics
     pub actions_ok: Arc<AtomicU64>,
@@ -71,6 +75,7 @@ pub fn spawn_enforcer(
     nft: Nft,
     limits: Limits,
     sinks: Arc<Sinks>,
+    enforcing: Arc<AtomicBool>,
 ) -> EnforcerHandle {
     let (tx, rx) = sync_channel(QUEUE);
     let h = EnforcerHandle {
@@ -88,6 +93,10 @@ pub fn spawn_enforcer(
         sinks,
         ok: h.actions_ok.clone(),
         failed: h.actions_failed.clone(),
+        enforcing,
+        dropped: h.dropped.clone(),
+        wait: INCIDENT_WAIT,
+        unsaved: HashMap::new(),
     };
     std::thread::Builder::new()
         .name("aegis-enforce".into())
@@ -106,7 +115,9 @@ pub fn spawn_enforcer(
 /// between two members is under the upper one and is kept. pid 1,
 /// kthreadd and aegisd are dropped whatever the table says.
 // ponytail: walks every process's parent chain, O(table x depth); index
-// children by parent if incidents get large.
+// children by parent if incidents get large. `parent_chain` stops at 64
+// levels, so a descendant deeper than that below a member is left out:
+// it fails towards acting on less.
 pub fn target_set(table: &ProcTable, members: &[ProcKey], me: u32) -> Vec<ProcKey> {
     let m: HashSet<ProcKey> = members.iter().copied().collect();
     let mut out: Vec<ProcKey> = table
@@ -188,11 +199,30 @@ pub struct Enforcer {
     sinks: Arc<Sinks>,
     ok: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
+    /// The daemon's mode now, which a reload can change while jobs wait.
+    enforcing: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
+    wait: Duration,
+    /// Actions done but not yet on the incident (its write failed), and
+    /// the verdict they earned. Release and kill read these too, and the
+    /// next job for the incident writes them first.
+    unsaved: HashMap<String, (Vec<ActionRecord>, Option<&'static str>)>,
 }
 
 impl Enforcer {
     pub fn run(&mut self, job: EnforceJob) {
         match job {
+            EnforceJob::Throttle { id, .. } | EnforceJob::Quarantine { id, .. }
+                if !self.enforcing.load(Ordering::Relaxed) =>
+            {
+                eprintln!("aegisd: audit mode now; enforcement for {id} dropped");
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            EnforceJob::Throttle { id, .. } | EnforceJob::Quarantine { id, .. }
+                if !self.recorded(&id) =>
+            {
+                self.report(&id, "enforcement skipped: incident not recorded".into());
+            }
             EnforceJob::Throttle { id, pids } => self.throttle(&id, &pids),
             EnforceJob::Quarantine { id, pids } => self.quarantine(&id, &pids),
             EnforceJob::Release { id, reply } => {
@@ -210,11 +240,30 @@ impl Enforcer {
         }
     }
 
+    /// Whether the incident exists, waiting for the writer thread if it
+    /// has not got there yet: the loop queues the record first.
+    fn recorded(&self, id: &str) -> bool {
+        let iid = IncidentId(id.into());
+        let until = std::time::Instant::now() + self.wait;
+        loop {
+            if self.store.get(&iid).is_some() {
+                return true;
+            }
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn actions(&self, id: &str) -> Vec<ActionRecord> {
-        self.store
+        let mut acts = self
+            .store
             .get(&IncidentId(id.into()))
             .map(|i| i.actions)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        acts.extend(self.unsaved.get(id).into_iter().flat_map(|u| u.0.clone()));
+        acts
     }
 
     fn throttle(&mut self, id: &str, pids: &[ProcKey]) {
@@ -302,7 +351,7 @@ impl Enforcer {
         self.refuse_ended(id, &prior)?;
         let quarantined = prior
             .iter()
-            .any(|a| a.ok && (a.kind == "hold" || a.unit.as_deref() == Some(unit.as_str())));
+            .any(|a| holding(a) || (a.ok && a.unit.as_deref() == Some(unit.as_str())));
         let mut acts = Vec::new();
         if quarantined {
             if prior.iter().any(|a| a.ok && a.kind == "freeze") {
@@ -344,6 +393,9 @@ impl Enforcer {
             .iter()
             .any(|a| a.ok && a.unit.as_deref() == Some(unit.as_str()))
         {
+            if prior.iter().any(holding) {
+                return Err(format!("{id} was never moved into its scope; release it"));
+            }
             return Err(format!("{id} was only throttled; release it instead"));
         }
         // A frozen cgroup still takes SIGKILL.
@@ -355,7 +407,7 @@ impl Enforcer {
 
     /// Refuses an incident never enforced, or already released or killed.
     fn refuse_ended(&self, id: &str, prior: &[ActionRecord]) -> Result<(), String> {
-        if !prior.iter().any(|a| a.ok) {
+        if !prior.iter().any(|a| a.ok || holding(a)) {
             return Err(format!("{id} was never enforced"));
         }
         match state(prior) {
@@ -388,55 +440,80 @@ impl Enforcer {
     }
 
     /// Records `acts` on the incident, counts them, and sends each
-    /// failure to telemetry.
+    /// failure to telemetry. Actions an earlier write lost go first.
     fn finish(&mut self, id: &str, acts: Vec<ActionRecord>, verdict: Option<&'static str>) {
         let n_ok = acts.iter().filter(|a| a.ok).count() as u64;
         self.ok.fetch_add(n_ok, Ordering::Relaxed);
         self.failed
             .fetch_add(acts.len() as u64 - n_ok, Ordering::Relaxed);
-        let iid = IncidentId(id.into());
-        // The loop queues the incident's record before its first job, but
-        // the writer thread may not have written it yet.
-        for _ in 0..50 {
-            if self.store.get(&iid).is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
         let failures: Vec<String> = acts.iter().filter_map(|a| a.error.clone()).collect();
-        if let Err(e) = self.store.add_actions(&iid, acts, verdict) {
-            eprintln!("aegisd: recording enforcement on {id} failed: {e:#}");
+        let (mut all, earlier) = self.unsaved.remove(id).unwrap_or_default();
+        all.extend(acts);
+        let verdict = verdict.or(earlier);
+        if let Err(e) = self
+            .store
+            .add_actions(&IncidentId(id.into()), all.clone(), verdict)
+        {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+            // Nothing else knows what is now on the host: say what to undo.
+            let mut undo: Vec<String> = all
+                .iter()
+                .filter(|a| a.ok)
+                .filter_map(|a| a.unit.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            undo.extend(live_rules(&all).iter().map(|h| format!("nft handle {h}")));
+            self.report(
+                id,
+                format!(
+                    "enforcement failed: recording actions: {e:#}; on the host: {}",
+                    undo.join(", ")
+                ),
+            );
+            self.unsaved.insert(id.into(), (all, verdict));
         }
-        let inc = self.store.get(&iid);
         for err in failures {
-            eprintln!("aegisd: enforcement failed on {id}: {err}");
-            let (tier, verdict) = match inc.as_ref().map(|i| i.verdict.as_str()) {
-                Some("quarantined") => (Tier::Quarantine, "quarantined"),
-                Some("would_quarantine") => (Tier::Quarantine, "would_quarantine"),
-                Some("throttled") => (Tier::Throttle, "throttled"),
-                _ => (Tier::Throttle, "would_throttle"),
-            };
-            self.sinks.emit(&TelemetryRecord {
-                ts_unix_ns: now_ns(),
-                incident: id.into(),
-                tier,
-                verdict,
-                score: inc.as_ref().map_or(0.0, |i| i.score),
-                mode: Mode::Enforce,
-                tgid: inc.as_ref().map_or(0, |i| i.root.tgid),
-                comm: inc
-                    .as_ref()
-                    .map(|i| i.root.comm.clone())
-                    .unwrap_or_default(),
-                exe: inc
-                    .as_ref()
-                    .and_then(|i| i.root.exe.clone())
-                    .map(String::into_bytes),
-                target: None,
-                reasons: vec![format!("enforcement failed: {err}")],
-            });
+            self.report(id, format!("enforcement failed: {err}"));
         }
     }
+
+    /// Logs `reason` and sends it to telemetry, against the incident as
+    /// it stands now.
+    fn report(&self, id: &str, reason: String) {
+        eprintln!("aegisd: {id}: {reason}");
+        let inc = self.store.get(&IncidentId(id.into()));
+        let (tier, verdict) = match inc.as_ref().map(|i| i.verdict.as_str()) {
+            Some("quarantined") => (Tier::Quarantine, "quarantined"),
+            Some("would_quarantine") => (Tier::Quarantine, "would_quarantine"),
+            Some("throttled") => (Tier::Throttle, "throttled"),
+            _ => (Tier::Throttle, "would_throttle"),
+        };
+        self.sinks.emit(&TelemetryRecord {
+            ts_unix_ns: now_ns(),
+            incident: id.into(),
+            tier,
+            verdict,
+            score: inc.as_ref().map_or(0.0, |i| i.score),
+            mode: Mode::Enforce,
+            tgid: inc.as_ref().map_or(0, |i| i.root.tgid),
+            comm: inc
+                .as_ref()
+                .map(|i| i.root.comm.clone())
+                .unwrap_or_default(),
+            exe: inc
+                .as_ref()
+                .and_then(|i| i.root.exe.clone())
+                .map(String::into_bytes),
+            target: None,
+            reasons: vec![reason],
+        });
+    }
+}
+
+/// A hold that left pids held, even if part of it failed.
+fn holding(a: &ActionRecord) -> bool {
+    a.kind == "hold" && (a.ok || !a.pids.is_empty())
 }
 
 fn tgids(pids: &[ProcKey]) -> Vec<u32> {
@@ -554,6 +631,10 @@ mod tests {
             sinks: Arc::new(Sinks::jsonl_at(&dir.with_extension("jsonl"))),
             ok: Arc::default(),
             failed: Arc::default(),
+            enforcing: Arc::new(AtomicBool::new(true)),
+            dropped: Arc::default(),
+            wait: Duration::ZERO,
+            unsaved: HashMap::new(),
         };
         Fx { e, id, dir }
     }
@@ -561,6 +642,9 @@ mod tests {
     impl Fx {
         fn incident(&self) -> crate::incident::Incident {
             self.e.store.get(&IncidentId(self.id.clone())).unwrap()
+        }
+        fn log(&self) -> String {
+            std::fs::read_to_string(self.dir.with_extension("jsonl")).unwrap_or_default()
         }
         fn kinds(&self) -> Vec<(String, bool)> {
             self.incident()
@@ -816,6 +900,144 @@ mod tests {
         assert_eq!(
             kinds[4..],
             [("kill".into(), true), ("nft_remove".into(), true)]
+        );
+    }
+
+    #[test]
+    fn queued_jobs_do_nothing_once_back_in_audit() {
+        let mut f = fx("audit", ok);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        take();
+        // A reload to audit while more jobs wait in the queue.
+        f.e.enforcing.store(false, Ordering::Relaxed);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(12)],
+        });
+        f.e.run(EnforceJob::Throttle {
+            id: f.id.clone(),
+            pids: vec![k(12)],
+        });
+        assert!(take().is_empty());
+        assert_eq!(f.e.holds.held(), 1);
+        assert_eq!(f.kinds().len(), 4);
+        assert_eq!(f.e.dropped.load(Ordering::Relaxed), 2);
+        // An admin's release still runs.
+        f.e.run(EnforceJob::Release {
+            id: f.id.clone(),
+            reply: None,
+        });
+        assert_eq!(f.e.holds.held(), 0);
+        assert!(!take().is_empty());
+    }
+
+    #[test]
+    fn an_incident_never_recorded_is_not_acted_on() {
+        let mut f = fx("missing", ok);
+        f.e.run(EnforceJob::Quarantine {
+            id: "AEG-20261021-000000-0000000000000000".into(),
+            pids: vec![k(10)],
+        });
+        assert!(take().is_empty());
+        assert_eq!(f.e.holds.held(), 0);
+        assert!(
+            f.log()
+                .contains("enforcement skipped: incident not recorded"),
+            "{}",
+            f.log()
+        );
+    }
+
+    #[test]
+    fn actions_that_could_not_be_recorded_are_kept_and_retried() {
+        let mut f = fx("unsaved", ok);
+        // A file where the incident's directory belongs: every write fails.
+        let inc_dir = f.dir.join(&f.id);
+        std::fs::remove_dir_all(&inc_dir).unwrap();
+        std::fs::write(&inc_dir, "").unwrap();
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        assert!(f.incident().actions.is_empty());
+        let unit = format!("aegis-incident-{}-q.scope", f.id);
+        let log = f.log();
+        assert!(log.contains("recording actions"), "{log}");
+        assert!(log.contains(&unit) && log.contains("nft handle 7"), "{log}");
+        take();
+        // The disk is back: release works from the kept actions, and
+        // everything lands on the incident.
+        std::fs::remove_file(&inc_dir).unwrap();
+        std::fs::create_dir(&inc_dir).unwrap();
+        let (r, mut rx) = reply();
+        f.e.run(EnforceJob::Release {
+            id: f.id.clone(),
+            reply: r,
+        });
+        assert!(rx.try_recv().unwrap().is_ok());
+        let kinds: Vec<String> = f.kinds().into_iter().map(|k| k.0).collect();
+        assert_eq!(
+            kinds,
+            [
+                "hold",
+                "scope",
+                "freeze",
+                "nft_drop",
+                "thaw",
+                "unhold",
+                "nft_remove"
+            ]
+        );
+        assert!(f.e.unsaved.is_empty());
+    }
+
+    #[test]
+    fn a_restart_requarantine_reholds_and_attaches_only() {
+        let mut f = fx("restart", ok);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        take();
+        // The hold map is lost with the old aegisd; the cgroup is not.
+        f.e.holds = Holds::default();
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let c = take();
+        assert_eq!(c.len(), 1);
+        assert!(c[0].contains(&"AttachProcessesToUnit".into()));
+        assert_eq!(f.e.holds.held(), 1);
+    }
+
+    #[test]
+    fn kill_after_a_failed_move_says_so() {
+        fn fail_scope(prog: &str, a: &[String]) -> Result<String> {
+            if prog.ends_with("busctl") {
+                bail!("busctl: exit Some(1)")
+            }
+            ok(prog, a)
+        }
+        let mut f = fx("kill-noscope", fail_scope);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let (r, mut rx) = reply();
+        f.e.run(EnforceJob::Kill {
+            id: f.id.clone(),
+            reply: r,
+        });
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Err(format!(
+                "{} was never moved into its scope; release it",
+                f.id
+            ))
         );
     }
 }

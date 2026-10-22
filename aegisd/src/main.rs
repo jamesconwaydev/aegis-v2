@@ -266,6 +266,7 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
             memory_high_bytes: u64::from(c.throttle.memory_high_mb) << 20,
         },
         pipe.sinks.clone(),
+        pipe.enforcing.clone(),
     );
     let (call_tx, mut calls) = mpsc::channel::<ipc::Call>(16);
     let server = tokio::spawn(ipc::serve(listener, call_tx, 0));
