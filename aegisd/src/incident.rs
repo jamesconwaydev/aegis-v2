@@ -523,8 +523,6 @@ impl IncidentStore {
     /// if one is given (only after an action succeeded; a failed action
     /// leaves the `would_*` verdict standing). Written like `record_as`:
     /// `incident.json` atomically, then a timeline line.
-    // The enforcer is the only caller, and it lands in the next change.
-    #[allow(dead_code)]
     pub fn add_actions(
         &self,
         id: &IncidentId,

@@ -82,6 +82,7 @@ pub fn status(r: &Response) -> Option<String> {
         verify_skipped,
         deferred_overflow,
         incident_suppressed,
+        enforce_dropped,
         telemetry_dropped: t,
     } = r
     else {
@@ -103,6 +104,7 @@ pub fn status(r: &Response) -> Option<String> {
             "incident repeats not recorded",
             incident_suppressed.to_string(),
         ),
+        kv("enforce jobs dropped", enforce_dropped.to_string()),
         kv("telemetry dropped: journald", t.journald.to_string()),
         kv(
             "telemetry dropped: otlp queue full",
@@ -469,6 +471,7 @@ mod tests {
             verify_skipped: 6,
             deferred_overflow: 7,
             incident_suppressed: 12,
+            enforce_dropped: 13,
             telemetry_dropped: aegis_proto::TelemetryDropped {
                 journald: 8,
                 otlp_queue_full: 9,
@@ -486,6 +489,7 @@ mod tests {
             ("verifications skipped", "6"),
             ("defer queue overflows", "7"),
             ("incident repeats not recorded", "12"),
+            ("enforce jobs dropped", "13"),
             ("journald", "8"),
             ("otlp queue full", "9"),
             ("otlp export failed", "10"),

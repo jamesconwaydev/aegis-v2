@@ -48,6 +48,9 @@ pub enum Response {
         /// sent to telemetry because they added nothing new.
         #[serde(default)]
         incident_suppressed: u64,
+        /// Enforcement jobs dropped because the enforcer's queue was full.
+        #[serde(default)]
+        enforce_dropped: u64,
         telemetry_dropped: TelemetryDropped,
     },
     Incidents(Vec<IncidentSummary>),

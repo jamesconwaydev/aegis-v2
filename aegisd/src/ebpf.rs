@@ -40,8 +40,7 @@ pub struct EbpfHandle {
     _ebpf: Ebpf,
     dropped: PerCpuArray<MapData, u64>,
     probes: Vec<ProbeStatus>,
-    // Unused until the enforcer lands.
-    #[allow(dead_code)]
+    /// Taken by the enforcer at startup.
     pub holds: Holds,
 }
 
@@ -54,8 +53,6 @@ pub struct Holds {
     mem: BTreeMap<u32, u64>,
 }
 
-// Unused until the enforcer lands.
-#[allow(dead_code)]
 impl Holds {
     /// Refuses pid 0-2 and aegisd itself, which must never be held, and
     /// a zero start time, which the kernel would never match.
@@ -96,6 +93,7 @@ impl Holds {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // tests; metrics later
     pub fn held(&self) -> usize {
         match &self.map {
             Some(m) => m.keys().filter(Result::is_ok).count(),

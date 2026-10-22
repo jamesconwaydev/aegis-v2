@@ -14,7 +14,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{sync_channel, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,9 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
 use crate::config::{Config, ConfigHandle};
+use crate::enforce::enforcer::{spawn_enforcer, EnforcerHandle};
+use crate::enforce::nft::Nft;
+use crate::enforce::systemd::{Limits, Systemd};
 use crate::incident::{IncidentId, IncidentStore};
 use crate::pipeline::{EnvReaders, ExeKey, Incidents, Pipeline};
 use crate::telemetry::{mode_str, Sinks};
@@ -242,7 +245,7 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     // Socket first: a second aegisd stops here, before loading probes.
     // The lock is held for the daemon's life; dropping it frees the path.
     let (listener, _lock) = ipc::bind(&cli.socket)?;
-    let (handle, mut events) = match ebpf::start(&ebpf::Config {
+    let (mut handle, mut events) = match ebpf::start(&ebpf::Config {
         channel_capacity: 4096,
     }) {
         Ok(x) => x,
@@ -251,6 +254,19 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
             return Err(e);
         }
     };
+    // Runs in audit mode too, idle: the pipeline only queues jobs in
+    // enforce mode, and a reload can switch modes.
+    let enforcer = spawn_enforcer(
+        store.clone(),
+        std::mem::take(&mut handle.holds),
+        Systemd::new(),
+        Nft::new(),
+        Limits {
+            cpu_quota_percent: c.throttle.cpu_quota_percent,
+            memory_high_bytes: u64::from(c.throttle.memory_high_mb) << 20,
+        },
+        pipe.sinks.clone(),
+    );
     let (call_tx, mut calls) = mpsc::channel::<ipc::Call>(16);
     let server = tokio::spawn(ipc::serve(listener, call_tx, 0));
     verifying.warm(&c);
@@ -298,7 +314,7 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                     });
                 }
                 _ => {
-                    let _ = reply.send(answer(req, &pipe, &handle, &cfg, started));
+                    let _ = reply.send(answer(req, &pipe, &handle, &enforcer, &cfg, started));
                 }
             },
             _ = ticker.tick() => {
@@ -327,9 +343,12 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                         for p in pipe.to_verify.drain(..) {
                             verifying.spawn(p);
                         }
-                        if c.telemetry != old.telemetry || c.incidents != old.incidents {
+                        if c.telemetry != old.telemetry
+                            || c.incidents != old.incidents
+                            || c.throttle != old.throttle
+                        {
                             eprintln!(
-                                "aegisd: telemetry and incident settings take effect at restart"
+                                "aegisd: telemetry, incident and throttle settings take effect at restart"
                             );
                         }
                         eprintln!("aegisd: configuration reloaded");
@@ -339,6 +358,15 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
             }
             _ = term.recv() => break,
             _ = int.recv() => break,
+        }
+        // Any arm can score (a verdict or deadline releases a deferred
+        // signal), so jobs are handed over after each, never waited on.
+        for job in pipe.to_enforce.drain(..) {
+            if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
+                enforcer.tx.try_send(job)
+            {
+                enforcer.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -361,6 +389,7 @@ fn answer(
     req: Request,
     pipe: &Pipeline,
     probes: &ebpf::EbpfHandle,
+    enforcer: &EnforcerHandle,
     cfg: &ConfigHandle,
     started: Instant,
 ) -> Response {
@@ -378,6 +407,7 @@ fn answer(
             verify_skipped: pipe.verify_skipped,
             deferred_overflow: pipe.deferred_overflow,
             incident_suppressed: pipe.incident_suppressed,
+            enforce_dropped: enforcer.dropped.load(Ordering::Relaxed),
             telemetry_dropped: pipe.sinks.dropped(),
         },
         Request::IncidentsList => Response::Incidents(pipe.store().list()),

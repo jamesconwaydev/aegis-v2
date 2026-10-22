@@ -32,6 +32,13 @@ failed_connects = 10
 overlay_max_size_mb = 512
 auto_expire_seconds = 3600
 
+# Enforce mode only: the limits a tree runs under once throttled.
+[throttle]
+# Percent of one CPU, 1 to 100.
+cpu_quota_percent = 25
+# MiB, at least 16. Above this the kernel reclaims hard and slows it.
+memory_high_mb = 256
+
 [incidents]
 dir = "/var/lib/aegis-v2/incidents"
 

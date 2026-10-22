@@ -32,6 +32,7 @@ pub fn run_cmd(prog: &str, args: &[String]) -> Result<String> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Limits {
     pub cpu_quota_percent: u32,
     pub memory_high_bytes: u64,
@@ -51,9 +52,7 @@ impl Systemd {
         Self { run, alive }
     }
 
-    /// Moves `pids` into a new transient scope under `slice`. A pid that
-    /// exits before systemd looks fails the whole call, so on failure
-    /// the dead ones are dropped and it is tried once more.
+    /// Moves `pids` into a new transient scope under `slice`.
     pub fn start_scope(
         &self,
         name: &str,
@@ -61,11 +60,45 @@ impl Systemd {
         pids: &[ProcKey],
         limits: Option<Limits>,
     ) -> Result<()> {
+        self.with_live(name, pids, |p| self.call_start(name, slice, p, &limits))
+    }
+
+    /// Moves `pids` into `unit`, a scope that already runs: how a
+    /// newcomer joins a quarantined tree. A process moved into a frozen
+    /// cgroup stops as it lands (cgroup-v2.rst, "Cgroup Freezer"), so
+    /// there is no second freeze.
+    pub fn attach(&self, unit: &str, pids: &[ProcKey]) -> Result<()> {
+        self.with_live(unit, pids, |p| {
+            let mut a: Vec<String> = [
+                "call",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "AttachProcessesToUnit",
+                "ssau",
+                unit,
+                "",
+            ]
+            .map(String::from)
+            .into();
+            a.push(p.len().to_string());
+            a.extend(p.iter().map(|k| k.tgid.to_string()));
+            (self.run)(BUSCTL, &a).map(drop)
+        })
+    }
+
+    /// A pid that exits before systemd looks fails the whole call, so on
+    /// failure the dead ones are dropped and it is tried once more.
+    fn with_live(
+        &self,
+        name: &str,
+        pids: &[ProcKey],
+        call: impl Fn(&[ProcKey]) -> Result<()>,
+    ) -> Result<()> {
         if pids.is_empty() {
             bail!("no processes to move into {name}");
         }
-        let first = self.call_start(name, slice, pids, &limits);
-        let Err(e) = first else { return Ok(()) };
+        let Err(e) = call(pids) else { return Ok(()) };
         let live: Vec<ProcKey> = pids
             .iter()
             .copied()
@@ -77,7 +110,7 @@ impl Systemd {
         if live.is_empty() {
             return Err(e.context("the process tree had already exited"));
         }
-        self.call_start(name, slice, &live, &limits)
+        call(&live)
     }
 
     fn call_start(
@@ -273,6 +306,32 @@ mod tests {
         let c = take();
         assert_eq!(c.len(), 2);
         assert_eq!(&c[1][10..13], ["au", "1", "10"]);
+    }
+
+    #[test]
+    fn attach_builds_busctl_argv_and_retries_without_dead_pids() {
+        take();
+        Systemd::with(fail_once, alive_10)
+            .attach("u.scope", &[k(10), k(11)])
+            .unwrap();
+        let c = take();
+        let want = |n: &[&str]| {
+            let mut w: Vec<String> = [
+                "call",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "AttachProcessesToUnit",
+                "ssau",
+                "u.scope",
+                "",
+            ]
+            .map(String::from)
+            .into();
+            w.extend(n.iter().map(|s| s.to_string()));
+            w
+        };
+        assert_eq!(c, [want(&["2", "10", "11"]), want(&["1", "10"])]);
     }
 
     #[test]

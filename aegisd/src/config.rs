@@ -253,6 +253,45 @@ impl Default for QuarantineConfig {
     }
 }
 
+fn percent<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let v = u32::deserialize(d)?;
+    if (1..=100).contains(&v) {
+        Ok(v)
+    } else {
+        Err(de::Error::custom(format!("must be 1 to 100, got {v}")))
+    }
+}
+
+fn at_least_16<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let v = u32::deserialize(d)?;
+    if v >= 16 {
+        Ok(v)
+    } else {
+        Err(de::Error::custom(format!("must be at least 16, got {v}")))
+    }
+}
+
+/// The limits a throttled tree runs under (enforce mode).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThrottleConfig {
+    /// Percent of one CPU.
+    #[serde(deserialize_with = "percent")]
+    pub cpu_quota_percent: u32,
+    /// Above this the kernel reclaims hard and slows the tree down.
+    #[serde(deserialize_with = "at_least_16")]
+    pub memory_high_mb: u32,
+}
+
+impl Default for ThrottleConfig {
+    fn default() -> Self {
+        Self {
+            cpu_quota_percent: 25,
+            memory_high_mb: 256,
+        }
+    }
+}
+
 /// Where to send OTLP logs (`http://` or `https://`).
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -346,6 +385,7 @@ pub struct Config {
     pub scoring: ScoringConfig,
     pub allowlist: Allowlist,
     pub quarantine: QuarantineConfig,
+    pub throttle: ThrottleConfig,
     pub telemetry: TelemetryConfig,
     pub incidents: IncidentConfig,
 }
@@ -637,6 +677,8 @@ mod tests {
         assert_eq!(c.general.score_threshold_quarantine, 80);
         assert_eq!(c.quarantine.overlay_max_size_mb, 512);
         assert_eq!(c.quarantine.auto_expire_seconds, 3600);
+        assert_eq!(c.throttle.cpu_quota_percent, 25);
+        assert_eq!(c.throttle.memory_high_mb, 256);
         assert_eq!(c.scoring.half_life_secs, 30.0);
         assert_eq!(c.scoring.weights.tmp_exec, 25.0);
         let w = &c.scoring.weights;
@@ -822,6 +864,8 @@ mod tests {
             "scoring.scan.failed_connects",
             "quarantine.overlay_max_size_mb",
             "quarantine.auto_expire_seconds",
+            "throttle.cpu_quota_percent",
+            "throttle.memory_high_mb",
             "incidents.dir",
         ] {
             let mut v = Some(&table);
@@ -890,6 +934,28 @@ mod tests {
             let e = load(&t, body).unwrap_err();
             assert!(e.message.contains("at least 1"), "{e}");
         }
+    }
+
+    #[test]
+    fn throttle_limits_out_of_range_rejected() {
+        let t = Dir::new("throttle");
+        for (body, want) in [
+            ("cpu_quota_percent = 0", "1 to 100"),
+            ("cpu_quota_percent = 101", "1 to 100"),
+            ("memory_high_mb = 15", "at least 16"),
+        ] {
+            let e = load(&t, &format!("[throttle]\n{body}\n")).unwrap_err();
+            assert!(e.message.contains(want), "{e}");
+        }
+        let c = load(
+            &t,
+            "[throttle]\ncpu_quota_percent = 100\nmemory_high_mb = 16\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (c.throttle.cpu_quota_percent, c.throttle.memory_high_mb),
+            (100, 16)
+        );
     }
 
     #[test]

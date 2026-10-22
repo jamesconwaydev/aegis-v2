@@ -11,6 +11,8 @@
 //! - **Incident writes** (fsync) go to a writer thread over a bounded
 //!   channel. Telemetry stays here, so a slow disk never holds up a
 //!   record.
+//! - **Enforcement** (enforce mode) is queued in `to_enforce` for the
+//!   caller to hand to the enforcer thread.
 //!
 //! Only executables an allowlist entry or a pin names are verified: for
 //! any other a verdict changes nothing, so it stays Unverified at no
@@ -28,7 +30,7 @@
 //! showed a signal kind it hadn't before, or a minute has passed since
 //! the incident last spoke. The rest are counted in `incident_suppressed`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -38,6 +40,7 @@ use std::time::{Duration, Instant};
 use aegis_common::{Event, EventKind, EXEC_MEMFD, PATH_TRUNCATED};
 
 use crate::config::{Config, Mode};
+use crate::enforce::enforcer::{target_set, EnforceJob};
 use crate::incident::{new_incident_id, verdict, IncidentStore};
 use crate::proctable::{env_taint, ProcInfo, ProcKey, ProcTable, UNREADABLE};
 use crate::scoring::{
@@ -152,7 +155,8 @@ pub struct Pipeline {
     scan: ScanDetector,
     daemons: Box<dyn DaemonClassifier>,
     incidents: Incidents,
-    pub sinks: Sinks,
+    /// Shared with the enforcer, which reports its failures here too.
+    pub sinks: Arc<Sinks>,
     mode: Mode,
     /// Verifications in flight, by what is being verified: who is
     /// waiting, and the exe each had when it asked.
@@ -182,6 +186,13 @@ pub struct Pipeline {
     // ponytail: one entry per incident for the daemon's life, like the
     // store's own map; evict both together if that ever matters.
     spoken: HashMap<String, Spoken>,
+    /// Per incident id, the tier enforcement was last asked for and the
+    /// processes it covered: each kind is sent once, and after that only
+    /// a newcomer to a quarantined tree gets a job of its own.
+    // ponytail: kept for the daemon's life, like `spoken`.
+    enforced: HashMap<String, (Tier, HashSet<ProcKey>)>,
+    /// Enforcement for the caller to queue (enforce mode only).
+    pub to_enforce: Vec<EnforceJob>,
     /// Incident membership on the loop, by a local group number: the
     /// same grouping rule the store applies, kept here so the incident
     /// score can be computed without waiting on the writer thread.
@@ -217,7 +228,7 @@ impl Pipeline {
             scan: ScanDetector::new(cfg.scoring.scan.clone()),
             daemons,
             incidents,
-            sinks,
+            sinks: Arc::new(sinks),
             mode: cfg.general.mode,
             pending: HashMap::new(),
             deferred: HashMap::new(),
@@ -232,6 +243,8 @@ impl Pipeline {
             env_auto: None,
             verify_paths: cfg.allowlist.verify_paths(),
             spoken: HashMap::new(),
+            enforced: HashMap::new(),
+            to_enforce: Vec::new(),
             // Seeded once from what the store loaded, so an incident opened
             // before a restart keeps its members. After this the store is
             // never asked: its lock must stay off the event loop's path.
@@ -773,6 +786,9 @@ impl Pipeline {
             return;
         }
         self.said(&g, subject.key, &d, ts_ns);
+        if self.mode == Mode::Enforce {
+            self.enforce(&g, subject.key, d.tier);
+        }
         let incident = g;
         self.sinks.emit(&TelemetryRecord {
             ts_unix_ns: now_ns(),
@@ -789,6 +805,48 @@ impl Pipeline {
                 .map(|e| e.as_os_str().as_encoded_bytes().to_vec()),
             target: target.map(|t| t.as_os_str().as_encoded_bytes().to_vec()),
             reasons: d.evidence.iter().map(|e| e.reason.clone()).collect(),
+        });
+    }
+
+    /// Queues enforcement for incident `g`, now at `tier` after `key`'s
+    /// decision: the whole tree the first time it reaches each tier, and
+    /// once quarantined, any process the quarantine didn't cover.
+    fn enforce(&mut self, g: &str, key: ProcKey, tier: Tier) {
+        let me = std::process::id();
+        if let Some((Tier::Quarantine, covered)) = self.enforced.get_mut(g) {
+            if covered.contains(&key) {
+                return;
+            }
+            let pids: Vec<ProcKey> = target_set(&self.table, &[key], me)
+                .into_iter()
+                .filter(|k| !covered.contains(k))
+                .collect();
+            if !pids.is_empty() {
+                covered.extend(&pids);
+                self.to_enforce
+                    .push(EnforceJob::Quarantine { id: g.into(), pids });
+            }
+            return;
+        }
+        if tier == Tier::Log || self.enforced.get(g).is_some_and(|e| e.0 >= tier) {
+            return;
+        }
+        let members: Vec<ProcKey> = self
+            .groups
+            .iter()
+            .filter(|(_, v)| *v == g)
+            .map(|(k, _)| *k)
+            .collect();
+        let pids = target_set(&self.table, &members, me);
+        if pids.is_empty() {
+            return;
+        }
+        self.enforced
+            .insert(g.into(), (tier, pids.iter().copied().collect()));
+        let id = g.into();
+        self.to_enforce.push(match tier {
+            Tier::Quarantine => EnforceJob::Quarantine { id, pids },
+            _ => EnforceJob::Throttle { id, pids },
         });
     }
 
@@ -1743,6 +1801,52 @@ mod tests {
         for l in text.lines() {
             let r: serde_json::Value = serde_json::from_str(l).unwrap();
             assert_eq!(r["incident"], id);
+        }
+    }
+
+    fn tgids(pids: &[ProcKey]) -> Vec<u32> {
+        pids.iter().map(|k| k.tgid).collect()
+    }
+
+    #[test]
+    fn audit_mode_emits_no_enforce_jobs() {
+        let (mut p, _d) = pipeline("enf-audit");
+        split_chain(&mut p, 80, 81, 80);
+        assert!(p.to_enforce.is_empty());
+    }
+
+    #[test]
+    fn enforce_mode_emits_throttle_then_quarantine_once() {
+        let (mut p, _d) = pipeline("enf-on");
+        p.mode = Mode::Enforce;
+        split_chain(&mut p, 80, 81, 80);
+        let id = p.store().list()[0].id.clone();
+        // bash 79, the shell's parent, is never in either set.
+        match &p.to_enforce[..] {
+            [EnforceJob::Throttle { id: a, pids: t }, EnforceJob::Quarantine { id: b, pids: q }] => {
+                assert_eq!((a, b), (&id, &id));
+                assert_eq!(tgids(t), [80, 81]);
+                assert_eq!(tgids(q), [80, 81]);
+            }
+            j => panic!("{j:?}"),
+        }
+    }
+
+    #[test]
+    fn newcomer_to_a_quarantined_incident_gets_its_own_job() {
+        let (mut p, _d) = pipeline("enf-new");
+        p.mode = Mode::Enforce;
+        split_chain(&mut p, 80, 81, 80);
+        p.to_enforce.clear();
+        // Already covered: a member scoring again sends nothing.
+        p.handle(&ptrace_pid1(81));
+        assert!(p.to_enforce.is_empty());
+        p.handle(&fork(80, 90));
+        p.handle(&exec(90, "/tmp/z", EXEC_FROM_TMP));
+        p.verified(&exe_key("/tmp/z"), Verification::Unverified);
+        match &p.to_enforce[..] {
+            [EnforceJob::Quarantine { pids, .. }] => assert_eq!(tgids(pids), [90]),
+            j => panic!("{j:?}"),
         }
     }
 

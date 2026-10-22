@@ -194,6 +194,10 @@ impl ProcTable {
         self.procs.get(k)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &ProcInfo> {
+        self.procs.values()
+    }
+
     /// The live process with this tgid, if we know it.
     // ponytail: linear scan; index by tgid if the table gets large.
     pub fn by_tgid(&self, tgid: u32) -> Option<&ProcInfo> {
