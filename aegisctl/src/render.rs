@@ -375,6 +375,11 @@ pub fn timeline(lines: &[Value], incident: Option<&Value>) -> String {
     }
 }
 
+/// What a release or kill reports, safe to print.
+pub fn done(msg: &str) -> String {
+    clean(msg) + "\n"
+}
+
 pub fn preflight(checks: &[Check], colour: bool) -> String {
     let mut o = String::new();
     let w = checks.iter().map(|c| c.check.len()).max().unwrap_or(0);
@@ -398,6 +403,15 @@ pub fn preflight(checks: &[Check], colour: bool) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn render_release_done() {
+        assert_eq!(
+            done("released AEG-1: thawed, network restored"),
+            "released AEG-1: thawed, network restored\n"
+        );
+        assert_eq!(done("killed\x1b[2J"), "killed\\x1b[2J\n");
+    }
 
     #[test]
     fn monotonic_to_wall() {

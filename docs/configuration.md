@@ -48,8 +48,8 @@ is an error, reported with the file, line and column (wrapped here to
 fit the page):
 
 ```text
-/etc/aegis-v2/config.toml:2:8: enforce mode is not available in this
-release (planned for v0.2.0)
+/etc/aegis-v2/config.toml:2:8: enforce mode needs nftables (dnf
+install nftables)
 ```
 
 An invalid file at startup stops aegisd with exit status 78, and the
@@ -63,8 +63,12 @@ unit doesn't retry. Fix the file and start it again.
 | `score_threshold_throttle`   | integer | `50`      |
 | `score_threshold_quarantine` | integer | `80`      |
 
-- `mode`: `"audit"` is the only mode v0.1 accepts. `"enforce"` is rejected with
-  the error above.
+- `mode`: `"audit"` scores and records what Aegis would do. From v0.2.0,
+  `"enforce"` also does it. aegisd refuses `"enforce"` unless the BPF
+  LSM is on (`bpf` in `/sys/kernel/security/lsm`; see
+  [preflight](preflight.md#bpf-lsm)) and `/usr/sbin/nft` exists. The
+  error points at the `mode` line, as above. A reload that fails this
+  check keeps the old configuration.
 
 - `score_threshold_throttle`: A score at or above this records
   `would_throttle`. Must be lower than `score_threshold_quarantine`.

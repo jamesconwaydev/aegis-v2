@@ -19,8 +19,21 @@ pub const MAX_REQUEST: usize = 64 * 1024;
 pub enum Request {
     Status,
     IncidentsList,
-    IncidentShow { id: String },
-    IncidentTimeline { id: String },
+    IncidentShow {
+        id: String,
+    },
+    IncidentTimeline {
+        id: String,
+    },
+    /// Thaw a quarantined tree and restore its network, or lift a
+    /// throttle's limits. From v0.2.0.
+    IncidentRelease {
+        id: String,
+    },
+    /// SIGKILL a quarantined tree. From v0.2.0.
+    IncidentKill {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -58,6 +71,8 @@ pub enum Response {
     Incident(Value),
     /// The incident's `timeline.jsonl`, one value per line.
     Timeline(Vec<Value>),
+    /// What a release or kill did, one line.
+    Done(String),
     #[serde(rename = "error")]
     Error(String),
 }
@@ -139,6 +154,14 @@ pub fn clean(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_and_kill_wire_format() {
+        let r: Request = serde_json::from_str(r#"{"IncidentKill":{"id":"AEG-1"}}"#).unwrap();
+        assert_eq!(r, Request::IncidentKill { id: "AEG-1".into() });
+        let line = serde_json::to_string(&Response::Done("killed AEG-1".into())).unwrap();
+        assert_eq!(line, r#"{"Done":"killed AEG-1"}"#);
+    }
 
     #[test]
     fn wire_format() {

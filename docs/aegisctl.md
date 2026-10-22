@@ -19,11 +19,13 @@ aegisctl [--socket <path>] [--json] <command>
 
 ## Exit codes
 
-| Code | Meaning                                             |
-| ---- | --------------------------------------------------- |
-| 0    | success                                             |
-| 1    | an error (printed to stderr), or a preflight `FAIL` |
-| 2    | preflight only: warnings, no failures               |
+| Code | Meaning                                              |
+| ---- | ---------------------------------------------------- |
+| 0    | success                                              |
+| 1    | an error (printed to stderr), or a preflight `FAIL`  |
+| 2    | preflight only: warnings, no failures                |
+
+A refused `incidents release` or `incidents kill` is an error too.
 
 ## `status`
 
@@ -180,6 +182,51 @@ A timeline that reached its 10,000-line cap ends with a row saying
 With `--json`, you get the lines of `timeline.jsonl` as a JSON array;
 see [incidents](incidents.md#timelinejsonl).
 
+## `incidents release <id>`
+
+From v0.2.0.
+
+```sh
+aegisctl incidents release AEG-20261019-093000-0123456789abcdef
+```
+
+Undoes what enforce mode did to an incident. A quarantined tree is
+thawed and its network comes back; a throttled one loses its CPU and
+memory limits. The tree stays where it is, so its accounting remains
+under `aegis-quarantine.slice`.
+
+```text
+released AEG-20261019-093000-0123456789abcdef: thawed, network restored
+```
+
+A throttle prints `released <id>: limits lifted` instead. It works from
+the actions recorded on the incident, so it still works after a daemon
+restart, and after you've switched `mode` back to `"audit"`.
+
+It refuses, with exit code 1, an incident that was never enforced
+(`<id> was never enforced`) and one already released
+(`<id> is already released`).
+
+With `--json`, you get `{"done": "<the line above>"}`.
+
+## `incidents kill <id>`
+
+From v0.2.0.
+
+```sh
+aegisctl incidents kill AEG-20261019-093000-0123456789abcdef
+```
+
+Sends SIGKILL to a quarantined tree, frozen or not, and removes its
+network rule. It prints `killed <id>`.
+
+A throttled incident has nothing to kill: aegisctl says
+`<id> was only throttled; release it instead`. Kill also refuses an
+incident that was never enforced or was already released or killed.
+Every refusal exits 1.
+
+With `--json`, you get `{"done": "killed <id>"}`.
+
 ## Text from processes
 
 Paths and process names come from whatever ran, and an attacker
@@ -197,6 +244,10 @@ Errors go to stderr, prefixed with `aegisctl:`, with exit code 1.
 - `aegisd: no such incident`: no incident has that id.
 - `no reply from aegisd within 30 s`: the daemon is stuck or
   overloaded.
+- `aegisd: enforcer busy, try again`: release and kill (from v0.2.0)
+  found the enforcer's queue full.
+- `aegisd: timed out waiting for the enforcer`: it was still working
+  after 30 s. Check the incident before retrying.
 
 Replies over 16 MiB are refused rather than read.
 

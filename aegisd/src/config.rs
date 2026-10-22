@@ -488,10 +488,26 @@ fn unconfined_warning(path: &Path, a: &Allowlist) -> Option<Warning> {
         })
 }
 
+/// Where enforce mode looks for what it needs, so tests can point
+/// elsewhere.
+pub struct Host {
+    pub lsm_file: PathBuf,
+    pub nft: PathBuf,
+}
+
+impl Host {
+    pub fn real() -> Self {
+        Self {
+            lsm_file: "/sys/kernel/security/lsm".into(),
+            nft: "/usr/sbin/nft".into(),
+        }
+    }
+}
+
 impl Config {
     #[cfg(test)]
-    pub fn load(main: &Path, dropin_dir: &Path) -> Result<Config, ConfigError> {
-        Self::load_checked(main, dropin_dir).map(|(c, _)| c)
+    pub fn load(main: &Path, dropin_dir: &Path, host: &Host) -> Result<Config, ConfigError> {
+        Self::load_on(main, dropin_dir, host).map(|(c, _)| c)
     }
 
     /// Like `load`, plus warnings for settings that are legal but unwise.
@@ -502,18 +518,37 @@ impl Config {
         main: &Path,
         dropin_dir: &Path,
     ) -> Result<(Config, Vec<Warning>), ConfigError> {
+        Self::load_on(main, dropin_dir, &Host::real())
+    }
+
+    fn load_on(
+        main: &Path,
+        dropin_dir: &Path,
+        host: &Host,
+    ) -> Result<(Config, Vec<Warning>), ConfigError> {
         let src = read(main)?;
         let mut cfg: Config = parse(main, &src)?;
 
         let spans: Spans = parse(main, &src)?;
         let start = |o: &Option<Spanned<_>>| o.as_ref().map(|v| v.span().start);
         if cfg.general.mode == Mode::Enforce {
-            return Err(ConfigError::at(
-                main,
-                &src,
-                spans.general.mode.as_ref().map(|v| v.span().start),
-                "enforce mode is not available in this release (planned for v0.2.0)",
-            ));
+            let bpf_lsm = std::fs::read_to_string(&host.lsm_file)
+                .is_ok_and(|l| l.trim().split(',').any(|m| m == "bpf"));
+            let msg = if !bpf_lsm {
+                Some("enforce mode needs the BPF LSM (see docs/preflight.md#bpf-lsm)")
+            } else if !host.nft.is_file() {
+                Some("enforce mode needs nftables (dnf install nftables)")
+            } else {
+                None
+            };
+            if let Some(msg) = msg {
+                return Err(ConfigError::at(
+                    main,
+                    &src,
+                    spans.general.mode.as_ref().map(|v| v.span().start),
+                    msg,
+                ));
+            }
         }
         if let Some(msg) = cfg.telemetry.otlp.as_ref().and_then(|o| o.validate().err()) {
             return Err(ConfigError::at(main, &src, None, msg));
@@ -640,8 +675,16 @@ mod tests {
         }
     }
 
+    /// A host with neither the BPF LSM nor nft, whatever this machine has.
+    fn bare(t: &Dir) -> Host {
+        Host {
+            lsm_file: t.0.join("no-lsm"),
+            nft: t.0.join("no-nft"),
+        }
+    }
+
     fn load(t: &Dir, body: &str) -> Result<Config, ConfigError> {
-        Config::load(&t.main(body), &t.dir())
+        Config::load(&t.main(body), &t.dir(), &bare(t))
     }
 
     #[test]
@@ -713,14 +756,46 @@ mod tests {
     }
 
     #[test]
-    fn enforce_rejected_in_v0_1() {
-        let t = Dir::new("enforce");
-        let e = load(&t, "[general]\nmode = \"enforce\"\n").unwrap_err();
+    fn enforce_refused_without_bpf_lsm() {
+        let t = Dir::new("enforce-lsm");
+        let host = bare(&t);
+        std::fs::write(&host.lsm_file, "lockdown,capability,selinux\n").unwrap();
+        std::fs::write(&host.nft, "").unwrap();
+        let m = t.main("[general]\nmode = \"enforce\"\n");
+        let e = Config::load(&m, &t.dir(), &host).unwrap_err();
         assert_eq!(
             e.message,
-            "enforce mode is not available in this release (planned for v0.2.0)"
+            "enforce mode needs the BPF LSM (see docs/preflight.md#bpf-lsm)"
         );
         assert_eq!(e.line_col, Some((2, 8)));
+        // Neither file at all: still the LSM message, first.
+        let e = load(&t, "[general]\nmode = \"enforce\"\n").unwrap_err();
+        assert!(e.message.contains("BPF LSM"), "{e}");
+    }
+
+    #[test]
+    fn enforce_refused_without_nft() {
+        let t = Dir::new("enforce-nft");
+        let host = bare(&t);
+        std::fs::write(&host.lsm_file, "lockdown,bpf\n").unwrap();
+        let m = t.main("[general]\nmode = \"enforce\"\n");
+        let e = Config::load(&m, &t.dir(), &host).unwrap_err();
+        assert_eq!(
+            e.message,
+            "enforce mode needs nftables (dnf install nftables)"
+        );
+        assert_eq!(e.line_col, Some((2, 8)));
+    }
+
+    #[test]
+    fn enforce_accepted_with_lsm_and_nft() {
+        let t = Dir::new("enforce-ok");
+        let host = bare(&t);
+        std::fs::write(&host.lsm_file, "lockdown,capability,selinux,bpf\n").unwrap();
+        std::fs::write(&host.nft, "").unwrap();
+        let m = t.main("[general]\nmode = \"enforce\"\n");
+        let c = Config::load(&m, &t.dir(), &host).unwrap();
+        assert_eq!(c.general.mode, Mode::Enforce);
     }
 
     #[test]
@@ -908,8 +983,10 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.line_col.unwrap().0, 3, "{e}");
-        let e = load(&t, "x = 1\n[scoring]\n[general]\nmode = \"enforce\"\n").unwrap_err();
-        assert!(e.line_col.is_some());
+        // `load` runs on a bare host, so enforce fails on its span.
+        let e = load(&t, "[scoring]\n[general]\nmode = \"enforce\"\n").unwrap_err();
+        assert_eq!(e.line_col.unwrap().0, 3);
+        assert!(e.message.contains("BPF LSM"), "{e}");
         let e = load(&t, "general = { mode = \"enforce\" }\n").unwrap_err();
         assert_eq!(e.line_col.unwrap().0, 1);
     }

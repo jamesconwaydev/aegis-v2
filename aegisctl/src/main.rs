@@ -48,6 +48,11 @@ enum Inc {
     Show { id: String },
     /// Show what happened in an incident, one line per decision.
     Timeline { id: String },
+    /// Thaw a quarantined tree and restore its network, or lift a
+    /// throttle's limits. From v0.2.0.
+    Release { id: String },
+    /// SIGKILL a quarantined tree. From v0.2.0.
+    Kill { id: String },
 }
 
 const MAX_REPLY: usize = 16 * 1024 * 1024;
@@ -147,14 +152,19 @@ fn run(cli: &Cli) -> Result<(String, u8), String> {
         }
         Cmd::Status => Request::Status,
         Cmd::Incidents(Inc::List) => Request::IncidentsList,
-        Cmd::Incidents(Inc::Show { id: i } | Inc::Timeline { id: i })
-            if !aegis_proto::is_incident_id(i) =>
-        {
+        Cmd::Incidents(
+            Inc::Show { id: i }
+            | Inc::Timeline { id: i }
+            | Inc::Release { id: i }
+            | Inc::Kill { id: i },
+        ) if !aegis_proto::is_incident_id(i) => {
             return Err(format!(
                 "{i} is not an incident id (AEG-YYYYMMDD-HHMMSS- and 16 hex digits)"
             ));
         }
         Cmd::Incidents(Inc::Show { id }) => Request::IncidentShow { id: id.clone() },
+        Cmd::Incidents(Inc::Release { id }) => Request::IncidentRelease { id: id.clone() },
+        Cmd::Incidents(Inc::Kill { id }) => Request::IncidentKill { id: id.clone() },
         Cmd::Incidents(Inc::Timeline { id: i }) => {
             id = i.clone();
             Request::IncidentTimeline { id: i.clone() }
@@ -162,6 +172,8 @@ fn run(cli: &Cli) -> Result<(String, u8), String> {
     };
     let resp = call(&cli.socket, &req)?;
     let out = match (&resp, cli.json) {
+        (Response::Done(m), true) => pretty(&serde_json::json!({ "done": m })),
+        (Response::Done(m), false) => render::done(m),
         (Response::Timeline(lines), true) => pretty(&Value::Array(lines.clone())),
         (_, true) => pretty(&payload(&resp)),
         (Response::Status { .. }, false) => render::status(&resp).unwrap(),

@@ -4,7 +4,8 @@
 # Allowlist rules live in /etc/aegis-v2/allowlist.d/*.toml.
 
 [general]
-# "audit" scores and logs but never acts. "enforce" arrives in v0.2.0.
+# "audit" scores and logs but never acts. "enforce" (from v0.2.0) acts on
+# incidents; the daemon refuses it unless the BPF LSM and nft are present.
 mode = "audit"
 # Scores at or above these trigger the action. throttle must be lower.
 score_threshold_throttle = 50

@@ -93,11 +93,14 @@ the policy module only confines it when SELinux is enforcing.
 
 Looks for an `nft` executable on `PATH`.
 
-- **On failure:** `WARN` (`nft not found (needed from v0.2.0)`)
+- **On failure:** `FAIL` if `/etc/aegis-v2/config.toml` sets
+  `mode = "enforce"`, otherwise `WARN` (`nft not found (needed for
+  enforce mode, from v0.2.0)`)
 - **Fix:** `dnf install nftables`
 
-v0.1 never calls `nft`. Egress control in v0.2.0 will, which is why the
-package already requires `nftables`.
+Audit mode never calls `nft`. Enforce mode, from v0.2.0, uses it to cut
+a quarantined tree's network, and aegisd won't start in enforce mode
+without it. A config that is missing or unreadable counts as audit.
 
 ### criu
 

@@ -102,6 +102,25 @@ fn kernel_ok(rel: &str) -> bool {
     (major, minor) >= (6, 12)
 }
 
+/// Whether `[general]` sets `mode = "enforce"`. Line-based and lenient:
+/// preflight must work on a file aegisd would reject.
+fn config_enforces(src: &str) -> bool {
+    let mut general = false;
+    for l in src.lines() {
+        let l = l.split('#').next().unwrap_or("").trim();
+        if l.starts_with('[') {
+            general = l == "[general]";
+        } else if general {
+            if let Some((k, v)) = l.split_once('=') {
+                if k.trim() == "mode" {
+                    return v.trim().trim_matches(|c| c == '"' || c == '\'') == "enforce";
+                }
+            }
+        }
+    }
+    false
+}
+
 fn on_path(dirs: &[PathBuf], name: &str) -> bool {
     dirs.iter().any(|d| d.join(name).is_file())
 }
@@ -201,12 +220,19 @@ impl Preflight {
             "setenforce 1, and set SELINUX=enforcing in /etc/selinux/config.",
         ));
 
+        // Enforce mode needs nft; in audit mode it is only advice. A
+        // missing or unreadable config counts as audit.
+        let enforce = read(root, "/etc/aegis-v2/config.toml").is_some_and(|c| config_enforces(&c));
         out.push(mk(
             "nft",
             on_path(path, "nft"),
-            Status::Warn,
+            if enforce { Status::Fail } else { Status::Warn },
             "nft found".into(),
-            "nft not found (needed from v0.2.0)".into(),
+            if enforce {
+                "nft not found, and the config sets mode = \"enforce\"".into()
+            } else {
+                "nft not found (needed for enforce mode, from v0.2.0)".into()
+            },
             "dnf install nftables",
         ));
         out.push(mk(
@@ -369,9 +395,30 @@ mod tests {
         put(&f.root, "sys/fs/selinux/enforce", "0");
         let c = Preflight::run(&f.root);
         assert!(get(&c, "criu").detail.contains("needed from v0.4.0"));
-        // v0.1 never touches nftables: missing it is only a warning.
+        // Audit mode never touches nftables: missing it is only a warning.
         assert_eq!(get(&c, "nft").status, Status::Warn);
-        assert!(get(&c, "nft").detail.contains("needed from v0.2.0"));
+        assert!(get(&c, "nft").detail.contains("enforce mode"));
         assert_eq!(exit_code(&c), 2);
+    }
+
+    #[test]
+    fn missing_nft_fails_when_the_config_enforces() {
+        let f = fixture("nft-enforce");
+        fs::remove_file(f.root.join("usr/bin/nft")).unwrap();
+        put(
+            &f.root,
+            "etc/aegis-v2/config.toml",
+            "[scoring]\nmode = \"audit\"\n[general]\nmode = \"enforce\" # on\n",
+        );
+        let c = Preflight::run(&f.root);
+        assert_eq!(get(&c, "nft").status, Status::Fail);
+        assert_eq!(exit_code(&c), 1);
+        // Unreadable or audit configs stay a warning.
+        put(
+            &f.root,
+            "etc/aegis-v2/config.toml",
+            "[general]\nmode = \"audit\"\n",
+        );
+        assert_eq!(get(&Preflight::run(&f.root), "nft").status, Status::Warn);
     }
 }

@@ -36,25 +36,11 @@ pub type Reply = tokio::sync::oneshot::Sender<Result<String, String>>;
 
 #[derive(Debug)]
 pub enum EnforceJob {
-    Throttle {
-        id: String,
-        pids: Vec<ProcKey>,
-    },
-    Quarantine {
-        id: String,
-        pids: Vec<ProcKey>,
-    },
-    // Sent by `aegisctl incidents release|kill`, which comes next.
-    #[allow(dead_code)]
-    Release {
-        id: String,
-        reply: Option<Reply>,
-    },
-    #[allow(dead_code)]
-    Kill {
-        id: String,
-        reply: Option<Reply>,
-    },
+    Throttle { id: String, pids: Vec<ProcKey> },
+    Quarantine { id: String, pids: Vec<ProcKey> },
+    // Sent by `aegisctl incidents release|kill`.
+    Release { id: String, reply: Option<Reply> },
+    Kill { id: String, reply: Option<Reply> },
 }
 
 pub struct EnforcerHandle {
@@ -366,6 +352,7 @@ impl Enforcer {
             .iter()
             .any(|a| holding(a) || (a.ok && a.unit.as_deref() == Some(unit.as_str())));
         let mut acts = Vec::new();
+        let mut done = format!("released {id}: limits lifted");
         if quarantined {
             if prior.iter().any(|a| a.ok && a.kind == "freeze") {
                 let r = self.sys.thaw(&unit);
@@ -387,6 +374,7 @@ impl Enforcer {
             };
             acts.push(act("unhold", None, pids.into_iter().collect(), r));
             self.remove_rules(&prior, &unit, &mut acts);
+            done = format!("released {id}: thawed, network restored");
             // ponytail: the tree stays in its -q scope, so its accounting
             // lives under aegis-quarantine.slice. Moving it back to its
             // original unit is AttachProcessesToUnit, if that's ever wanted.
@@ -395,7 +383,7 @@ impl Enforcer {
             let r = self.sys.lift_limits(&t);
             acts.push(act("lift_limits", Some(&t), vec![], r.map(|_| None)));
         }
-        self.conclude(id, acts, "released")
+        self.conclude(id, acts, done)
     }
 
     fn kill(&mut self, id: &str) -> Result<String, String> {
@@ -415,7 +403,7 @@ impl Enforcer {
         let r = self.sys.kill(&unit);
         let mut acts = vec![act("kill", Some(&unit), vec![], r.map(|_| None))];
         self.remove_rules(&prior, &unit, &mut acts);
-        self.conclude(id, acts, "killed")
+        self.conclude(id, acts, format!("killed {id}"))
     }
 
     /// Refuses an incident never enforced, or already released or killed.
@@ -441,12 +429,12 @@ impl Enforcer {
         &mut self,
         id: &str,
         acts: Vec<ActionRecord>,
-        what: &str,
+        done: String,
     ) -> Result<String, String> {
         let errs: Vec<String> = acts.iter().filter_map(|a| a.error.clone()).collect();
         self.finish(id, acts, None);
         if errs.is_empty() {
-            Ok(format!("{what} {id}"))
+            Ok(done)
         } else {
             Err(format!("{id}: {}", errs.join("; ")))
         }
@@ -872,6 +860,132 @@ mod tests {
         });
         assert!(rx.try_recv().unwrap().is_err());
         assert!(take().is_empty());
+    }
+
+    fn run_reply(
+        e: &mut Enforcer,
+        job: impl FnOnce(Option<Reply>) -> EnforceJob,
+    ) -> Result<String, String> {
+        let (r, mut rx) = reply();
+        e.run(job(r));
+        rx.try_recv().unwrap()
+    }
+
+    #[test]
+    fn release_refuses_incident_without_actions() {
+        let mut f = fx("rel-none", ok);
+        let id = f.id.clone();
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release {
+            id: id.clone(),
+            reply,
+        });
+        assert_eq!(r, Err(format!("{id} was never enforced")));
+    }
+
+    #[test]
+    fn release_refuses_twice() {
+        let mut f = fx("rel-twice", ok);
+        let id = f.id.clone();
+        f.e.run(EnforceJob::Quarantine {
+            id: id.clone(),
+            pids: vec![k(10)],
+        });
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release {
+            id: id.clone(),
+            reply,
+        });
+        assert_eq!(r, Ok(format!("released {id}: thawed, network restored")));
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release {
+            id: id.clone(),
+            reply,
+        });
+        assert_eq!(r, Err(format!("{id} was already released")));
+    }
+
+    #[test]
+    fn release_of_a_throttle_lifts_limits_and_kill_says_killed() {
+        let mut f = fx("rel-thr", ok);
+        let id = f.id.clone();
+        f.e.run(EnforceJob::Throttle {
+            id: id.clone(),
+            pids: vec![k(10)],
+        });
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release {
+            id: id.clone(),
+            reply,
+        });
+        assert_eq!(r, Ok(format!("released {id}: limits lifted")));
+        let mut f = fx("kill-ok", ok);
+        let id = f.id.clone();
+        f.e.run(EnforceJob::Quarantine {
+            id: id.clone(),
+            pids: vec![k(10)],
+        });
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Kill {
+            id: id.clone(),
+            reply,
+        });
+        assert_eq!(r, Ok(format!("killed {id}")));
+    }
+
+    #[test]
+    fn kill_refuses_throttle_only() {
+        let mut f = fx("kill-thr", ok);
+        let id = f.id.clone();
+        f.e.run(EnforceJob::Throttle {
+            id: id.clone(),
+            pids: vec![k(10)],
+        });
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Kill {
+            id: id.clone(),
+            reply,
+        });
+        assert_eq!(
+            r,
+            Err(format!("{id} was only throttled; release it instead"))
+        );
+    }
+
+    #[test]
+    fn release_after_restart_uses_recorded_actions() {
+        let mut f = fx("restart", ok);
+        let id = f.id.clone();
+        f.e.run(EnforceJob::Quarantine {
+            id: id.clone(),
+            pids: vec![k(10)],
+        });
+        take();
+        // A new process: same store directory, nothing in memory.
+        let store = IncidentStore::open_at(&f.dir, Some("boot".into()), 0).unwrap();
+        let mut e2 = Enforcer {
+            store: Arc::new(store),
+            holds: Holds::default(),
+            sys: Systemd::with(ok, alive),
+            nft: Nft::with(ok),
+            limits: Limits {
+                cpu_quota_percent: 25,
+                memory_high_bytes: 256 << 20,
+            },
+            sinks: Arc::new(Sinks::jsonl_at(&f.dir.with_extension("jsonl"))),
+            ok: Arc::default(),
+            failed: Arc::default(),
+            enforcing: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::default(),
+            wait: Duration::ZERO,
+            unsaved: HashMap::new(),
+        };
+        let r = run_reply(&mut e2, |reply| EnforceJob::Release {
+            id: id.clone(),
+            reply,
+        });
+        assert!(r.is_ok(), "{r:?}");
+        let c = take();
+        assert_eq!(
+            c[0][1..3],
+            ["thaw".to_string(), format!("aegis-incident-{id}-q.scope")]
+        );
+        assert_eq!(c[1][1..3], ["delete".to_string(), "rule".into()]);
+        assert_eq!(c[1].last().unwrap(), "7");
     }
 
     #[test]
