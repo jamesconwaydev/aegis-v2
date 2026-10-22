@@ -146,7 +146,11 @@ fn run(cmd: &mut Command) -> Result<()> {
 fn containerfile_hash() -> Result<String> {
     use sha2::{Digest, Sha256};
     let body = std::fs::read(root().join("build/Containerfile"))?;
-    Ok(format!("{:x}", Sha256::digest(body)))
+    // sha2 0.11 digests no longer implement LowerHex.
+    Ok(Sha256::digest(body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 const LABEL: &str = "aegis.containerfile";
