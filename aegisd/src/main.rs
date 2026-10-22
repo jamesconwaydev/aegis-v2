@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 mod config;
 mod ebpf;
+mod enforce;
 mod incident;
 mod ipc;
 mod pipeline;
