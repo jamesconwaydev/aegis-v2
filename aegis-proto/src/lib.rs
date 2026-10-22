@@ -91,6 +91,10 @@ pub struct TelemetryDropped {
     pub otlp_queue_full: u64,
     pub otlp_export_failed: u64,
     pub otlp_disconnected: u64,
+    #[serde(default)]
+    pub webhook_queue_full: u64,
+    #[serde(default)]
+    pub webhook_failed: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

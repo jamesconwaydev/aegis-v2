@@ -320,39 +320,104 @@ impl fmt::Debug for OtlpConfig {
 
 impl OtlpConfig {
     pub fn validate(&self) -> Result<(), String> {
-        let bad = |s: &str| s.chars().any(|c| c.is_control());
-        let host = self
-            .endpoint
-            .strip_prefix("http://")
-            .or_else(|| self.endpoint.strip_prefix("https://"))
-            .ok_or("otlp endpoint must start with http:// or https://")?;
-        if host.split('/').next().is_some_and(|a| a.contains('@')) {
-            return Err(
-                "otlp endpoint must not carry user:pass@; put credentials in [telemetry.otlp.headers]"
-                    .into(),
-            );
+        validate_http(
+            "otlp endpoint",
+            &self.endpoint,
+            self.timeout_secs,
+            &self.headers,
+            "[telemetry.otlp.headers]",
+        )
+    }
+}
+
+/// The rule for every outbound HTTP target: http or https, no
+/// credentials in the URL, sane timeout, headers that can't smuggle a
+/// second header.
+fn validate_http(
+    what: &str,
+    url: &str,
+    timeout_secs: u64,
+    headers: &BTreeMap<String, String>,
+    table: &str,
+) -> Result<(), String> {
+    let bad = |s: &str| s.chars().any(|c| c.is_control());
+    let host = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or(format!("{what} must start with http:// or https://"))?;
+    if host.split('/').next().is_some_and(|a| a.contains('@')) {
+        return Err(format!(
+            "{what} must not carry user:pass@; put credentials in {table}"
+        ));
+    }
+    if host.is_empty() || bad(url) || url.contains(' ') {
+        return Err(format!("{what} is empty or has control characters"));
+    }
+    if timeout_secs == 0 {
+        return Err(format!("{what} timeout_secs must be at least 1"));
+    }
+    for (k, v) in headers {
+        // RFC 7230 token characters.
+        let token = !k.is_empty()
+            && k.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+        if !token {
+            return Err(format!("{what} header name {k:?} is not a valid token"));
         }
-        if host.is_empty() || bad(&self.endpoint) || self.endpoint.contains(' ') {
-            return Err("otlp endpoint is empty or has control characters".into());
+        if bad(v) {
+            return Err(format!(
+                "{what} header {k} has control characters in its value"
+            ));
         }
-        if self.timeout_secs == 0 {
-            return Err("otlp timeout_secs must be at least 1".into());
-        }
-        for (k, v) in &self.headers {
-            // RFC 7230 token characters.
-            let token = !k.is_empty()
-                && k.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
-            if !token {
-                return Err(format!("otlp header name {k:?} is not a valid token"));
-            }
-            if bad(v) {
-                return Err(format!(
-                    "otlp header {k} has control characters in its value"
-                ));
-            }
-        }
-        Ok(())
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookFormat {
+    /// `{incident, verdict, score, ...}`
+    #[default]
+    Json,
+    /// `{"text": "<one-line message>"}`
+    Slack,
+}
+
+/// Where to post a note when an incident reaches throttle, then
+/// quarantine (`http://` or `https://`).
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    pub url: String,
+    #[serde(default)]
+    pub format: WebhookFormat,
+    /// Extra request headers, for auth tokens. Values are never logged.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default = "default_otlp_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl fmt::Debug for WebhookConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebhookConfig")
+            .field("url", &"<hidden>")
+            .field("format", &self.format)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
+impl WebhookConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_http(
+            "webhook url",
+            &self.url,
+            self.timeout_secs,
+            &self.headers,
+            "[telemetry.webhook.headers]",
+        )
     }
 }
 
@@ -362,6 +427,7 @@ impl OtlpConfig {
 pub struct TelemetryConfig {
     pub jsonl: Option<PathBuf>,
     pub otlp: Option<OtlpConfig>,
+    pub webhook: Vec<WebhookConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -554,6 +620,14 @@ impl Config {
         if let Some(msg) = cfg.telemetry.otlp.as_ref().and_then(|o| o.validate().err()) {
             return Err(ConfigError::at(main, &src, None, msg));
         }
+        if let Some(msg) = cfg
+            .telemetry
+            .webhook
+            .iter()
+            .find_map(|w| w.validate().err())
+        {
+            return Err(ConfigError::at(main, &src, None, msg));
+        }
         let (thr, quar) = (
             cfg.general.score_threshold_throttle,
             cfg.general.score_threshold_quarantine,
@@ -713,6 +787,33 @@ mod tests {
     }
 
     #[test]
+    fn webhook_config_validates() {
+        let t = Dir::new("webhook");
+        let c = load(
+            &t,
+            "[[telemetry.webhook]]\nurl = \"https://h/x\"\nformat = \"slack\"\n[telemetry.webhook.headers]\nAuthorization = \"Bearer s3cret\"\n[[telemetry.webhook]]\nurl = \"http://h\"\n",
+        )
+        .unwrap();
+        let w = &c.telemetry.webhook;
+        assert_eq!(
+            (w[0].format, w[1].format),
+            (WebhookFormat::Slack, WebhookFormat::Json)
+        );
+        assert_eq!(w[1].timeout_secs, 5);
+        assert!(!format!("{:?}", w[0]).contains("s3cret"));
+        for bad in [
+            "url = \"ftp://h\"",
+            "url = \"https://hooks.example.com/T0/s3cret@h\"\nformat = \"xml\"",
+            "url = \"https://user:pw@h/x\"",
+            "url = \"http://h\"\ntimeout_secs = 0",
+            "url = \"http://h\"\n[telemetry.webhook.headers]\nX = \"a\\r\\nB: c\"",
+        ] {
+            let r = load(&t, &format!("[[telemetry.webhook]]\n{bad}\n"));
+            assert!(r.is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn defaults_match_spec() {
         let t = Dir::new("defaults");
         let c = load(&t, "").unwrap();
@@ -749,7 +850,8 @@ mod tests {
             c.telemetry,
             TelemetryConfig {
                 jsonl: None,
-                otlp: None
+                otlp: None,
+                webhook: vec![]
             }
         );
         assert_eq!(c.allowlist, Allowlist::default());

@@ -10,6 +10,7 @@ use crate::scoring::Tier;
 pub mod journald;
 pub mod jsonl;
 pub mod otlp;
+pub mod webhook;
 
 pub struct TelemetryRecord {
     pub ts_unix_ns: u64,
@@ -91,6 +92,7 @@ pub struct Sinks {
     journald: journald::Journald,
     jsonl: Option<jsonl::JsonLines>,
     otlp: Option<otlp::Otlp>,
+    webhooks: Vec<webhook::Webhook>,
 }
 
 impl Sinks {
@@ -104,6 +106,15 @@ impl Sinks {
             journald: journald::Journald::new(),
             jsonl,
             otlp: cfg.otlp.as_ref().map(otlp::Otlp::new),
+            webhooks: cfg
+                .webhook
+                .iter()
+                .filter_map(|w| {
+                    webhook::Webhook::new(w)
+                        .inspect_err(|e| eprintln!("aegisd: telemetry webhook: {e:#}"))
+                        .ok()
+                })
+                .collect(),
         }
     }
 
@@ -114,6 +125,7 @@ impl Sinks {
             journald: journald::Journald::with_socket(None),
             jsonl: None,
             otlp: None,
+            webhooks: vec![],
         }
     }
 
@@ -124,6 +136,7 @@ impl Sinks {
             journald: journald::Journald::with_socket(None),
             jsonl: Some(jsonl::JsonLines::open(p).unwrap()),
             otlp: None,
+            webhooks: vec![],
         }
     }
 
@@ -135,6 +148,9 @@ impl Sinks {
         if let Some(s) = &self.otlp {
             s.emit(rec);
         }
+        for w in &self.webhooks {
+            w.emit(rec);
+        }
     }
 
     pub fn dropped(&self) -> aegis_proto::TelemetryDropped {
@@ -144,6 +160,8 @@ impl Sinks {
             otlp_queue_full: o.map_or(0, |o| o.dropped_queue_full()),
             otlp_export_failed: o.map_or(0, |o| o.dropped_export_failed()),
             otlp_disconnected: o.map_or(0, |o| o.dropped_disconnected()),
+            webhook_queue_full: self.webhooks.iter().map(|w| w.dropped_queue_full()).sum(),
+            webhook_failed: self.webhooks.iter().map(|w| w.dropped_failed()).sum(),
         }
     }
 }

@@ -56,6 +56,16 @@ dir = "/var/lib/aegis-v2/incidents"
 # timeout_secs = 5
 # [telemetry.otlp.headers]
 # Authorization = "Bearer <token>"
+#
+# Webhooks: one POST when an incident first reaches throttle, one when it
+# first reaches quarantine, and one per enforcement failure. Repeat the
+# table for more than one. Same SELinux boolean as OTLP.
+# [[telemetry.webhook]]
+# url = "https://hooks.slack.com/services/<path>"   # http:// or https://
+# format = "json"                        # or "slack"
+# timeout_secs = 5
+# [telemetry.webhook.headers]
+# Authorization = "Bearer <token>"
 
 # [allowlist] is optional here and usually lives in allowlist.d/.
 # Pin a binary that isn't in the RPM database by its SHA-256:

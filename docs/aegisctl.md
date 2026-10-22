@@ -51,6 +51,8 @@ telemetry dropped: journald            0
 telemetry dropped: otlp queue full     0
 telemetry dropped: otlp export failed  0
 telemetry dropped: otlp disconnected   0
+telemetry dropped: webhook queue full  0
+telemetry dropped: webhook failed      0
 
 probes
   aegis_exec_check   lsm/bprm_check_security

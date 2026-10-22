@@ -118,6 +118,14 @@ pub fn status(r: &Response) -> Option<String> {
             "telemetry dropped: otlp disconnected",
             t.otlp_disconnected.to_string(),
         ),
+        kv(
+            "telemetry dropped: webhook queue full",
+            t.webhook_queue_full.to_string(),
+        ),
+        kv(
+            "telemetry dropped: webhook failed",
+            t.webhook_failed.to_string(),
+        ),
     ];
     let mut out = table(&rows);
     rows = probes
@@ -491,6 +499,8 @@ mod tests {
                 otlp_queue_full: 9,
                 otlp_export_failed: 10,
                 otlp_disconnected: 11,
+                webhook_queue_full: 14,
+                webhook_failed: 15,
             },
         };
         let o = status(&r).unwrap();
@@ -508,6 +518,8 @@ mod tests {
             ("otlp queue full", "9"),
             ("otlp export failed", "10"),
             ("otlp disconnected", "11"),
+            ("webhook queue full", "14"),
+            ("webhook failed", "15"),
         ] {
             assert!(
                 o.lines()

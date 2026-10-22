@@ -184,8 +184,9 @@ These should stay at 0. Each one that grows means something was lost.
   incident.
 - **telemetry dropped: journald:** journald was away or its buffer was
   full. Check `systemctl status systemd-journald`.
-- **telemetry dropped: otlp ...:** see
-  [telemetry](telemetry.md#failure-handling).
+- **telemetry dropped: otlp ... or webhook ...:** see
+  [telemetry](telemetry.md#failure-handling) and
+  [webhooks](telemetry.md#retries-and-drops).
 
 `incident repeats not recorded` is different: it counts decisions inside
 an open incident that added nothing new, and it grows in normal use.

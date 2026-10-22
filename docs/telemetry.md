@@ -1,17 +1,21 @@
 # Telemetry
 
 Every recorded incident decision produces one telemetry record, sent to
-up to three sinks. That's the first decision at the throttle tier or
+up to four sinks. That's the first decision at the throttle tier or
 above, and after it, only the ones that add something: the incident's
 tier rose, a process showed a signal kind for the first time, or 60
 seconds have passed since the incident last recorded. Repeats and
 decisions below the throttle tier produce none.
 
-| Sink       | On by default | Configured in        |
-| ---------- | ------------- | -------------------- |
-| journald   | always        | nothing to configure |
-| JSON lines | no            | `[telemetry] jsonl`  |
-| OTLP logs  | no            | `[telemetry.otlp]`   |
+| Sink       | On by default | Configured in           |
+| ---------- | ------------- | ----------------------- |
+| journald   | always        | nothing to configure    |
+| JSON lines | no            | `[telemetry] jsonl`     |
+| OTLP logs  | no            | `[telemetry.otlp]`      |
+| Webhooks   | no            | `[[telemetry.webhook]]` |
+
+Webhooks are the odd one out: they hear about fewer records, not more.
+See [Webhooks](#webhooks).
 
 Every sink is best effort. A sink that fails logs the problem and counts
 what it lost; it never slows down or stops scoring. `aegisctl status`
@@ -213,3 +217,96 @@ and stays quiet until an export succeeds again. There's no retry.
 OTLP metrics aren't in v0.1; they're planned for v0.2.0 (see the
 [roadmap](roadmap.md)). Until then, `aegisctl status --json` gives you
 the counters to scrape.
+
+## Webhooks
+
+Journald is for the log you read afterwards. A webhook is for the
+moment an incident opens and nobody is reading anything. aegisd posts to
+a URL you choose when an incident first reaches throttle, again when it
+first reaches quarantine, and whenever enforcement fails. A busy
+incident that stays at one tier sends nothing more.
+
+```toml
+[[telemetry.webhook]]
+url = "https://hooks.slack.com/services/<path>"
+format = "slack"
+
+[[telemetry.webhook]]
+url = "https://alerts.example.com/aegis"
+format = "json"
+timeout_secs = 5
+
+[telemetry.webhook.headers]
+Authorization = "Bearer <token>"
+```
+
+Repeat `[[telemetry.webhook]]` for as many targets as you like; each has
+its own queue and thread. `format` is `json` (the default) or `slack`.
+`timeout_secs` defaults to 5. A URL can't carry `user:pass@`; put
+credentials in `headers`. Header values and the URL stay out of
+logs. The same SELinux boolean as OTLP applies
+(`aegisd_can_network_connect`), and `https://` is checked against the
+system trust store.
+
+### When it sends
+
+A webhook sends in audit mode and in enforce mode, so a `would_throttle`
+tells you what enforce mode would have done. It sends for:
+
+- the first record at throttle for an incident;
+- the first record at quarantine for that incident, throttled or not
+  before;
+- every enforcement failure (`enforcement failed:` or `enforcement
+  skipped:` as the reason).
+
+It doesn't send a second record at a tier it has already reported. The
+webhook remembers its last 4,096 incidents; past that it forgets them
+all and an old incident that records again may notify again.
+
+### Payloads
+
+`json` posts one object per record:
+
+```json
+{
+  "incident": "AEG-20261021-093000-0123456789abcdef",
+  "verdict": "would_throttle",
+  "score": 62.0,
+  "mode": "audit",
+  "tgid": 4242,
+  "comm": "x",
+  "exe": "/tmp/x",
+  "reasons": ["exec from a temp directory (/tmp/x)"],
+  "ts": "2026-10-21T09:30:00Z"
+}
+```
+
+`slack` posts the same one-line message journald gets, as the only
+field Slack needs. For an enforcement failure the reason follows it.
+
+<!-- markdownlint-disable MD013 -->
+```json
+{
+  "text": "aegis would_throttle incident AEG-20261021-093000-0123456789abcdef score 62.0 tgid 4242 comm x exe /tmp/x"
+}
+```
+<!-- markdownlint-enable MD013 -->
+
+### Retries and drops
+
+Each webhook queues 256 bodies for one worker thread, so a slow endpoint
+never slows scoring. A body gets up to three attempts, waiting 1 second
+after the first failure and 2 seconds after the second. Any network
+error, timeout or non-2xx answer is a failed attempt. While a body
+retries, the ones behind it wait.
+
+Two counters in `aegisctl status` show losses, summed over all your
+webhooks:
+
+- `telemetry dropped: webhook queue full`: the queue was full, so the
+  new record was discarded.
+- `telemetry dropped: webhook failed`: a body failed all three attempts
+  and was discarded.
+
+aegisd logs the first failure in a run, without the URL, and stays quiet
+until a post succeeds again.
