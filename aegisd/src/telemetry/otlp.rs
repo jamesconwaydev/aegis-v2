@@ -78,9 +78,12 @@ impl Otlp {
                     Ok(_) => failing = false,
                     Err(e) => {
                         c.export_failed.fetch_add(n, Ordering::Relaxed);
-                        // Log the transition only; ureq errors carry no headers.
+                        // Log the transition only; ureq's Display can quote the URL.
                         if !failing {
-                            eprintln!("aegisd: otlp export failing, dropping records: {e}");
+                            eprintln!(
+                                "aegisd: otlp export failing, dropping records: {}",
+                                super::webhook::error_kind(&e)
+                            );
                         }
                         failing = true;
                     }

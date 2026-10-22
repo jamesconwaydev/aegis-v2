@@ -94,7 +94,10 @@ impl Webhook {
                             // Log the transition only. The URL can be a
                             // secret (Slack), so it is not in the message.
                             if !failing {
-                                eprintln!("aegisd: webhook failing, dropping records: {e}");
+                                eprintln!(
+                                    "aegisd: webhook failing, dropping records: {}",
+                                    error_kind(&e)
+                                );
                             }
                             failing = true;
                         }
@@ -160,6 +163,22 @@ impl Webhook {
             }),
         }
         .to_string()
+    }
+}
+
+/// What went wrong, without anything that could carry the request URL:
+/// ureq's Display for `Http`, `BadUri`, `RequireHttpsOnly` and `Other`
+/// can quote it. The status code, the io error kind or the variant name
+/// is enough to act on.
+pub fn error_kind(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::StatusCode(c) => format!("http status {c}"),
+        ureq::Error::Io(e) => format!("io: {:?}", e.kind()),
+        ureq::Error::Timeout(t) => format!("timeout: {t}"),
+        other => {
+            let d = format!("{other:?}");
+            d.split(['(', ' ']).next().unwrap_or("error").to_string()
+        }
     }
 }
 
@@ -385,6 +404,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(w.dropped_failed(), 1);
+    }
+
+    #[test]
+    fn failure_log_text_never_carries_the_url_path() {
+        const PATH: &str = "/services/T000/B000/XXXX";
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let refused = ureq::get(format!("http://127.0.0.1:{port}{PATH}?k=XXXX"))
+            .call()
+            .unwrap_err();
+        // A server that answers 500.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}{PATH}?k=XXXX", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut t, _)) = l.accept() {
+                let _ = t.read(&mut [0u8; 1024]);
+                let _ = t.write_all(
+                    b"HTTP/1.1 500 Oops\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let status = ureq::get(&url).call().unwrap_err();
+        assert_eq!(error_kind(&status), "http status 500");
+        // Other variants that quote a URL in ureq's Display.
+        let quoting = [
+            ureq::Error::BadUri(format!("http://h{PATH}")),
+            ureq::Error::RequireHttpsOnly(format!("http://h{PATH}")),
+            ureq::Error::Other(format!("http://h{PATH}").into()),
+        ];
+        for e in std::iter::once(refused).chain(quoting) {
+            let k = error_kind(&e);
+            assert!(!k.contains("XXXX") && !k.contains("services"), "{k}");
+        }
+        assert!(error_kind(&status).find("XXXX").is_none());
     }
 
     #[test]
