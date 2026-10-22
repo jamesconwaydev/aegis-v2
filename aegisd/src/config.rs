@@ -492,14 +492,15 @@ fn unconfined_warning(path: &Path, a: &Allowlist) -> Option<Warning> {
 /// elsewhere.
 pub struct Host {
     pub lsm_file: PathBuf,
-    pub nft: PathBuf,
+    /// Where nft may live; any one existing is enough.
+    pub nft: Vec<PathBuf>,
 }
 
 impl Host {
     pub fn real() -> Self {
         Self {
             lsm_file: "/sys/kernel/security/lsm".into(),
-            nft: "/usr/sbin/nft".into(),
+            nft: vec!["/usr/sbin/nft".into(), "/usr/bin/nft".into()],
         }
     }
 }
@@ -536,7 +537,7 @@ impl Config {
                 .is_ok_and(|l| l.trim().split(',').any(|m| m == "bpf"));
             let msg = if !bpf_lsm {
                 Some("enforce mode needs the BPF LSM (see docs/preflight.md#bpf-lsm)")
-            } else if !host.nft.is_file() {
+            } else if !host.nft.iter().any(|p| p.is_file()) {
                 Some("enforce mode needs nftables (dnf install nftables)")
             } else {
                 None
@@ -679,7 +680,7 @@ mod tests {
     fn bare(t: &Dir) -> Host {
         Host {
             lsm_file: t.0.join("no-lsm"),
-            nft: t.0.join("no-nft"),
+            nft: vec![t.0.join("no-nft")],
         }
     }
 
@@ -760,7 +761,7 @@ mod tests {
         let t = Dir::new("enforce-lsm");
         let host = bare(&t);
         std::fs::write(&host.lsm_file, "lockdown,capability,selinux\n").unwrap();
-        std::fs::write(&host.nft, "").unwrap();
+        std::fs::write(&host.nft[0], "").unwrap();
         let m = t.main("[general]\nmode = \"enforce\"\n");
         let e = Config::load(&m, &t.dir(), &host).unwrap_err();
         assert_eq!(
@@ -792,7 +793,7 @@ mod tests {
         let t = Dir::new("enforce-ok");
         let host = bare(&t);
         std::fs::write(&host.lsm_file, "lockdown,capability,selinux,bpf\n").unwrap();
-        std::fs::write(&host.nft, "").unwrap();
+        std::fs::write(&host.nft[0], "").unwrap();
         let m = t.main("[general]\nmode = \"enforce\"\n");
         let c = Config::load(&m, &t.dir(), &host).unwrap();
         assert_eq!(c.general.mode, Mode::Enforce);

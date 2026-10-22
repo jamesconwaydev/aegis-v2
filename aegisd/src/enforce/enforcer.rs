@@ -412,8 +412,8 @@ impl Enforcer {
             return Err(format!("{id} was never enforced"));
         }
         match state(prior) {
-            Some("thaw" | "lift_limits") => Err(format!("{id} was already released")),
-            Some("kill") => Err(format!("{id} was already killed")),
+            Some("thaw" | "lift_limits") => Err(format!("{id} is already released")),
+            Some("kill") => Err(format!("{id} is already killed")),
             _ => Ok(()),
         }
     }
@@ -899,7 +899,7 @@ mod tests {
             id: id.clone(),
             reply,
         });
-        assert_eq!(r, Err(format!("{id} was already released")));
+        assert_eq!(r, Err(format!("{id} is already released")));
     }
 
     #[test]

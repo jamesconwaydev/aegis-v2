@@ -257,7 +257,9 @@ For scripts that want to skip `aegisctl`: connect to the socket as
 root, write one JSON request per line, read one JSON response per line.
 Requests are `"Status"`, `"IncidentsList"`,
 `{"IncidentShow":{"id":"<id>"}}` and
-`{"IncidentTimeline":{"id":"<id>"}}`. An error comes back as
+`{"IncidentTimeline":{"id":"<id>"}}`, and from v0.2.0
+`{"IncidentRelease":{"id":"<id>"}}` and `{"IncidentKill":{"id":"<id>"}}`,
+which answer `{"Done":"<message>"}`. An error comes back as
 `{"error":"<message>"}`.
 
 ```sh
