@@ -655,9 +655,9 @@ fn end_enforce(remote: &Remote) -> Result<()> {
 
 /// Each incident aegisd still throttles or quarantines, with the command
 /// that ends it: a quarantine is killed, a throttle released. One the
-/// scenario ended itself (release-enforce, say) is left alone. A
-/// throttled or quarantined verdict with no `state` is an error: the
-/// filter would otherwise pick nothing and the sweep would hide it.
+/// scenario ended itself (release-enforce, say) is left alone. Any
+/// other state on a throttled or quarantined verdict, or none, is an
+/// error: skipping it would let the sweep hide it.
 fn enforced(json: &str) -> Result<Vec<(String, &'static str)>> {
     let v: serde_json::Value = serde_json::from_str(json).context("incidents list --json")?;
     let mut out = Vec::new();
@@ -669,7 +669,8 @@ fn enforced(json: &str) -> Result<Vec<(String, &'static str)>> {
         let verb = match i["state"].as_str() {
             Some("quarantined") => "kill",
             Some("throttled") => "release",
-            Some(_) => continue,
+            Some("released" | "killed") => continue,
+            Some(s) => bail!("{id}: an enforced verdict with state {s}"),
             None => bail!("{id}: incidents list --json has no state"),
         };
         out.push((id.to_string(), verb));
@@ -773,7 +774,7 @@ mod tests {
                    {"id":"AEG-3","verdict":"would_quarantine","state":"held"},
                    {"id":"AEG-4","verdict":"quarantined","state":"released"},
                    {"id":"AEG-5","verdict":"quarantined","state":"killed"},
-                   {"id":"AEG-6","verdict":"throttled","state":"expired"},
+                   {"id":"AEG-6","verdict":"would_quarantine","state":"expired"},
                    {"id":"AEG-7","verdict":"would_throttle","state":null}]"#;
         assert_eq!(
             enforced(j).unwrap(),
@@ -783,6 +784,11 @@ mod tests {
         // An enforced verdict without a state: an older or broken daemon.
         assert!(enforced(r#"[{"id":"AEG-1","verdict":"quarantined"}]"#).is_err());
         assert!(enforced(r#"[{"id":"AEG-1","verdict":"throttled","state":null}]"#).is_err());
+        // A state that can't follow an enforced verdict fails closed.
+        for st in ["held", "expired", "bogus"] {
+            let j = format!(r#"[{{"id":"AEG-1","verdict":"quarantined","state":"{st}"}}]"#);
+            assert!(enforced(&j).is_err(), "{st}");
+        }
     }
 
     #[test]
