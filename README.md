@@ -54,7 +54,7 @@ SBOMs and build provenance; [Installation][wiki-install] shows how to
 check one before you install it.
 
 ```sh
-VERSION=0.2.2 ARCH=x86_64   # or aarch64
+VERSION=0.2.3 ARCH=x86_64   # or aarch64
 base=https://github.com/jamesconwaydev/aegis-v2/releases/download/v$VERSION
 curl -fsSLO "$base/aegis-v2-$VERSION-1.el10.$ARCH.rpm" \
      -O "$base/aegis-v2-selinux-$VERSION-1.el10.noarch.rpm"

@@ -6,6 +6,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-28
+
+I started fuzzing the parsers that read what Aegis doesn't control, and
+within seconds the fuzzer found the first fix below. The other two
+close the last gaps the v0.2.1 review left around nftables reloads.
+
 ### Fixed
 
 - On a host up for more than about 5.8 years, aegisd worked out every
@@ -348,7 +354,8 @@ the host is stopped, moved or rewritten yet; that starts in v0.2.0.
 
 The [threat model](docs/threat-model.md) has the full list.
 
-[Unreleased]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.1.1...v0.2.0
