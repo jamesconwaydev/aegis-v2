@@ -1,0 +1,4 @@
+# cargo fuzz needs nightly. The same one build/Containerfile installs for
+# the eBPF crate, so the build image already has it.
+[toolchain]
+channel = "nightly-2026-10-19"

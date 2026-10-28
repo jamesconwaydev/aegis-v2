@@ -1,0 +1,55 @@
+[package]
+name = "aegis-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: the fuzz crate needs nightly and never touches the
+# stable build or the release.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+aegisd = { path = "../aegisd" }
+aegis-proto = { path = "../aegis-proto" }
+serde_json = "1"
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_request"
+path = "fuzz_targets/proto_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "incident_store"
+path = "fuzz_targets/incident_store.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proc_parsers"
+path = "fuzz_targets/proc_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nft_listing"
+path = "fuzz_targets/nft_listing.rs"
+test = false
+doc = false
+bench = false

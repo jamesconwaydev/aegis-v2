@@ -1,0 +1,2 @@
+add rule inet aegis out socket cgroupv2 level 3 "x" counter packets 0 bytes 0 drop # handle 7
+# new generation 12 by process 1 (nft)
