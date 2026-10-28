@@ -6,6 +6,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+**Upgrading from 0.2.0.** There's nothing to migrate. Incidents 0.2.0
+recorded get their `STATE` the first time you list them. An incident
+that was quarantined and lost its rule to an earlier reload gets the
+rule back within about 10 seconds of the restart. One catch: the
+"Stopping aegisd lets the enforcer finish first" fix below can't cover
+the upgrade itself, because it's the 0.2.0 binary that shuts down. A
+quarantine caught mid-flight by that restart may still go unrecorded.
+
 ### Fixed
 
 - **An nftables reload no longer gives quarantined trees their network
@@ -17,7 +25,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   kill also stop trusting the handle they recorded, which a reload
   could hand to another incident's rule: they look the rule up by the
   tree's cgroup and delete only that. Kill looks it up before the
-  SIGKILL, while nftables can still name the cgroup. If the rule's
+  SIGKILL, while nftables can still name the cgroup. If the scope is
+  already gone, release falls back to the recorded handle, but only
+  when nftables shows that rule with a bare cgroup id. If the rule's
   already gone, release still succeeds and says so. (#53)
 - **A quarantine on a busy host gets frozen, not just held.** busctl
   hands back as soon as systemd queues the scope's start job, so the
@@ -30,6 +40,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tree moved or frozen with nothing written down, and the next release
   then said "never enforced". Shutdown now waits up to 5 seconds for the
   job in hand and anything still queued.
+- **A drop rule whose first try failed gets added later.** In enforce
+  mode, if the `nft` call that should have blocked a quarantined tree
+  failed, nothing came back for it. Now the 10-second check adds it,
+  and the record says `added late: the first attempt failed`.
+- **nft runs from `/usr/bin/nft` when that's the only copy.** The
+  config check already looked there; the enforcer didn't. Stock Rocky 10
+  has both, so you'll only notice on a trimmed image.
 - **The "queue full" alert names the incident's score and root
   process.** It used to arrive with a score of 0 and no process name.
 - **An `attach` on the record means something moved.** When every
@@ -39,6 +56,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Actions in `incident.json` can carry a `detail` field,** and
+  `incidents show` prints it. It says why an action happened, such as a
+  rule re-added after a reload. If you parse the records: a removal
+  that finds the rule already gone is now an ok `nft_remove` with no
+  `nft_handle`, where it used to be an error.
 - **`incidents list` has a `STATE` column.** The verdict is history, so
   a tree you'd released still showed `quarantined` and nothing said
   otherwise. `STATE` says what's in place now: `throttled`,

@@ -283,8 +283,6 @@ case $I in AEG-*) ;; *) exit 1 ;; esac
 case $I in *[!A-Za-z0-9-]*) exit 1 ;; esac
 S=aegis-incident-$I-q.scope
 h() { nft -a list chain inet aegis out | grep -F -- "$1" | sed -n 's/.*# handle //p'; }
-H=$(h $S)
-case $H in ''|*[!0-9]*) exit 1 ;; esac
 # Started here only if it wasn't running, and then stopped again. The
 # reload flushes the whole ruleset, podman's netavark table included;
 # it comes back only when a later scenario (podman-run-enforce) runs a
@@ -292,12 +290,19 @@ case $H in ''|*[!0-9]*) exit 1 ;; esac
 if ! systemctl is-active -q nftables; then
   systemctl start nftables; trap 'systemctl stop nftables' EXIT
 fi
+# The real trigger first: the rule must come back by itself.
 systemctl reload nftables
-nft list table inet aegis >/dev/null 2>&1 && exit 1
-# Another rule takes the freed handle before the next 10-second check.
-nft add table inet aegis
-nft add chain inet aegis out '{ type filter hook output priority 0; policy accept; }'
-nft add rule inet aegis out meta mark 0x0ae91500 counter
+timeout 25 sh -c "until nft list chain inet aegis out | grep -qF $S; do sleep 1; done"
+H=$(h $S)
+case $H in ''|*[!0-9]*) exit 1 ;; esac
+# Flush and the stranger's rule in one transaction, so no 10-second
+# check lands between them and takes the freed handle first.
+nft -f - <<'NFT'
+flush ruleset
+add table inet aegis
+add chain inet aegis out { type filter hook output priority 0; policy accept; }
+add rule inet aegis out meta mark 0x0ae91500 counter
+NFT
 [ "$(h 'mark 0x0ae91500')" = "$H" ]
 timeout 25 sh -c "until nft list chain inet aegis out | grep -qF $S; do sleep 1; done"
 aegisctl incidents show $I | grep -qF 're-added after the rule was removed'
