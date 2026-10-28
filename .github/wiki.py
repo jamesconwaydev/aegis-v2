@@ -89,7 +89,7 @@ def check():
         "  [y]: ./roadmap.md#v1": "  [y]: Roadmap#v1",
         "[z]: https://x.org": "[z]: https://x.org",
     }
-    for bad in ("[a](/foo.md)", "![a](/x.png)"):
+    for bad in ("[a](/foo.md)", "![a](/x.png)", "[x]: /foo"):
         try:
             convert(bad, "v9")
         except SystemExit as e:
