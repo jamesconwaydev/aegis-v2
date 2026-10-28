@@ -88,7 +88,7 @@ impl DaemonClassifier for ProcDaemons {
 
 /// The cgroup v2 line (`0::<path>`) puts it directly in a
 /// `system.slice/*.service` unit.
-fn is_service_cgroup(s: &str) -> bool {
+pub fn is_service_cgroup(s: &str) -> bool {
     s.lines().filter_map(|l| l.strip_prefix("0::")).any(|p| {
         p.strip_prefix("/system.slice/")
             .is_some_and(|u| u.ends_with(".service"))

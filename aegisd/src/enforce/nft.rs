@@ -74,13 +74,18 @@ impl Nft {
             "counter",
             "drop",
         ])?;
+        Self::echoed_handle(&out)
+            .ok_or_else(|| anyhow!("no rule handle in nft output: {}", out.trim()))
+            .context("adding the drop rule")
+    }
+
+    /// The rule handle in what `nft --echo --handle add rule` printed.
+    pub fn echoed_handle(out: &str) -> Option<u64> {
         out.rsplit("# handle ")
             .next()
             .filter(|_| out.contains("# handle "))
             .and_then(|s| s.split_whitespace().next())
             .and_then(|n| n.parse().ok())
-            .ok_or_else(|| anyhow!("no rule handle in nft output: {}", out.trim()))
-            .context("adding the drop rule")
     }
 
     /// The live `out` chain with rule handles, or None once a ruleset

@@ -1170,7 +1170,14 @@ fn proc_start_ns(tgid: u32) -> Option<u64> {
 
 /// Fields 4 (ppid) and 22 (starttime, in ns) of `/proc/<tgid>/stat`.
 fn read_stat(tgid: u32) -> Option<(u32, u64)> {
-    let stat = std::fs::read_to_string(format!("/proc/{tgid}/stat")).ok()?;
+    parse_stat(
+        &std::fs::read_to_string(format!("/proc/{tgid}/stat")).ok()?,
+        clk_tck(),
+    )
+}
+
+/// `read_stat` on the file's text, with `hz` clock ticks a second.
+pub fn parse_stat(stat: &str, hz: u64) -> Option<(u32, u64)> {
     // comm (field 2) is parenthesised and may hold spaces or ')': the
     // fields after it start at the last ')'.
     let rest: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
@@ -1178,7 +1185,7 @@ fn read_stat(tgid: u32) -> Option<(u32, u64)> {
     // (field 22) the 20th.
     let ppid = rest.get(1)?.parse().ok()?;
     let ticks: u64 = rest.get(19)?.parse().ok()?;
-    Some((ppid, ticks * 1_000_000_000 / clk_tck()))
+    Some((ppid, ticks * 1_000_000_000 / hz))
 }
 
 #[cfg(test)]
