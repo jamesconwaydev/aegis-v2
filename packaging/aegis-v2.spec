@@ -33,7 +33,9 @@ Requires:       (%{name}-selinux = %{version}-%{release} if selinux-policy-%{sel
 %description
 aegisd watches every exec, fork, ptrace, memfd and outbound connect
 through eBPF, scores each process for risk, and records an incident
-when one crosses the line. aegisctl asks it what it has seen.
+when one crosses the line. In enforce mode it also throttles or
+quarantines the process tree. aegisctl asks it what it has seen, and
+releases or kills what it holds.
 
 %package selinux
 Summary:        SELinux policy module for aegisd
@@ -50,9 +52,10 @@ Requires(post): policycoreutils
 %description selinux
 Confines aegisd to the aegisd_t domain: the BPF and perf access its
 probes need, read access to /proc and to executables, the rpm
-database, and its own state, socket and log directories. Outbound
-network for the OTLP sink sits behind the aegisd_can_network_connect
-boolean, off by default.
+database, its own state, socket and log directories, and the systemd
+and nftables calls enforce mode makes. Outbound network for OTLP and
+webhooks sits behind the aegisd_can_network_connect boolean, off by
+default.
 
 %prep
 
@@ -83,10 +86,31 @@ install -Dpm 0644 -t %{buildroot}%{_licensedir}/%{name} \
 %{_bindir}/aegisctl preflight || :
 
 %preun
+# On erase, say up front that trees enforce mode moved will be left in
+# place. dnf doesn't pause, so this is for next time, not a prompt.
+if [ $1 -eq 0 ] && [ -n "$(systemctl list-units --all --plain --no-legend 'aegis-incident-*' 2>/dev/null)" ]; then
+    echo "aegis-v2: aegis-incident-* scopes exist; removal will leave them in place." >&2
+    echo "aegis-v2: next time, kill or release them with aegisctl before removing." >&2
+fi
 %systemd_preun aegisd.service
 
 %postun
 %systemd_postun_with_restart aegisd.service
+# On erase, enforce mode's slices and nftables table outlive the package.
+# Clean them up only when no incident scope is left: stopping the slice
+# would kill a held tree, and deleting the table would free a
+# quarantined one's network. Otherwise leave both and say how to finish.
+if [ $1 -eq 0 ]; then
+    if [ -z "$(systemctl list-units --all --plain --no-legend 'aegis-incident-*' 2>/dev/null)" ]; then
+        systemctl stop aegis.slice 2>/dev/null || :
+        nft delete table inet aegis 2>/dev/null || :
+    else
+        echo "aegis-v2: left aegis-incident-* scopes, aegis.slice and the inet aegis table in place." >&2
+        echo "aegis-v2: to thaw, end or clean them up, see" >&2
+        echo "aegis-v2: https://github.com/jamesconwaydev/aegis-v2/blob/v%{version}/docs/installation.md#uninstall" >&2
+    fi
+    systemctl daemon-reload 2>/dev/null || :
+fi
 
 # The selinux-policy macros: install or remove the module, then relabel
 # whatever its file contexts changed.
@@ -121,6 +145,18 @@ systemctl try-restart aegisd.service 2>/dev/null || :
 %{_datadir}/selinux/packages/%{selinuxtype}/aegis.pp
 
 %changelog
+* Wed Oct 28 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.2.0-1
+- Enforce mode: throttle and quarantine a process tree, with release
+  and kill through aegisctl.
+- Hold a caught tree in the kernel with BPF LSM programs until it is
+  frozen, and refuse any debugger on aegisd.
+- Read the environment in the kernel at exec for the injection checks.
+- Webhooks, and OTLP metrics beside the logs.
+- SELinux policy 0.2.0: aegisd may run busctl, systemctl and nft.
+- On erase, stop the aegis slices, remove the nftables table and
+  reload systemd, unless an aegis-incident-* scope is left, released
+  ones included, which is kept and warned about.
+
 * Wed Oct 21 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.1.1-1
 - List a member that joined at an exec under the image it runs.
 - Record signals by their weight key, not a Rust debug string.

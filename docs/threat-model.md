@@ -1,10 +1,10 @@
 # Threat model
 
-Read this before you rely on Aegis v0.1.
+Read this before you rely on Aegis v0.2.
 
 ## What it's for
 
-Aegis v0.1 detects common post-exploitation behaviour on a Rocky Linux
+Aegis v0.2 detects common post-exploitation behaviour on a Rocky Linux
 10 host and records it as incidents:
 
 - running a dropped payload from a temp directory
@@ -12,9 +12,21 @@ Aegis v0.1 detects common post-exploitation behaviour on a Rocky Linux
 - attaching a debugger to pid 1 or a system service
 - scanning the network outward
 
-It's a detector in audit mode. It doesn't stop, slow, isolate or kill
-anything, and nothing it does changes the host. The e2e tests check
-that `/etc` is byte-for-byte unchanged across every scenario.
+In audit mode, the default, that's all it does. Nothing it does changes
+the host.
+
+In enforce mode it also acts on the incident's process tree. At the
+throttle tier it moves the tree into a scope with CPU and memory limits.
+At the quarantine tier it holds the tree's processes in the kernel,
+moves the tree into its own scope, freezes it and drops its traffic.
+[Below](#children-of-a-caught-tree) is exactly which processes get
+which. It never
+kills anything unless you run `aegisctl incidents kill`. It never acts
+on pid 1, on aegisd, or on any ancestor of the tree, so the shell or
+service a payload came from is left alone.
+
+The end-to-end tests check that `/etc` is byte-for-byte unchanged
+across every scenario, enforce mode included.
 
 ## What it trusts
 
@@ -53,8 +65,25 @@ aegisd runs confined: six capabilities, a read-only filesystem apart
 from its own directories, and its own SELinux domain. The control socket
 answers root only.
 
-That protects the host from a compromised aegisd. It doesn't protect
-aegisd from root.
+That protects the host from a compromised aegisd. It mostly doesn't
+protect aegisd from root, with one exception in both modes and a second
+in enforce mode:
+
+- **No debugger gets in**, in either mode. While aegisd runs, the
+  kernel refuses any other process, root included, an attach-level
+  ptrace access to it:
+  `strace -p`, `gdb -p`, reading or writing `/proc/<pid>/mem`, and
+  `process_vm_readv` or `process_vm_writev` all fail with `EPERM`.
+  Read-level access still works, so `ps`, `/proc/<pid>/status` and
+  `/proc/<pid>/maps` do too.
+- **A held process can't signal it**, in enforce mode, where processes
+  get held. Only held processes are refused; root and systemd aren't.
+
+Root can still stop, restart or kill aegisd, through systemd or a
+signal, and that unloads every probe and hold program with it. Root can
+also edit the config or remove the package. The guard stops someone
+reading or steering a running aegisd from the inside, not someone
+turning it off.
 
 ## Known limitations
 
@@ -91,9 +120,10 @@ yet. The checks can still be beaten:
   as unreadable, so it fails closed: the process gets no allowlist
   credit.
 - Processes already running when aegisd starts never exec in front of
-  it, so their environment is read from `/proc/<pid>/environ`, the v0.1
-  way. That read sees the process's memory as it is now, and a library
-  already loaded could have scrubbed its `LD_PRELOAD` entry by then.
+  it, so their environment is read from `/proc/<pid>/environ`, as v0.1
+  read every process's. That read sees the process's memory as it is
+  now, and a library already loaded could have scrubbed its
+  `LD_PRELOAD` entry by then.
 - A ptrace attach is only seen when another process attaches to the
   target. `PTRACE_TRACEME`, or a seize set up before the exec, isn't
   seen.
@@ -123,7 +153,7 @@ answer "not owned", and aegisd caches that. Allowlisted binaries stay
 The egress scan signal counts connects per process. A scan spread
 across many processes, one connection each, never crosses the
 threshold in any of them. It also comes from TCP state changes only, so
-UDP traffic, UDP scans included, isn't observed in v0.1.
+UDP traffic, UDP scans included, isn't observed.
 
 ### btrfs subvolumes and overlayfs stay unverified
 
@@ -179,6 +209,125 @@ environment is read loses its allowlist credit the same way.
 Longer paths are truncated in events and incidents. A truncated path is
 never verified, and a path too long to render at all scores as a
 temp-directory exec.
+
+### Enforce mode acts after the fact
+
+The hold starts when aegisd writes the process into the kernel's hold
+map, not at the moment the score crosses the line. Between the two,
+the event travels to userspace, is scored, the incident is written to
+disk, and the enforcer takes the job: usually a few milliseconds, in
+which the tree can still fork, connect and write.
+
+### Children of a caught tree
+
+A tree can fork in that gap, and aegisd chases what it forks in three
+ways:
+
+- **Fork events.** For 30 seconds after a throttle or quarantine
+  decision, every child a covered process forks gets a job of its own,
+  unless its fork jobs fill their half of the enforcer's queue (128
+  jobs), when the rest are dropped and counted. Under a quarantine
+  it's held and attached to the frozen scope, where it stops. Under a
+  throttle it joins the throttle scope.
+- **A `/proc` walk.** When aegisd quarantines a tree, it also moves and
+  freezes any child it finds in `/proc`, including children whose fork
+  it never saw.
+- **A second walk** after the freeze, which attaches anything new to
+  the frozen scope.
+
+A child is held (writes, connects and forks refused) only once aegisd
+sees its fork event. If the event was lost (say, an attacker flooded
+the ring buffer), that child is frozen and cut off from the network
+like the rest of the tree. It isn't held, though, so for the few
+milliseconds before the freeze it can still act. A process that child
+forks before the move and then orphans, by exiting so the process is
+reparented out of the tree, can stay outside the scope, whether or not
+its own fork event arrives. So can anything past the walk's
+1,024-process limit. Closing this needs a kernel-side change and is
+planned.
+
+A throttle never walks `/proc`, so it relies on fork jobs alone. The 30
+seconds start at the decision, not the move. If aegisd's enforcer falls
+more than 30 seconds behind, or a throttled tree's fork jobs are
+dropped because they filled their half of the queue, the processes it
+starts in that time may stay outside its limits. A quarantine isn't
+affected: its walk runs when its job does.
+
+### A failed move isn't retried
+
+If aegisd can't move a tree into its quarantine scope, it doesn't try
+again. The tree stays held but not frozen, and the incident stays
+`would_quarantine` with the error recorded. Later processes that join
+the tree are held the same way. A restart doesn't retry the move, and it
+lifts the holds, so after one the tree runs free. Kill it yourself, or
+release it.
+
+### Writes before the hold reach the disk
+
+Once held, a process can't write through any file descriptor. Whatever
+it wrote before that is on disk, and a shared writable memory mapping
+it already had isn't a write the hook sees, so data written through one
+before the freeze lands too. There's no overlay to throw those writes
+away yet; that's the box planned for v0.4.0.
+
+### A restart lifts the holds
+
+The hold map lives in the kernel only while aegisd's programs are
+loaded. Restart aegisd and every hold is gone. The freeze and the
+nftables rule stay, because systemd and nftables keep them, so a
+quarantined tree is still frozen and cut off. `aegisctl incidents
+release` and `kill` read the recorded actions and still work.
+
+After a reboot there's nothing left to release: the scope, the freeze
+and the nftables rule went with the old boot. Release or kill of an
+incident from an earlier boot touches nothing on the host and records
+it as ended.
+
+### Reloading nftables frees quarantined trees
+
+Reloading nftables (`systemctl reload nftables`, or any
+`nft flush ruleset`) removes aegisd's `inet aegis` table, and every
+quarantined tree's drop rule with it, silently. A frozen tree can't use
+the network anyway, but one of its locks is gone: anything that thaws
+it finds its network back. Don't reload nftables while a tree is
+quarantined. If you did, release the affected incidents one at a time
+and check `nft list table inet aegis` after each: once the table is
+recreated, rule handles can be reused within the same boot, so a
+release could delete another incident's rule. Release then reports the
+missing rule as an error. The tree is still released. A fix that puts
+the table back is planned for v0.2.1.
+
+### Incident scopes are delegated
+
+Both incident scopes, `aegis-incident-<id>.scope` and
+`aegis-incident-<id>-q.scope`, are started with `Delegate=yes`.
+systemd only lets a process join a running scope that way, and
+newcomers join by that call. It changes less than it sounds:
+
+- The scope's cgroup stays root-owned. A process in it that isn't root
+  can't create cgroups, change limits, thaw, or move itself out, any
+  more than it could before.
+- A process running as root inside a throttled or quarantined tree can
+  create sub-cgroups under the scope, or leave it, as root always could;
+  that sits under [a root attacker can stop it](#a-root-attacker-can-stop-it).
+  Delegation only means systemd leaves those sub-cgroups alone.
+- Limits, freezing and kill are hierarchical. CPU and memory limits
+  bind the whole subtree, a frozen scope freezes every cgroup below it,
+  and a kill reaches every process under it, sub-cgroups included.
+
+### A frozen process looks frozen
+
+Freezing is a cgroup state, and anything that inspects the process can
+see it: `systemctl status`, the scope's `cgroup.events`, a process
+listing that shows its cgroup. If an attacker has a second foothold
+outside the tree, it can tell the first one was caught.
+
+### A released process stays in the quarantine slice
+
+`aegisctl incidents release` lifts the tree's holds, thaws it and
+removes its nftables rule, but leaves it in its scope under
+`aegis-quarantine.slice`. Its CPU and memory accounting stays there,
+and the limits of the unit it came from no longer apply to it.
 
 ### OTLP
 

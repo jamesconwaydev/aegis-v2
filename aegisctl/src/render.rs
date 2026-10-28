@@ -340,6 +340,8 @@ pub fn incident(v: &Value, cur_boot: Option<&str>) -> String {
 }
 
 /// One line per timeline record: time, process, signals, score, tier.
+/// A line of enforcement actions takes the same columns: "enforcement",
+/// what was done (a failed step marked so), no score, and the verdict.
 pub fn timeline(lines: &[Value], incident: Option<&Value>) -> String {
     // Records carry only tgid; the incident knows the names.
     let name = |tgid: &Value| {
@@ -355,6 +357,26 @@ pub fn timeline(lines: &[Value], incident: Option<&Value>) -> String {
         .map(|l| {
             if l["truncated"] == true {
                 return vec![s(l, "ts").to_string(), s(l, "note").to_string()];
+            }
+            if let Some(acts) = l["actions"].as_array() {
+                let done: Vec<String> = acts
+                    .iter()
+                    .map(|a| {
+                        let k = s(a, "kind").replace('_', " ");
+                        if a["ok"] == true {
+                            k
+                        } else {
+                            format!("{k} (failed)")
+                        }
+                    })
+                    .collect();
+                return vec![
+                    s(l, "ts").to_string(),
+                    "enforcement".into(),
+                    done.join(", "),
+                    "-".into(),
+                    s(l, "verdict").to_string(),
+                ];
             }
             let sig: Vec<&str> = l["evidence"]
                 .as_array()
@@ -544,6 +566,32 @@ mod tests {
                 .unwrap()
                 .contains("timeline truncated at 10000 lines"),
             "{t}"
+        );
+    }
+
+    #[test]
+    fn timeline_shows_enforcement_lines() {
+        let t = timeline(
+            &[
+                json!({"ts":"t1","tgid":7,"tier":"quarantine","score":110.0,"evidence":[{"signal":"tmp_exec"}]}),
+                json!({"ts":"t2","verdict":"quarantined","actions":[
+                    {"kind":"hold","ok":true},{"kind":"scope","ok":true},
+                    {"kind":"freeze","ok":true},{"kind":"nft_drop","ok":true}]}),
+                json!({"ts":"t3","verdict":"would_quarantine","actions":[
+                    {"kind":"attach","ok":false,"error":"boom"}]}),
+            ],
+            None,
+        );
+        let l: Vec<&str> = t.lines().collect();
+        assert!(!t.contains("pid null"), "{t}");
+        let words = |l: &str| l.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            words(l[1]),
+            "t2 enforcement hold, scope, freeze, nft drop - quarantined"
+        );
+        assert_eq!(
+            words(l[2]),
+            "t3 enforcement attach (failed) - would_quarantine"
         );
     }
 

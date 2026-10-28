@@ -31,10 +31,10 @@ reload applies:
 
 | Setting                                            | On reload    |
 | -------------------------------------------------- | ------------ |
-| `[general]` thresholds                             | applied      |
+| `[general]`, `mode` and thresholds                 | applied      |
 | `[scoring]`, `[scoring.weights]`, `[scoring.scan]` | applied      |
 | `[allowlist]` and every drop-in, pins included     | applied      |
-| `[telemetry]`, `[incidents]`                       | next restart |
+| `[throttle]`, `[telemetry]`, `[incidents]`         | next restart |
 
 Scores already built up carry over a reload, and decay at the new
 half-life from then on. A reload empties the verification cache, so
@@ -63,18 +63,29 @@ unit doesn't retry. Fix the file and start it again.
 | `score_threshold_throttle`   | integer | `50`      |
 | `score_threshold_quarantine` | integer | `80`      |
 
-- `mode`: `"audit"` scores and records what Aegis would do. From v0.2.0,
-  `"enforce"` also does it. aegisd refuses `"enforce"` unless the BPF
-  LSM is on (`bpf` in `/sys/kernel/security/lsm`; see
-  [preflight](preflight.md#bpf-lsm)) and `/usr/sbin/nft` exists. The
-  error points at the `mode` line, as above. A reload that fails this
-  check keeps the old configuration.
+- `mode`: `"audit"` scores and records what Aegis would do, and
+  changes nothing. `"enforce"` also does it: a throttle-tier incident's
+  tree is limited, and a quarantine-tier one is held, frozen and cut off
+  (see the [overview](overview.md#throttle-and-quarantine)). aegisd
+  refuses `"enforce"` unless the BPF LSM is on (`bpf` in
+  `/sys/kernel/security/lsm`; see [preflight](preflight.md#bpf-lsm))
+  and a file exists at `/usr/sbin/nft` or `/usr/bin/nft`. The check
+  accepts either, but enforce mode runs `/usr/sbin/nft`, which is where
+  Rocky's `nftables` package installs it. The error points at the
+  `mode` line, as above. A reload that fails this check
+  keeps the old configuration.
+
+  A reload to `"audit"` stops new actions at once, including any still
+  queued, but undoes nothing already done. Release or kill those with
+  [aegisctl](aegisctl.md#incidents-release-id), which works in either
+  mode.
 
 - `score_threshold_throttle`: A score at or above this records
-  `would_throttle`. Must be lower than `score_threshold_quarantine`.
+  `would_throttle`, or throttles in enforce mode. Must be lower than
+  `score_threshold_quarantine`.
 
 - `score_threshold_quarantine`: A score at or above this records
-  `would_quarantine`.
+  `would_quarantine`, or quarantines in enforce mode.
 
 ## `[scoring]`
 
@@ -219,9 +230,22 @@ every unit start.
 | `overlay_max_size_mb` | integer | `512`   | ≥ 1  |
 | `auto_expire_seconds` | integer | `3600`  | ≥ 1  |
 
-Both are validated and otherwise unused in v0.1. They're reserved for
-the quarantine box planned for later releases (see the
-[roadmap](roadmap.md)).
+Both are validated and otherwise unused. They're reserved for the
+quarantine box planned for v0.4.0 (see the [roadmap](roadmap.md)).
+
+## `[throttle]`
+
+Enforce mode only: the limits a throttled tree runs under.
+
+| Key                 | Type    | Default | Rule     |
+| ------------------- | ------- | ------- | -------- |
+| `cpu_quota_percent` | integer | `25`    | 1 to 100 |
+| `memory_high_mb`    | integer | `256`   | ≥ 16     |
+
+- `cpu_quota_percent`: Percent of one CPU the whole tree may use.
+
+- `memory_high_mb`: MiB. Above this the kernel reclaims the tree's
+  memory hard and slows it down. It's a soft limit, not a kill.
 
 ## `[incidents]`
 
@@ -235,13 +259,14 @@ the quarantine box planned for later releases (see the
 
 ## `[telemetry]`
 
-journald is always on and has no setting. The other two sinks are off
+journald is always on and has no setting. The other sinks are off
 until you add them.
 
-| Key     | Type  | Default |
-| ------- | ----- | ------- |
-| `jsonl` | path  | unset   |
-| `otlp`  | table | unset   |
+| Key       | Type           | Default |
+| --------- | -------------- | ------- |
+| `jsonl`   | path           | unset   |
+| `otlp`    | table          | unset   |
+| `webhook` | array of table | unset   |
 
 - `jsonl`: Append one JSON line per record to this file, created with mode 0600.
   It has to live under `/var/log/aegis-v2`: the unit makes the rest of
@@ -256,9 +281,10 @@ until you add them.
 | `timeout_secs` | integer | `5`        |
 
 - `endpoint`: Base URL of an OTLP/HTTP collector, `http://` or `https://`.
-  Records go to `<endpoint>/v1/logs`, unless the endpoint already ends in
-  `/v1/logs`. A URL with credentials (`user:pass@host`) is rejected; use
-  `headers`.
+  Records go to `<endpoint>/v1/logs` and metrics to
+  `<endpoint>/v1/metrics`; an endpoint that already ends in `/v1/logs`
+  has that trimmed first. A URL with credentials (`user:pass@host`) is
+  rejected; use `headers`.
 
 - `headers`: Extra HTTP headers on every request, typically for a token.
   Names must be valid HTTP tokens and values can't hold control
@@ -281,8 +307,16 @@ Authorization = "Bearer <token>"
 OTLP needs one more step on an SELinux host; see
 [telemetry](telemetry.md#otlp).
 
+### `[[telemetry.webhook]]`
+
+One table per target: `url` (required, `http://` or `https://`),
+`format` (`"json"`, the default, or `"slack"`), `headers` and
+`timeout_secs` (default 5). The URL rules match OTLP's.
+[Telemetry](telemetry.md#webhooks) covers when a webhook fires and what
+it sends.
+
 The config file is mode 0600 in a 0750 directory, root only, because it
-may hold that token.
+may hold that token, or a webhook URL that works as one.
 
 ## Command-line flags
 

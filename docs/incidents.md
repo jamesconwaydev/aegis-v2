@@ -25,7 +25,8 @@ went.
 The rules for the incident score are in
 [scoring](scoring.md#incidents-and-process-trees).
 
-Incidents never close in v0.1. Every incident counts as open, and
+Incidents don't close yet, released or killed ones included. Every
+incident counts as open, and
 `aegisctl status` reports how many are loaded as `open incidents`.
 
 ## Where they live
@@ -59,7 +60,7 @@ a process already in an incident stays in it across a daemon restart.
 `aegisctl incidents list` shows only those loaded incidents. Older ones
 stay on disk, and `aegisctl incidents show <id>` still finds them by id.
 
-v0.1 never deletes an incident. Remove old directories yourself when you
+aegisd never deletes an incident. Remove old directories yourself when you
 no longer need them.
 
 ## `incident.json`
@@ -91,7 +92,7 @@ no longer need them.
 | `created`, `updated`     | UTC, RFC 3339, to the second                |
 | `updated_ns`             | `updated` in Unix nanoseconds               |
 | `boot_id`                | the boot the process ids belong to          |
-| `mode`                   | `audit` in v0.1                             |
+| `mode`                   | `audit` or `enforce`, when last recorded    |
 | `verdict`                | see [Verdicts](#verdicts)                   |
 | `max_score`              | the highest score recorded                  |
 | `score`                  | the score at the last update                |
@@ -111,37 +112,55 @@ enforce mode can also write `throttled` and `quarantined`, and only
 after the action succeeded. If it failed, the verdict stays at
 `would_*` and the failure is in `actions`. A verdict never moves down.
 
+If aegisd can't move a tree into its quarantine scope, it doesn't try
+again. The tree stays held but not frozen, and the incident stays
+`would_quarantine` with the error recorded. Later processes that join
+the tree are held the same way. A restart doesn't retry the move, and it
+lifts the holds, so after one the tree runs free. Kill it yourself, or
+release it.
+
 ### Action entries
 
 From v0.2.0, each thing enforce mode does to an incident's processes is
 appended to `actions`, oldest first. The list is empty in audit mode,
 and in incidents written before v0.2.0. Releasing or killing an
 incident reads the unit names and nft handles from here, so they
-survive a restart.
+survive a daemon restart. A reboot doesn't leave anything to release:
+release or kill of an incident from an earlier boot runs nothing and
+records `expired`. A hold's `start_times` let release free a pid only
+while it's still the process that was held.
 
-| Field        | Meaning                                              |
-| ------------ | ---------------------------------------------------- |
-| `kind`       | what was done, see below                             |
-| `ok`         | `true` if it worked                                  |
-| `unit`       | the systemd unit involved, if any                    |
-| `nft_handle` | the nftables rule handle involved, if any            |
-| `pids`       | the process ids it applied to                        |
-| `error`      | why it failed, when `ok` is `false`                  |
-| `ts`         | when it happened, UTC, RFC 3339                      |
+| Field         | Meaning                                       |
+| ------------- | --------------------------------------------- |
+| `kind`        | what was done, see below                      |
+| `ok`          | `true` if it worked                           |
+| `unit`        | the systemd unit involved, if any             |
+| `nft_handle`  | the nftables rule handle involved, if any     |
+| `pids`        | the process ids it applied to                 |
+| `start_times` | a hold's start time per pid; absent otherwise |
+| `error`       | why it failed, when `ok` is `false`           |
+| `ts`          | when it happened, UTC, RFC 3339               |
 
 `kind` is one of:
 
-| Value         | Meaning                                     |
-| ------------- | ------------------------------------------- |
-| `hold`        | resource limits put on the processes        |
-| `scope`       | the processes moved into their own scope    |
-| `freeze`      | the processes frozen                        |
-| `nft_drop`    | an nftables rule dropping their traffic     |
-| `thaw`        | frozen processes resumed                    |
-| `unhold`      | resource limits removed                     |
-| `nft_remove`  | the nftables rule deleted                   |
-| `kill`        | the processes killed                        |
-| `lift_limits` | every limit lifted                          |
+| Value         | Meaning                                       |
+| ------------- | --------------------------------------------- |
+| `hold`        | the processes held in the kernel              |
+| `scope`       | the processes moved into their own scope      |
+| `attach`      | later processes moved into that scope         |
+| `freeze`      | the scope frozen                              |
+| `nft_drop`    | an nftables rule dropping its traffic         |
+| `unhold`      | the holds removed                             |
+| `thaw`        | the scope thawed                              |
+| `nft_remove`  | the nftables rule deleted                     |
+| `kill`        | the processes killed                          |
+| `lift_limits` | a throttle's CPU and memory limits lifted     |
+| `expired`     | release or kill of an earlier boot's incident |
+
+`systemctl show` on a `scope` or `attach` unit reports `Delegate=yes`.
+That's deliberate: systemd only lets processes join a running scope
+that's delegated. The [threat model](threat-model.md#incident-scopes-are-delegated)
+says what that does and doesn't allow.
 
 ### Process entries
 
@@ -235,7 +254,8 @@ One JSON object per line, one line per recorded decision:
 | `evidence`      | the one evidence entry this decision added |
 
 A line for actions has `ts`, `actions` (the entries added) and
-`verdict`, and no `tgid` or `evidence`.
+`verdict`, and no `tgid` or `evidence`. `aegisctl incidents timeline`
+prints it as an `enforcement` row.
 
 Earlier evidence is on earlier lines. A timeline stops at 10,000 lines.
 One marker line follows (shown wrapped here), and then nothing more is

@@ -165,8 +165,8 @@ cargo xtask rpm --arch x86_64
 ```
 
 That's a release build, then rpmbuild, both in the container. You get
-two RPMs in `dist/rpm/`: `aegis-v2-0.1.1-1.el10.x86_64.rpm` and the
-noarch `aegis-v2-selinux-0.1.1-1.el10.noarch.rpm`. The spec is
+two RPMs in `dist/rpm/`: `aegis-v2-0.2.0-1.el10.x86_64.rpm` and the
+noarch `aegis-v2-selinux-0.2.0-1.el10.noarch.rpm`. The spec is
 `packaging/aegis-v2.spec`, the unit is `packaging/aegisd.service`, and
 the policy module lives in `selinux/`.
 
@@ -232,25 +232,45 @@ cleared first. It passes when:
 
 - its command exits 0,
 - `aegisctl incidents list --json` shows exactly what `expect` says:
-  `none`, or one incident with `would_throttle` or `would_quarantine`,
-- no SELinux denial mentioning aegis was logged (an `ausearch` failure
-  other than `<no matches>` fails the check), and
-- `/etc` hashes the same before and after, since v0.1 must never change
-  the host.
+  `none`, or one incident with `would_throttle`, `would_quarantine`,
+  `throttled` or `quarantined`,
+- its `check`, if it has one, passes once the verdict settles,
+- in enforce mode, no incident recorded a failed action, read after the
+  harness has released or killed it,
+- no SELinux denial mentioning aegis was logged since the scenario
+  started. `ausearch` must find some audit event in that window, or the
+  check fails: an empty answer means the log isn't being read, and
+- `/etc` hashes the same before and after, in enforce mode too.
+
+A scenario with `mode = "enforce"` switches aegisd to enforce mode and
+reloads before it starts. Afterwards, pass or fail, the harness kills
+each quarantined incident, releases each throttled one, puts the config
+back, and sweeps away leftover scopes and the `inet aegis` table. The
+scenario fails if any of that does.
 
 "No incident" has to hold for 8 seconds, past aegisd's 6-second hold on
 signals, and an expected incident has 15 seconds to appear.
 
-There are twelve scenarios: five attack simulations (`tmp-dropper`,
-`memfd-exec`, `ptrace-daemon`, `port-scan`, `chain`), five benign
-workloads that must not trip anything (`dnf-install`, `gdb-attach`,
-`pip-download`, `podman-run`, `ssh-login`), and a pair for the
-injection check. `preload-memfd` pins `aegis-sim`, lists it as a memfd
-caller, and runs it with `LD_PRELOAD`, which must still quarantine;
-`pinned-memfd` does the same without the preload, which must not.
+There are twenty scenarios. Twelve run in audit mode: five attack
+simulations (`tmp-dropper`, `memfd-exec`, `ptrace-daemon`, `port-scan`,
+`chain`), five benign workloads that must not trip anything
+(`dnf-install`, `gdb-attach`, `pip-download`, `podman-run`,
+`ssh-login`), and a pair for the injection check. `preload-memfd` pins
+`aegis-sim`, lists it as a memfd caller, and runs it with `LD_PRELOAD`,
+which must still quarantine; `pinned-memfd` does the same without the
+preload, which must not.
+
+Eight run in enforce mode. `quarantine-memfd-enforce` and
+`quarantine-chain-enforce` check that the whole tree lands frozen in its
+quarantine scope, and the first that an nftables rule drops its traffic;
+`throttle-ptrace-enforce` that a tracer lands in its throttle scope with
+its CPU limit. `release-enforce` and `kill-enforce` check that release
+thaws a tree and kill ends it. `dnf-install-enforce`,
+`podman-run-enforce` and `ssh-login-enforce` must still trip nothing.
 
 Adding a scenario means adding a `[[scenario]]` with a `name`, a shell
-`run` command and an `expect`.
+`run` command and an `expect`, plus `mode = "enforce"` and a `check`
+(a shell snippet run under `set -e`) when it needs them.
 `aegis-sim --help` lists the simulators.
 
 ## Licences and CI

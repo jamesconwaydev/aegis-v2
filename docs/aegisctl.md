@@ -36,7 +36,7 @@ aegisctl status
 Shows the daemon's version, mode and health counters, then its probes.
 
 ```text
-version                                0.1.1
+version                                0.2.0
 mode                                   audit
 uptime                                 2h 14m
 events                                 1843920
@@ -66,8 +66,8 @@ What each row means, with its key in `--json` output:
 - **events** (`events_total`): probe events processed.
 - **dropped events** (`dropped_events`): events the kernel ring buffer
   had no room for.
-- **open incidents** (`incidents_open`): incidents loaded. All of them
-  are open in v0.1.
+- **open incidents** (`incidents_open`): incidents loaded. Incidents
+  don't close yet, so that's all of them.
 - **incident write errors** (`incident_errors`): incident writes that
   failed.
 - **incidents dropped** (`incident_dropped`): decisions lost to a full
@@ -80,9 +80,14 @@ What each row means, with its key in `--json` output:
 - **incident repeats not recorded** (`incident_suppressed`): decisions
   inside an open incident that weren't recorded or sent to telemetry,
   because they added nothing new. This one grows in normal use.
-- **enforce jobs dropped** (`enforce_dropped`): throttle or quarantine
-  jobs lost to a full enforcer queue, or still queued when a reload
-  switched to audit mode.
+- **enforce jobs dropped** (`enforce_dropped`): enforcer jobs dropped
+  without running: lost to a full queue, or still queued when a reload
+  switched to audit mode. That includes the jobs for children a tree
+  forks after it's enforced, which can only take half the queue, so a
+  forking tree can't crowd out a new throttle or quarantine. A dropped
+  throttle or quarantine is also logged and sent to telemetry as
+  `enforcement failed: queue full, nothing was done`; dropped child
+  jobs are logged once per burst.
 - **telemetry dropped: ...** (`telemetry_dropped`): records each sink
   lost.
 - **probes** (`probes`): each probe's name and hook.
@@ -178,6 +183,14 @@ added, score, and tier.
 2026-10-19T09:30:02Z  aegis-sim (4242)  MemfdExec  85.0  quarantine
 ```
 
+In enforce mode, each batch of actions gets a row too: `enforcement`,
+the steps in order (a failed one marked `(failed)`), `-` where the score
+goes, and the verdict after them.
+
+```text
+2026-10-19T09:30:03Z  enforcement  hold, scope, freeze, nft drop  -  quarantined
+```
+
 A timeline that reached its 10,000-line cap ends with a row saying
 `timeline truncated at 10000 lines`.
 
@@ -192,10 +205,11 @@ From v0.2.0.
 aegisctl incidents release AEG-20261019-093000-0123456789abcdef
 ```
 
-Undoes what enforce mode did to an incident. A quarantined tree is
-thawed and its network comes back; a throttled one loses its CPU and
-memory limits. The tree stays where it is, so its accounting remains
-under `aegis-quarantine.slice`.
+Undoes what enforce mode did to an incident. A quarantined tree loses
+its kernel holds while it's still frozen, then is thawed and gets its
+network back; a throttled one loses its CPU and memory limits. The tree
+stays in its scope, so a released quarantine's accounting remains under
+`aegis-quarantine.slice`.
 
 ```text
 released AEG-20261019-093000-0123456789abcdef: thawed, network restored
@@ -204,6 +218,11 @@ released AEG-20261019-093000-0123456789abcdef: thawed, network restored
 A throttle prints `released <id>: limits lifted` instead. It works from
 the actions recorded on the incident, so it still works after a daemon
 restart, and after you've switched `mode` back to `"audit"`.
+
+After a reboot there's nothing left to release: the scope, the freeze
+and the nftables rule went with the old boot. Release of an incident
+from an earlier boot runs nothing, records it as ended, and answers
+`<id> is from an earlier boot; nothing of it is left on this host`.
 
 It refuses, with exit code 1, an incident that was never enforced
 (`<id> was never enforced`) and one already released
@@ -225,7 +244,8 @@ network rule. It prints `killed <id>`.
 A throttled incident has nothing to kill: aegisctl says
 `<id> was only throttled; release it instead`. Kill also refuses an
 incident that was never enforced or was already released or killed.
-Every refusal exits 1.
+Every refusal exits 1. Like release, kill of an incident from an
+earlier boot runs nothing and records it as ended.
 
 With `--json`, you get `{"done": "killed <id>"}`.
 

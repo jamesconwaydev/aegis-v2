@@ -21,8 +21,9 @@ aegisd --check-config
 Fix the file, then `systemctl start aegisd`. The unit doesn't retry on
 status 78, because the same file would fail the same way.
 
-The most common cause in v0.1 is `mode = "enforce"`, which isn't
-available yet. Set it back to `"audit"`.
+The most common cause is `mode = "enforce"` on a host without the BPF
+LSM or `nft`. The error says which; fix that, or set the mode back to
+`"audit"`.
 
 ### It fails while loading the probes
 
@@ -36,8 +37,8 @@ or a missing program. Run `aegisctl preflight`:
   offsets it needs.
 - **`kernel` FAIL:** the kernel is older than 6.12.
 
-aegisd attaches all nine probes or none, and won't run with a partial
-set.
+aegisd attaches all its probes and hold programs or none, and won't run
+with a partial set.
 
 ### It keeps restarting with `probe event stream ended`
 
@@ -57,6 +58,16 @@ don't delete it.
 Something changed the socket directory's ownership or mode. The unit
 creates it as root, 0700. Remove the directory and start the service
 again, so systemd recreates it.
+
+### `strace` or `gdb` on aegisd fails with `Operation not permitted`
+
+That's on purpose. While aegisd runs, a BPF LSM program refuses every
+other process, root included, an attach-level ptrace access to it:
+`strace -p`, `gdb -p`, `/proc/<pid>/mem` and `process_vm_readv`. It
+applies in audit mode too. To see what aegisd is doing, use
+`journalctl -u aegisd`, `aegisctl status`, or run it in the foreground
+with `--debug` on a test host. See the
+[threat model](threat-model.md#self-protection).
 
 ## aegisctl can't reach the daemon
 
@@ -158,7 +169,7 @@ empties the cache.
 On btrfs subvolumes and overlayfs, the device number the kernel reports
 for an executed file doesn't match what `stat` reports, so aegisd can't
 confirm it's the same file. Those binaries stay `unverified`, and
-allowlists don't apply to them. There's no workaround in v0.1; XFS and
+allowlists don't apply to them. There's no workaround yet; XFS and
 ext4 aren't affected. See the [threat model](threat-model.md).
 
 ### A process lost its score after the host resumed from suspend
@@ -219,6 +230,32 @@ aegisd doesn't rotate it. Set up logrotate with `copytruncate`; see
 
 An endpoint with `user:pass@` in it is rejected at load; put credentials
 in `[telemetry.otlp.headers]`.
+
+## A quarantined tree got its network back
+
+Check that the table is still there:
+
+```sh
+nft list table inet aegis
+```
+
+If it isn't, something flushed the ruleset: `systemctl reload
+nftables`, a firewall tool, or `nft flush ruleset`. That removes the
+table and every quarantined tree's drop rule with it, and aegisd
+doesn't put it back yet (planned for v0.2.1). The trees are still
+frozen, so they can't use the network until something thaws them.
+Release or kill the affected incidents one at a time, checking the
+table after each. Release then reports the missing rule as an error;
+the tree is still released. See the
+[threat model](threat-model.md#reloading-nftables-frees-quarantined-trees).
+Avoid reloading nftables while a tree is quarantined.
+
+## A tree is still frozen after uninstalling
+
+Removing the package while a tree was quarantined or throttled leaves
+its scope, and the `inet aegis` table, in place, and `aegisctl` is gone.
+[Installation](installation.md#if-you-already-removed-it) has the
+commands to thaw it, end it, and clean up.
 
 ## SELinux denials
 

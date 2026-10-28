@@ -1,7 +1,8 @@
 # Aegis v2 documentation
 
-These pages describe v0.1 (currently v0.1.1). Where a page mentions something later
-releases will add, it says so and links to the [roadmap](roadmap.md).
+These pages describe v0.2 (currently v0.2.0). Where a page mentions
+something later releases will add, it says so and links to the
+[roadmap](roadmap.md).
 
 ## Getting started
 
