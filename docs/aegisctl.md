@@ -122,14 +122,23 @@ AEG-20261020-141500-fedcba9876543210  quarantined       released  92.5   5150   
 <!-- markdownlint-enable MD013 -->
 
 `VERDICT` is history: what aegisd decided, and it never goes back down.
-`STATE` (from v0.2.1) is what's in place now. `held` means the
-enforcement is still on the tree, whether that's a throttle, a
-quarantine, or only the kernel hold after a failed move. `released` and
-`killed` mean someone ended it with `incidents release` or `kill`, and
-`expired` means it came from an earlier boot. A `-` means nothing was
-ever enforced, which is every incident in audit mode. So the second row
-above was quarantined and then let go. `--json` carries the same value
-as `state`, or `null` for `-`.
+`STATE` (from v0.2.1) is what's in place right now:
+
+| `STATE`       | What it means                                              |
+| ------------- | ---------------------------------------------------------- |
+| `throttled`   | the tree runs in its CPU- and memory-limited scope         |
+| `quarantined` | the tree is in its quarantine scope, frozen                |
+| `held`        | kernel holds only: the move or the freeze failed           |
+| `released`    | you ended it with `incidents release`                      |
+| `killed`      | you ended it with `incidents kill`                         |
+| `expired`     | it's from an earlier boot, so nothing of it is left        |
+| `-`           | nothing was ever enforced, as in every audit-mode incident |
+
+The second row above, then, was quarantined and later let go. One
+catch with `held`: the holds live in aegisd, so an aegisd restart lifts
+them and the tree runs free, while the list still says `held`. Release
+or kill it before you restart. `--json` carries the same value as
+`state`, or `null` for `-`.
 
 `SCORE` is the highest score the incident reached. The list holds
 incidents updated in the last 30 days; older ones are still on disk.

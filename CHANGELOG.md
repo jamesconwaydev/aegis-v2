@@ -41,9 +41,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`incidents list` has a `STATE` column.** The verdict is history, so
   a tree you'd released still showed `quarantined` and nothing said
-  otherwise. `STATE` says what's in place now: `held`, `released`,
-  `killed`, `expired`, or `-` when nothing was enforced. `--json` carries
-  it as `state`. Scripts that read the table by column position will
+  otherwise. `STATE` says what's in place now: `throttled`,
+  `quarantined`, `held` (kernel holds only), `released`, `killed`,
+  `expired`, or `-` when nothing was enforced. `--json` carries it as
+  `state`. Scripts that read the table by column position will
   find `SCORE` and everything after it one column to the right.
 - **A release or kill that outlasts the 30-second wait says it's still
   queued.** It used to say "timed out waiting for the enforcer", which

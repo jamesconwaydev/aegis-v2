@@ -604,7 +604,12 @@ impl IncidentStore {
                 max_score: i.max_score,
                 root_tgid: i.root.tgid,
                 actions: i.actions.len(),
-                state: crate::enforce::enforcer::summary_state(&i.actions).map(String::from),
+                // The same rule release and kill use for an earlier boot.
+                state: crate::enforce::enforcer::summary_state(
+                    &i.actions,
+                    i.boot_id != g.boot_id.clone().unwrap_or_default(),
+                )
+                .map(String::from),
             })
             .collect()
     }

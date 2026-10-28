@@ -114,9 +114,10 @@ after the action succeeded. If it failed, the verdict stays at
 
 So a verdict is history. A tree you released still says `quarantined`.
 For what's in place now, `aegisctl incidents list` has a `STATE` column
-from v0.2.1, worked out from `actions`: `held` while the throttle,
-quarantine or bare kernel hold is still on, then `released`, `killed` or
-`expired` once it's ended, and `-` if nothing was ever enforced.
+from v0.2.1, worked out from `actions` and the boot: `throttled`,
+`quarantined`, or `held` (kernel holds only) while it's on, then
+`released`, `killed` or `expired` once it's over, and `-` if nothing was
+ever enforced. [aegisctl](aegisctl.md#incidents-list) has the full table.
 
 Released doesn't mean back where it was, though. A released or throttled
 process stays in its incident scope (`aegis-incident-<id>.scope`, or

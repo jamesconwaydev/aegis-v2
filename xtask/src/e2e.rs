@@ -614,7 +614,7 @@ fn end_enforce(remote: &Remote) -> Result<()> {
         .and_then(|j| enforced(&j))
     {
         Ok(left) => {
-            for (id, verb) in left {
+            for (id, verb) in &left {
                 match remote.try_run(&format!("aegisctl incidents {verb} {id}")) {
                     Ok((false, out, err)) => {
                         errs.push(format!("{verb} {id}: {} {}", out.trim(), err.trim()))
@@ -622,6 +622,14 @@ fn end_enforce(remote: &Remote) -> Result<()> {
                     Ok(_) => {}
                     Err(e) => errs.push(format!("{verb} {id}: {e:#}")),
                 }
+            }
+            // A STATE that was wrong would let the sweep hide it.
+            let ids: Vec<String> = left.into_iter().map(|(id, _)| id).collect();
+            if let Err(e) = remote
+                .check("aegisctl incidents list --json")
+                .and_then(|j| all_ended(&j, &ids))
+            {
+                errs.push(format!("after ending: {e:#}"));
             }
         }
         Err(e) => errs.push(format!("listing incidents: {e:#}")),
@@ -645,25 +653,50 @@ fn end_enforce(remote: &Remote) -> Result<()> {
     }
 }
 
-/// Each incident aegisd acted on and still holds, with the command that
-/// ends it: a quarantine is killed, a throttle released.
+/// Each incident aegisd still throttles or quarantines, with the command
+/// that ends it: a quarantine is killed, a throttle released. One the
+/// scenario ended itself (release-enforce, say) is left alone. A
+/// throttled or quarantined verdict with no `state` is an error: the
+/// filter would otherwise pick nothing and the sweep would hide it.
 fn enforced(json: &str) -> Result<Vec<(String, &'static str)>> {
     let v: serde_json::Value = serde_json::from_str(json).context("incidents list --json")?;
-    Ok(v.as_array()
-        .context("expected a JSON array")?
+    let mut out = Vec::new();
+    for i in v.as_array().context("expected a JSON array")? {
+        let id = i["id"].as_str().context("incident without an id")?;
+        if !matches!(i["verdict"].as_str(), Some("quarantined" | "throttled")) {
+            continue;
+        }
+        let verb = match i["state"].as_str() {
+            Some("quarantined") => "kill",
+            Some("throttled") => "release",
+            Some(_) => continue,
+            None => bail!("{id}: incidents list --json has no state"),
+        };
+        out.push((id.to_string(), verb));
+    }
+    Ok(out)
+}
+
+/// Fails unless every incident in `ids` now reads killed or released.
+fn all_ended(json: &str, ids: &[String]) -> Result<()> {
+    let v: serde_json::Value = serde_json::from_str(json).context("incidents list --json")?;
+    let list = v.as_array().context("expected a JSON array")?;
+    let bad: Vec<String> = ids
         .iter()
-        // Only what is still in place: one the scenario ended itself
-        // (release-enforce, say) would be refused.
-        .filter(|i| i["state"] == "held")
-        .filter_map(|i| {
-            let verb = match i["verdict"].as_str()? {
-                "quarantined" => "kill",
-                "throttled" => "release",
-                _ => return None,
-            };
-            Some((i["id"].as_str()?.to_string(), verb))
+        .filter_map(|id| {
+            let state = list
+                .iter()
+                .find(|i| i["id"] == id.as_str())
+                .and_then(|i| i["state"].as_str());
+            (!matches!(state, Some("killed" | "released")))
+                .then(|| format!("{id} is {}", state.unwrap_or("missing")))
         })
-        .collect())
+        .collect();
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        bail!("not ended: {}", bad.join(", "))
+    }
 }
 
 fn cleanup(
@@ -735,17 +768,32 @@ mod tests {
 
     #[test]
     fn enforced_incidents_and_how_they_end() {
-        let j = r#"[{"id":"AEG-1","verdict":"quarantined","state":"held"},
-                   {"id":"AEG-2","verdict":"throttled","state":"held"},
+        let j = r#"[{"id":"AEG-1","verdict":"quarantined","state":"quarantined"},
+                   {"id":"AEG-2","verdict":"throttled","state":"throttled"},
                    {"id":"AEG-3","verdict":"would_quarantine","state":"held"},
                    {"id":"AEG-4","verdict":"quarantined","state":"released"},
-                   {"id":"AEG-5","verdict":"throttled","state":"killed"},
-                   {"id":"AEG-6","verdict":"quarantined"}]"#;
+                   {"id":"AEG-5","verdict":"quarantined","state":"killed"},
+                   {"id":"AEG-6","verdict":"throttled","state":"expired"},
+                   {"id":"AEG-7","verdict":"would_throttle","state":null}]"#;
         assert_eq!(
             enforced(j).unwrap(),
             [("AEG-1".into(), "kill"), ("AEG-2".into(), "release")]
         );
         assert!(enforced("{}").is_err());
+        // An enforced verdict without a state: an older or broken daemon.
+        assert!(enforced(r#"[{"id":"AEG-1","verdict":"quarantined"}]"#).is_err());
+        assert!(enforced(r#"[{"id":"AEG-1","verdict":"throttled","state":null}]"#).is_err());
+    }
+
+    #[test]
+    fn ended_incidents_must_read_killed_or_released() {
+        let ids = ["AEG-1".to_string(), "AEG-2".to_string()];
+        let j = r#"[{"id":"AEG-1","state":"killed"},{"id":"AEG-2","state":"released"}]"#;
+        assert!(all_ended(j, &ids).is_ok());
+        let j = r#"[{"id":"AEG-1","state":"killed"},{"id":"AEG-2","state":"throttled"}]"#;
+        let e = all_ended(j, &ids).unwrap_err().to_string();
+        assert!(e.contains("AEG-2 is throttled"), "{e}");
+        assert!(all_ended(r#"[{"id":"AEG-1","state":"killed"}]"#, &ids).is_err());
     }
 
     #[test]

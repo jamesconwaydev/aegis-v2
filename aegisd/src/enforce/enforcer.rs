@@ -348,17 +348,42 @@ fn state(acts: &[ActionRecord]) -> Option<&str> {
     last_state(acts).map(|a| a.kind.as_str())
 }
 
-/// What enforcement left in place, for `incidents list`: held (scoped,
-/// frozen or only held), released, killed, or expired (an earlier
-/// boot). None if nothing was ever enforced.
-pub fn summary_state(acts: &[ActionRecord]) -> Option<&'static str> {
+/// What enforcement left in place, for `incidents list`. Ended:
+/// killed, released (thaw, lift_limits, or an unhold with no scope:
+/// a hold-only tree let go), expired (an earlier boot, whose scopes and
+/// holds went with it). In place: throttled (in the throttle scope),
+/// quarantined (in the -q scope and frozen), held (kernel holds only:
+/// the move failed, or the tree was moved but never frozen). None if
+/// nothing was ever enforced. Unlike `state`, this reads unhold too.
+pub fn summary_state(acts: &[ActionRecord], earlier_boot: bool) -> Option<&'static str> {
     if !acts.iter().any(|a| a.ok || holding(a)) {
         return None;
     }
-    Some(match state(acts) {
-        Some("thaw" | "lift_limits") => "released",
-        Some("kill") => "killed",
-        Some("expired") => "expired",
+    let scoped = acts.iter().any(|a| a.ok && a.kind == "scope");
+    let last = acts.iter().rev().filter(|a| a.ok).find(|a| {
+        matches!(
+            a.kind.as_str(),
+            "scope" | "attach" | "freeze" | "thaw" | "lift_limits" | "kill" | "expired" | "unhold"
+        )
+    });
+    let quarantine = |a: &ActionRecord| a.unit.as_deref().is_some_and(|u| u.ends_with("-q.scope"));
+    Some(match last.map(|a| (a.kind.as_str(), a)) {
+        Some(("kill", _)) => "killed",
+        Some(("thaw" | "lift_limits", _)) => "released",
+        Some(("unhold", _)) if !scoped => "released",
+        Some(("expired", _)) => "expired",
+        _ if earlier_boot => "expired",
+        Some((_, a)) if quarantine(a) => {
+            let frozen = acts
+                .iter()
+                .any(|f| f.ok && f.kind == "freeze" && f.unit == a.unit);
+            if frozen {
+                "quarantined"
+            } else {
+                "held"
+            }
+        }
+        Some(("scope" | "attach", _)) => "throttled",
         _ => "held",
     })
 }
@@ -1648,40 +1673,79 @@ mod tests {
 
     #[test]
     fn the_incident_list_shows_what_enforcement_left_in_place() {
-        let state = |f: &Fx| f.e.store.list()[0].state.clone();
-        let mut f = fx("state-q", ok);
-        assert_eq!(state(&f), None);
-        f.e.run(EnforceJob::Quarantine {
-            id: f.id.clone(),
-            pids: vec![k(10)],
-        });
-        assert_eq!(state(&f).as_deref(), Some("held"));
-        let id = f.id.clone();
-        run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply }).unwrap();
-        assert_eq!(state(&f).as_deref(), Some("released"));
-
-        let mut f = fx("state-k", ok);
-        f.e.run(EnforceJob::Quarantine {
-            id: f.id.clone(),
-            pids: vec![k(10)],
-        });
-        let id = f.id.clone();
-        run_reply(&mut f.e, |reply| EnforceJob::Kill { id, reply }).unwrap();
-        assert_eq!(state(&f).as_deref(), Some("killed"));
-
-        // The move failed, but the tree is held.
-        let mut f = fx("state-h", |p, a| {
+        fn state(f: &Fx) -> Option<String> {
+            f.e.store.list()[0].state.clone()
+        }
+        fn quarantine(f: &mut Fx) {
+            f.e.run(EnforceJob::Quarantine {
+                id: f.id.clone(),
+                pids: vec![k(10)],
+            });
+        }
+        fn end(f: &mut Fx, kill: bool) {
+            let id = f.id.clone();
+            let r = run_reply(&mut f.e, |reply| match kill {
+                true => EnforceJob::Kill { id, reply },
+                false => EnforceJob::Release { id, reply },
+            });
+            assert!(r.is_ok(), "{r:?}");
+        }
+        fn no_move(p: &str, a: &[String]) -> Result<String> {
             if a.get(4).is_some_and(|m| m == "StartTransientUnit") {
                 bail!("busctl: refused")
             }
             ok(p, a)
-        });
-        f.e.run(EnforceJob::Quarantine {
+        }
+
+        // Nothing enforced, then quarantined, then released by thaw.
+        let mut f = fx("state-q", ok);
+        assert_eq!(state(&f), None);
+        quarantine(&mut f);
+        assert_eq!(state(&f).as_deref(), Some("quarantined"));
+        end(&mut f, false);
+        assert_eq!(state(&f).as_deref(), Some("released"));
+
+        let mut f = fx("state-k", ok);
+        quarantine(&mut f);
+        end(&mut f, true);
+        assert_eq!(state(&f).as_deref(), Some("killed"));
+
+        // Throttled, then released by lifting the limits.
+        let mut f = fx("state-t", ok);
+        f.e.run(EnforceJob::Throttle {
             id: f.id.clone(),
             pids: vec![k(10)],
         });
+        assert_eq!(state(&f).as_deref(), Some("throttled"));
+        end(&mut f, false);
+        assert_eq!(state(&f).as_deref(), Some("released"));
+
+        // The move failed: kernel holds only. Released, it says so.
+        let mut f = fx("state-h", no_move);
+        quarantine(&mut f);
         assert_eq!(f.incident().verdict, "would_quarantine");
         assert_eq!(state(&f).as_deref(), Some("held"));
+        end(&mut f, false);
+        assert_eq!(state(&f).as_deref(), Some("released"));
+
+        // Moved but never frozen: held too, not quarantined.
+        let mut f = fx("state-nf", fail_freeze);
+        f.e.sys = Systemd::with(fail_freeze, alive).with_events(no_cgroup);
+        quarantine(&mut f);
+        assert_eq!(f.incident().verdict, "would_quarantine");
+        assert_eq!(state(&f).as_deref(), Some("held"));
+
+        // From an earlier boot: expired, whether or not anyone tried to
+        // end it, and nothing enforced still reads as none.
+        let mut f = fx("state-boot", ok);
+        quarantine(&mut f);
+        f.e.store = Arc::new(IncidentStore::open_at(&f.dir, Some("later".into()), 0).unwrap());
+        assert_eq!(state(&f).as_deref(), Some("expired"));
+        end(&mut f, false);
+        assert_eq!(state(&f).as_deref(), Some("expired"));
+        let f = fx("state-boot-none", ok);
+        let st = IncidentStore::open_at(&f.dir, Some("later".into()), 0).unwrap();
+        assert_eq!(st.list()[0].state, None);
     }
 
     #[test]
