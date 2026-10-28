@@ -1187,7 +1187,7 @@ pub fn parse_stat(stat: &str, hz: u64) -> Option<(u32, u64)> {
     let ticks: u64 = rest.get(19)?.parse().ok()?;
     // In u128: at 100 ticks a second, ticks * 10^9 passes u64::MAX once
     // a host has been up 5.8 years.
-    let ns = u128::from(ticks) * 1_000_000_000 / u128::from(hz);
+    let ns = (u128::from(ticks) * 1_000_000_000).checked_div(u128::from(hz))?;
     Some((ppid, u64::try_from(ns).ok()?))
 }
 
@@ -1208,6 +1208,12 @@ mod tests {
                        \0\0\0\0\0\0\0 51278 8355840 1172 18446744073709551615 1 1 0 0 0 0 \
                        65536 3670020 LD_AUDIT=1 1 0 0 17 3 0 0 0 0 0 0 0 0 0 0$0 0\xff0 ";
         assert_eq!(parse_stat(&String::from_utf8_lossy(fuzzed), 49), None);
+    }
+
+    #[test]
+    fn stat_with_no_tick_rate_is_unknown() {
+        let line = "7 (a) S 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0";
+        assert_eq!(parse_stat(line, 0), None);
     }
 
     struct Pid1;
