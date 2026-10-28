@@ -37,8 +37,9 @@ release it or kill it.
   clone, connect, send, mount, `bpf()`, module loading, ptrace, writes
   through any file descriptor, new user namespaces, and any signal to
   aegisd. A process that isn't held costs one map lookup per hook.
-  Separately, nothing but aegisd itself can attach a debugger to
-  aegisd, root included. (#26)
+  Separately, in audit mode too, no other process can ptrace aegisd,
+  root included: `strace -p`, `gdb -p` and `/proc/<pid>/mem` get
+  `EPERM`. Root can still stop it. (#26)
 - **`aegisctl incidents release` and `kill`.** Release thaws a
   quarantined tree, lifts its holds and restores its network, or lifts
   a throttle's limits. Kill sends SIGKILL to a quarantined tree, frozen
@@ -80,10 +81,13 @@ release it or kill it.
   Processes that were already running when aegisd started still get
   the `/proc` read. (#25)
 - **Uninstalling left systemd holding on.** After `dnf remove`,
-  `aegis.slice` stayed active and the removed unit stayed loaded. The
-  package now stops the aegis slices, deletes the `inet aegis` nftables
-  table, and reloads systemd on erase. Stopping the slices kills any
-  tree still quarantined, since nothing is left to release it.
+  `aegis.slice` stayed active and the removed unit stayed loaded. On
+  erase the package now reloads systemd, and stops the aegis slices and
+  deletes the `inet aegis` table when no incident scope is left. If a
+  throttled or quarantined tree is still there, it keeps all of that,
+  warns you, and the
+  [uninstall steps](https://github.com/jamesconwaydev/aegis-v2/blob/v0.2.0/docs/installation.md#uninstall)
+  say how to end it.
 - **The end-to-end SELinux check never looked.** Over ssh, `ausearch`
   read its stdin instead of the audit log and answered `<no matches>`
   every time, so the suite's "no denials" result for v0.1 proved

@@ -138,6 +138,19 @@ changed.
 
 ## Uninstall
 
+If aegisd ever ran in enforce mode, end what it's holding first, while
+`aegisctl` is still installed:
+
+```sh
+aegisctl incidents list
+aegisctl incidents release <id>   # or kill <id>
+```
+
+Do that for every incident whose verdict is `throttled` or
+`quarantined`.
+
+Then remove it:
+
 ```sh
 systemctl disable --now aegisd
 dnf remove aegis-v2 aegis-v2-selinux
@@ -145,7 +158,46 @@ rm -rf /var/lib/aegis-v2 /var/log/aegis-v2   # only if you want the incidents go
 ```
 
 `dnf remove` leaves incidents and logs in place, because aegisd created
-them at run time and the RPM doesn't own them.
+them at run time and the RPM doesn't own them. When no incident scope is
+left, it also stops `aegis.slice`, deletes the `inet aegis` nftables
+table and reloads systemd.
+
+If an `aegis-incident-*` scope is still there, removal leaves the
+scopes, the slice and the table alone and prints a warning. Stopping
+the slice would kill those trees, and deleting the table would give a
+quarantined one its network back without anyone deciding to.
+
+### If you already removed it
+
+Stopping aegisd lifted the kernel holds, but a quarantined tree is still
+frozen and cut off, and a throttled one still runs under its limits.
+List what's left:
+
+```sh
+systemctl list-units --all 'aegis-incident-*'
+```
+
+`aegis-incident-<id>-q.scope` is a quarantine, `aegis-incident-<id>.scope`
+a throttle. For each one, decide:
+
+```sh
+# End it. SIGKILL reaches a frozen tree too.
+systemctl kill --signal=SIGKILL aegis-incident-<id>-q.scope
+
+# Or let it go: thaw it now; its network comes back with the table below.
+systemctl thaw aegis-incident-<id>-q.scope
+
+# Or lift a throttle's limits.
+systemctl set-property --runtime aegis-incident-<id>.scope CPUQuota= MemoryHigh=infinity
+```
+
+Once nothing frozen is left that should stay cut off, remove the rules
+and the slice:
+
+```sh
+nft delete table inet aegis
+systemctl stop aegis.slice   # kills anything still running under it
+```
 
 ## Where to go next
 

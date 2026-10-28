@@ -59,6 +59,16 @@ Something changed the socket directory's ownership or mode. The unit
 creates it as root, 0700. Remove the directory and start the service
 again, so systemd recreates it.
 
+### `strace` or `gdb` on aegisd fails with `Operation not permitted`
+
+That's on purpose. While aegisd runs, a BPF LSM program refuses every
+other process, root included, an attach-level ptrace access to it:
+`strace -p`, `gdb -p`, `/proc/<pid>/mem` and `process_vm_readv`. It
+applies in audit mode too. To see what aegisd is doing, use
+`journalctl -u aegisd`, `aegisctl status`, or run it in the foreground
+with `--debug` on a test host. See the
+[threat model](threat-model.md#self-protection).
+
 ## aegisctl can't reach the daemon
 
 - `aegisd is not running (no socket at /run/aegis-v2/aegisd.sock)`:
@@ -220,6 +230,13 @@ aegisd doesn't rotate it. Set up logrotate with `copytruncate`; see
 
 An endpoint with `user:pass@` in it is rejected at load; put credentials
 in `[telemetry.otlp.headers]`.
+
+## A tree is still frozen after uninstalling
+
+Removing the package while a tree was quarantined or throttled leaves
+its scope, and the `inet aegis` table, in place, and `aegisctl` is gone.
+[Installation](installation.md#if-you-already-removed-it) has the
+commands to thaw it, end it, and clean up.
 
 ## SELinux denials
 

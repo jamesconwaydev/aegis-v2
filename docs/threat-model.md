@@ -63,10 +63,24 @@ aegisd runs confined: six capabilities, a read-only filesystem apart
 from its own directories, and its own SELinux domain. The control socket
 answers root only.
 
-That protects the host from a compromised aegisd. It doesn't protect
-aegisd from root, with two exceptions. No other process can attach a
-debugger to aegisd, root's included, and a held process can't send it
-any signal. Root can still stop it through systemd.
+That protects the host from a compromised aegisd. It mostly doesn't
+protect aegisd from root, with two exceptions that hold in audit and
+enforce mode alike:
+
+- **No debugger gets in.** While aegisd runs, the kernel refuses any
+  other process, root included, an attach-level ptrace access to it:
+  `strace -p`, `gdb -p`, reading or writing `/proc/<pid>/mem`, and
+  `process_vm_readv` or `process_vm_writev` all fail with `EPERM`.
+  Read-level access still works, so `ps`, `/proc/<pid>/status` and
+  `/proc/<pid>/maps` do too.
+- **A held process can't signal it.** Only held processes are refused;
+  root and systemd aren't.
+
+Root can still stop, restart or kill aegisd, through systemd or a
+signal, and that unloads every probe and hold program with it. Root can
+also edit the config or remove the package. The guard stops someone
+reading or steering a running aegisd from the inside, not someone
+turning it off.
 
 ## Known limitations
 
