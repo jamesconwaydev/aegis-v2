@@ -676,7 +676,8 @@ impl Enforcer {
             let r = self
                 .nft
                 .ensure_table()
-                .and_then(|()| self.nft.drop_cgroup(&cg));
+                .and_then(|()| self.drop_rule(&cg))
+                .map(|(h, _)| h);
             acts.push(act("nft_drop", Some(&unit), vec![], r.map(Some)));
         }
         let v = (moved && now_frozen).then_some("quarantined");
@@ -861,23 +862,73 @@ impl Enforcer {
                 return "";
             }
         };
-        if live.is_empty() {
+        let already_gone = || {
             let mut a = act("nft_remove", Some(unit), vec![], Ok(None));
             a.detail = Some("the rule was already gone".into());
-            acts.push(a);
+            a
+        };
+        if live.is_empty() {
+            acts.push(already_gone());
             return "; its drop rule was already gone";
         }
+        let mut all_gone = true;
         for h in live {
-            let r = self.nft.remove(h);
-            acts.push(act("nft_remove", Some(unit), vec![], r.map(|()| Some(h))));
+            let mut a = act(
+                "nft_remove",
+                Some(unit),
+                vec![],
+                self.nft.remove(h).map(|()| Some(h)),
+            );
+            // A ruleset flush since `find_rules` looked: nothing left to
+            // delete, and the tree has its network back either way.
+            let gone = !a.ok && self.rule_gone(h);
+            if gone {
+                a = already_gone();
+            }
+            all_gone &= gone;
+            acts.push(a);
         }
-        ""
+        if all_gone {
+            "; its drop rule was already gone"
+        } else {
+            ""
+        }
+    }
+
+    /// Whether the live table no longer has rule `h`, or no longer
+    /// exists. False if nft can't say.
+    fn rule_gone(&self, h: u64) -> bool {
+        let tail = format!("# handle {h}");
+        match self.nft.list() {
+            Ok(None) => true,
+            Ok(Some(l)) => !l.lines().any(|l| l.trim_end().ends_with(&tail)),
+            Err(_) => false,
+        }
+    }
+
+    /// Adds the drop rule for `cg`, returning its handle and whether
+    /// the table had to be recreated. If a ruleset flush took the table
+    /// since it was last seen, recreates it and tries once more, so a
+    /// `systemctl reload nftables` mid-job isn't recorded as a failure.
+    fn drop_rule(&self, cg: &str) -> Result<(u64, bool)> {
+        match self.nft.drop_cgroup(cg) {
+            Ok(h) => Ok((h, false)),
+            Err(e) => match self.nft.list() {
+                Ok(None) => {
+                    self.nft.ensure_table()?;
+                    Ok((self.nft.drop_cgroup(cg)?, true))
+                }
+                _ => Err(e),
+            },
+        }
     }
 
     /// Puts back the drop rule of each tree still quarantined in this
     /// boot whose rule a ruleset flush removed, recreating the table if
-    /// it went too. A poll, so a tree can have its network for up to
-    /// one interval. Nothing quarantined, no nft call. In audit mode it
+    /// it went too. That includes a tree moved into its -q scope whose
+    /// freeze failed: its holds lapse if aegisd restarts, the rule
+    /// doesn't. A poll, so a tree can have its network for up to one
+    /// interval. Nothing quarantined, no nft call. In audit mode it
     /// only restores a rule enforce mode added; a tree whose first rule
     /// failed gets one late only in enforce mode.
     fn reassert(&mut self) {
@@ -886,22 +937,32 @@ impl Enforcer {
             .store
             .list()
             .into_iter()
-            .filter(|s| s.verdict == "quarantined")
-            .map(|s| s.id)
-            .filter(|id| self.earlier_boot(id) == Some(false))
-            .filter(|id| {
-                let acts = self.actions(id);
+            .filter(|s| matches!(s.verdict.as_str(), "quarantined" | "would_quarantine"))
+            .filter(|s| self.earlier_boot(&s.id) == Some(false))
+            .filter(|s| {
+                let acts = self.actions(&s.id);
                 matches!(state(&acts), Some("scope" | "attach" | "freeze"))
                     && (enforcing || acts.iter().any(|a| a.ok && a.kind == "nft_drop"))
             })
-            // A tree no longer frozen has exited, leaving no cgroup for
-            // a rule to match, or was thawed outside aegisctl.
-            .filter(|id| matches!(self.sys.is_frozen(QUARANTINE_SLICE, &q_unit(id)), Ok(true)))
+            // A frozen tree no longer frozen has exited, leaving no
+            // cgroup for a rule to match, or was thawed outside
+            // aegisctl. One never frozen needs only a process left in
+            // its -q scope, which also means it was moved there.
+            .filter(|s| {
+                let unit = q_unit(&s.id);
+                let live = if s.verdict == "quarantined" {
+                    self.sys.is_frozen(QUARANTINE_SLICE, &unit)
+                } else {
+                    self.sys.is_populated(QUARANTINE_SLICE, &unit)
+                };
+                matches!(live, Ok(true))
+            })
+            .map(|s| s.id)
             .collect();
         if ids.is_empty() {
             return;
         }
-        let (listing, why) = match self.nft.list() {
+        let (listing, mut why) = match self.nft.list() {
             Ok(Some(l)) => (l, "re-added after the rule was removed"),
             Ok(None) => match self.nft.ensure_table() {
                 Ok(()) => (String::new(), "re-added after the table was removed"),
@@ -919,7 +980,14 @@ impl Enforcer {
                 .actions(&id)
                 .iter()
                 .any(|a| a.ok && a.kind == "nft_drop");
-            let r = self.nft.drop_cgroup(&cg);
+            let r = self.drop_rule(&cg).map(|(h, recreated)| {
+                if recreated {
+                    // A flush took the table since the listing: say so,
+                    // here and for the rest of this pass.
+                    why = "re-added after the table was removed";
+                }
+                h
+            });
             let mut a = act("nft_drop", Some(&unit), vec![], r.map(Some));
             let why = if had {
                 why
@@ -2748,6 +2816,272 @@ mod tests {
             pids: vec![k(10)],
         });
         assert_eq!(last_act(&f).kind, "nft_drop");
+        assert!(!last_act(&f).ok);
+        f.e.nft = Nft::with(ok);
+        take();
+        f.e.enforcing.store(false, Ordering::Relaxed);
+        f.e.run(EnforceJob::Reassert);
+        assert!(take().is_empty());
+        f.e.enforcing.store(true, Ordering::Relaxed);
+        f.e.run(EnforceJob::Reassert);
+        let a = last_act(&f);
+        assert_eq!((a.kind.as_str(), a.ok), ("nft_drop", true));
+        assert_eq!(
+            a.detail.as_deref(),
+            Some("added late: the first attempt failed")
+        );
+    }
+
+    thread_local! {
+        /// The nft verb `flush_first` flushes the ruleset in front of.
+        static FLUSH_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// `systemctl reload nftables` landing mid-job: the ruleset goes
+    /// just before the first nft call that starts with `FLUSH_AT`.
+    fn flush_first(prog: &str, a: &[String]) -> Result<String> {
+        let hit = FLUSH_AT.with(|f| {
+            let hit = f.get().is_some_and(|w| a.first().is_some_and(|s| s == w));
+            if hit {
+                f.set(None);
+            }
+            hit
+        });
+        if hit {
+            set_rules(None);
+        }
+        ok(prog, a)
+    }
+
+    #[test]
+    fn reassert_survives_a_flush_between_its_list_and_its_add() {
+        let (mut f, cg) = quarantined("re-race");
+        set_rules(Some(vec![]));
+        f.e.nft = Nft::with(flush_first);
+        FLUSH_AT.with(|w| w.set(Some("--echo")));
+        let failed = f.e.failed.load(Ordering::Relaxed);
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(rules(), Some(vec![(7, cg)]));
+        let a = last_act(&f);
+        assert_eq!(
+            (a.kind.as_str(), a.ok, a.nft_handle),
+            ("nft_drop", true, Some(7))
+        );
+        assert_eq!(f.e.failed.load(Ordering::Relaxed), failed);
+        assert!(!f.log().contains("enforcement failed"), "{}", f.log());
+        assert_eq!(
+            a.detail.as_deref(),
+            Some("re-added after the table was removed")
+        );
+    }
+
+    #[test]
+    fn a_failure_that_outlasts_the_recreated_table_is_recorded() {
+        /// Every add finds the table flushed again.
+        fn always_flush(prog: &str, a: &[String]) -> Result<String> {
+            if a.first().is_some_and(|s| s == "--echo") {
+                set_rules(None);
+            }
+            ok(prog, a)
+        }
+        let (mut f, _) = quarantined("re-persist");
+        set_rules(Some(vec![]));
+        f.e.nft = Nft::with(always_flush);
+        let failed = f.e.failed.load(Ordering::Relaxed);
+        f.e.run(EnforceJob::Reassert);
+        let a = last_act(&f);
+        assert_eq!((a.kind.as_str(), a.ok), ("nft_drop", false));
+        assert!(
+            a.error.as_deref().unwrap().contains("No such file"),
+            "{a:?}"
+        );
+        assert_eq!(f.e.failed.load(Ordering::Relaxed), failed + 1);
+        assert!(f.log().contains("enforcement failed"), "{}", f.log());
+        // Two adds, with the table recreated between them: no loop.
+        let adds = take().iter().filter(|c| c[1] == "--echo").count();
+        assert_eq!(adds, 2);
+    }
+
+    #[test]
+    fn a_first_quarantine_survives_a_flush_before_its_add() {
+        let mut f = fx("q-race", ok);
+        f.e.sys = Systemd::with(ok, alive).with_events(frozen);
+        f.e.nft = Nft::with(flush_first);
+        FLUSH_AT.with(|w| w.set(Some("--echo")));
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &q_unit(&f.id));
+        assert_eq!(rules(), Some(vec![(7, cg)]));
+        let a = last_act(&f);
+        assert_eq!(
+            (a.kind.as_str(), a.ok, a.nft_handle),
+            ("nft_drop", true, Some(7))
+        );
+        assert_eq!(f.incident().verdict, "quarantined");
+        assert_eq!(f.e.failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn release_and_kill_succeed_when_a_flush_beats_the_delete() {
+        for kill in [false, true] {
+            let (mut f, _) = quarantined(&format!("re-race-{kill}"));
+            f.e.nft = Nft::with(flush_first);
+            FLUSH_AT.with(|w| w.set(Some("delete")));
+            let id = f.id.clone();
+            let r = run_reply(&mut f.e, |reply| {
+                if kill {
+                    EnforceJob::Kill { id, reply }
+                } else {
+                    EnforceJob::Release { id, reply }
+                }
+            });
+            let r = r.unwrap_or_else(|e| panic!("kill={kill}: {e}"));
+            assert!(r.ends_with("; its drop rule was already gone"), "{r}");
+            let a = last_act(&f);
+            assert_eq!(
+                (a.kind.as_str(), a.ok, a.nft_handle),
+                ("nft_remove", true, None)
+            );
+            assert_eq!(a.detail.as_deref(), Some("the rule was already gone"));
+        }
+    }
+
+    #[test]
+    fn a_delete_whose_rule_left_the_live_table_is_already_gone() {
+        /// Something deletes the rule, but not the table, first.
+        fn rule_goes(prog: &str, a: &[String]) -> Result<String> {
+            if a.first().is_some_and(|s| s == "delete") {
+                set_rules(Some(vec![]));
+            }
+            ok(prog, a)
+        }
+        let (mut f, _) = quarantined("re-rulegone");
+        f.e.nft = Nft::with(rule_goes);
+        let id = f.id.clone();
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply }).unwrap();
+        assert!(r.ends_with("; its drop rule was already gone"), "{r}");
+        assert_eq!(rules(), Some(vec![]));
+        let a = last_act(&f);
+        assert_eq!(
+            (a.kind.as_str(), a.ok, a.nft_handle),
+            ("nft_remove", true, None)
+        );
+        assert_eq!(a.detail.as_deref(), Some("the rule was already gone"));
+    }
+
+    #[test]
+    fn a_delete_that_fails_with_the_rule_still_listed_is_an_error() {
+        fn no_delete(prog: &str, a: &[String]) -> Result<String> {
+            if a.first().is_some_and(|s| s == "delete") {
+                bail!("nft: exit Some(1): Error: Operation not permitted")
+            }
+            ok(prog, a)
+        }
+        let (mut f, _) = quarantined("re-nodelete");
+        f.e.nft = Nft::with(no_delete);
+        let id = f.id.clone();
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply });
+        assert!(r.is_err_and(|e| e.contains("Operation not permitted")));
+        assert!(!last_act(&f).ok);
+    }
+
+    fn unfrozen(_: &str) -> Result<String> {
+        Ok("populated 1\nfrozen 0\n".into())
+    }
+
+    #[test]
+    fn reassert_restores_the_rule_of_a_tree_moved_but_never_frozen() {
+        let mut f = fx("re-unfrozen", fail_freeze);
+        f.e.sys = Systemd::with(fail_freeze, alive).with_events(unfrozen);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        assert_eq!(f.incident().verdict, "would_quarantine");
+        let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &q_unit(&f.id));
+        assert_eq!(rules(), Some(vec![(7, cg.clone())]));
+        // Audit mode too: enforce mode put this rule in place.
+        f.e.enforcing.store(false, Ordering::Relaxed);
+        set_rules(None);
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(rules(), Some(vec![(7, cg)]));
+        assert_eq!(
+            last_act(&f).detail.as_deref(),
+            Some("re-added after the table was removed")
+        );
+        // Every process gone: no cgroup for a rule to match.
+        f.e.sys = Systemd::with(ok, alive).with_events(no_cgroup);
+        set_rules(None);
+        take();
+        f.e.run(EnforceJob::Reassert);
+        assert!(take().is_empty());
+    }
+
+    #[test]
+    fn an_unfrozen_tree_that_ended_gets_no_rule_back() {
+        fn unfrozen_q(name: &str) -> Fx {
+            let mut f = fx(name, fail_freeze);
+            f.e.sys = Systemd::with(fail_freeze, alive).with_events(unfrozen);
+            f.e.run(EnforceJob::Quarantine {
+                id: f.id.clone(),
+                pids: vec![k(10)],
+            });
+            assert_eq!(f.incident().verdict, "would_quarantine");
+            f
+        }
+        // Released: thawed and ended, though its scope is still populated.
+        let mut f = unfrozen_q("re-unfrozen-released");
+        let id = f.id.clone();
+        run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply }).unwrap();
+        set_rules(None);
+        take();
+        f.e.run(EnforceJob::Reassert);
+        assert!(take().is_empty());
+        // From an earlier boot.
+        let mut f = unfrozen_q("re-unfrozen-oldboot");
+        f.e.store = Arc::new(IncidentStore::open_at(&f.dir, Some("later".into()), 0).unwrap());
+        set_rules(None);
+        take();
+        f.e.run(EnforceJob::Reassert);
+        assert!(take().is_empty());
+        // Throttled only: populated, but in its throttle scope, not -q.
+        fn no_q(p: &str) -> Result<String> {
+            if p.contains("-q.scope") {
+                return no_cgroup(p);
+            }
+            unfrozen(p)
+        }
+        let mut f = fx("re-unfrozen-throttle", ok);
+        f.e.sys = Systemd::with(ok, alive).with_events(no_q);
+        f.e.run(EnforceJob::Throttle {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        assert_eq!(f.incident().verdict, "would_quarantine");
+        assert_eq!(state(&f.incident().actions), Some("scope"));
+        set_rules(None);
+        take();
+        f.e.run(EnforceJob::Reassert);
+        assert!(take().is_empty());
+    }
+
+    #[test]
+    fn an_unfrozen_tree_whose_first_rule_failed_gets_none_in_audit_mode() {
+        fn no_drop(prog: &str, a: &[String]) -> Result<String> {
+            if a.first().is_some_and(|s| s == "--echo") {
+                bail!("nft: exit Some(1): Error: Could not process rule")
+            }
+            fail_freeze(prog, a)
+        }
+        let mut f = fx("re-unfrozen-late", fail_freeze);
+        f.e.sys = Systemd::with(fail_freeze, alive).with_events(unfrozen);
+        f.e.nft = Nft::with(no_drop);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
         assert!(!last_act(&f).ok);
         f.e.nft = Nft::with(ok);
         take();

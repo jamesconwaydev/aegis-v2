@@ -296,6 +296,16 @@ tree stays frozen and held, so it can't use the network unless
 something thaws it. Each rule put back is recorded on its incident as
 an `nft_drop` that says why. This is a poll, not a watch on nftables.
 
+The check also covers a tree that was moved into its quarantine scope
+but never frozen, because both freeze attempts failed. Its incident
+stays `would_quarantine`, yet it got a drop rule, and it gets that rule
+back after a reload for as long as any of its processes are left in
+the scope. Its held processes can't connect anyway, but not every
+member is held: a child the walk found is moved into the scope
+unheld, and only its own fork job holds it later. If that job is lost,
+the rule is the one thing stopping it. The rule is also all that's
+left if aegisd restarts, since the holds go with it.
+
 In audit mode the check only puts back a rule that enforce mode added.
 If a quarantine's own rule failed, enforce mode adds it late on a
 check. Audit mode never does, because that would be a new action.
@@ -307,6 +317,14 @@ only. Kill looks before it sends SIGKILL, because once the scope
 empties nftables shows the rule by a bare cgroup id, not the path.
 Release of a scope that's already gone falls back to the recorded
 handle, but only when that handle's rule shows such a bare id.
+
+A reload can also land in the middle of one of these jobs, in the few
+milliseconds between nft calls. If the check's add fails and the table
+turns out to be gone, aegisd recreates it and adds the rule again
+rather than reporting a failed enforcement. If a release or kill's
+delete fails and the rule is no longer listed, that's recorded as "the
+rule was already gone", because the network is back either way. A
+failure with the rule still in place is still an error.
 
 ### Incident scopes are delegated
 
