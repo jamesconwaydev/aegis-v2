@@ -1,0 +1,48 @@
+name: Wiki
+
+# docs/ is the source; the wiki is a copy of it as of the latest release,
+# so what people browse matches what they can install.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # the wiki is a git repository under the same token
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Clone the wiki
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki \
+            || { echo "::error::No wiki to push to. Create its first page on GitHub, then rerun."; exit 1; }
+      - name: Copy docs into wiki pages
+        env:
+          REF: ${{ github.event.release.tag_name || github.ref_name }}
+        run: python3 .github/wiki.py docs wiki "$REF"
+      - name: Push
+        working-directory: wiki
+        env:
+          REF: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          git add -A
+          if git diff --cached --quiet; then echo "wiki already current"; exit 0; fi
+          git -c user.name="James Conway" \
+              -c user.email="148910373+jamesconwaydev@users.noreply.github.com" \
+              commit -q -m "Docs as of $REF"
+          git push -q origin HEAD

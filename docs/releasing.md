@@ -83,6 +83,11 @@ gh release edit v0.2.0 --draft=false
 
 ## After publishing
 
+Publishing the release also runs the Wiki workflow, which copies
+`docs/` into the [wiki](https://github.com/jamesconwaydev/aegis-v2/wiki)
+as of the new tag. The wiki is a copy: edit `docs/`, never the wiki,
+or the next release overwrites the change.
+
 Install the released x86_64 RPM on a freshly rebuilt test host and run
 the end-to-end scenarios against it. See
 [development](development.md#end-to-end-tests).

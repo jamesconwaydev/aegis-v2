@@ -2,8 +2,7 @@
 
 Everything below the current release is **planned**. None of it ships
 today, and plans can change. For what the current release does, see the
-[overview](overview.md), and for a one-table summary, the
-[README](../README.md#today-versus-planned).
+[overview](overview.md).
 
 Each release goes through the same path: pull requests with green CI,
 end-to-end tests on a real Rocky 10 host, then a tagged pre-release with
