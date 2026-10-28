@@ -277,6 +277,52 @@ Adding a scenario means adding a `[[scenario]]` with a `name`, a shell
 (a shell snippet run under `set -e`) when it needs them.
 `aegis-sim --help` lists the simulators.
 
+## Fuzzing
+
+Some of what aegisd reads, it doesn't control. The config is hand-edited.
+Any root process can write to the control socket. A crash or a full disk
+can leave an incident file half-written, and a watched process gets a say
+in what its own `/proc` files contain. Each of those parsers has a fuzz
+target in `fuzz/`, and none of them may panic, hang or eat memory,
+whatever bytes it's handed:
+
+| Target | What it feeds |
+| --- | --- |
+| `config` | `Config::load_checked`: `config.toml` plus one drop-in |
+| `proto_request` | a socket line into `Request`; `is_incident_id`, `clean` |
+| `incident_store` | `incident.json` and `timeline.jsonl` into `IncidentStore` |
+| `proc_parsers` | `parse_stat`, `env_taint`, `is_service_cgroup`, `in_unit` |
+| `nft_listing` | `Nft::echoed_handle`, `Nft::unresolved`, `Nft::handles` |
+
+The fuzz crate sits outside the workspace, because cargo-fuzz needs
+nightly. Its `rust-toolchain.toml` pins the same nightly the image
+already carries for the eBPF crate, so all you add is cargo-fuzz. To give
+one target five minutes:
+
+```sh
+podman run --rm -v "$PWD:/src:z" -w /src/fuzz \
+    -v aegis-cargo-aarch64:/usr/local/cargo/registry \
+    -v aegis-target-aarch64:/target -e CARGO_TARGET_DIR=/target/fuzz \
+    aegis-build:rocky10-aarch64 sh -c '
+        cargo install cargo-fuzz --locked --version 0.13.2 &&
+        cargo fuzz run config corpus/config seeds/config -- -max_total_time=300'
+```
+
+`cargo fuzz list` names the rest. `seeds/<target>` holds a handful of
+real inputs to start from; what the fuzzer learns piles up in
+`corpus/<target>`, which git ignores.
+
+When it finds a crash, it saves the input under `artifacts/<target>/` and
+prints the command that replays it. That crash is a bug. Fix it, and add
+the input to a unit test beside the code it broke, one that fails
+without your fix.
+
+On a pull request that touches Rust, ClusterFuzzLite builds the same
+targets and fuzzes them for five minutes between them
+(`.github/workflows/cflite_pr.yml`). Under `--cfg fuzzing`,
+`aegisd/build.rs` skips the probes, so that build needs no BPF
+toolchain.
+
 ## Licences and CI
 
 `deny.toml` says which licences a dependency may carry, and the list is
@@ -292,6 +338,10 @@ the Rust jobs, and a skipped job counts as passing. If the step that
 decides breaks, every job runs. Pushing again
 cancels the run it replaces, and every job has a timeout, so nothing
 runs on after it's useful.
+
+A PR that touches Rust also gets fuzzed (see [Fuzzing](#fuzzing)). That
+check isn't required for a merge, but a crash it reports is a bug to fix
+before one.
 
 Pushing a `v*.*.*` tag builds the x86_64 and aarch64 RPMs and publishes
 a GitHub release with a `SHA256SUMS` file. The notes come from that

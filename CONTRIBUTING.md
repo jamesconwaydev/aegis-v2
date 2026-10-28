@@ -61,6 +61,12 @@ cargo test
 ```
 
 New behaviour needs a test. A bug fix needs one that fails without the fix.
+
+Changing a parser? Run its fuzz target for a few minutes too. Anything
+that reads the config, the control socket, an incident file or `/proc`
+has one, and
+[docs/development.md](docs/development.md#fuzzing) shows how. CI fuzzes
+every Rust PR as well, but your machine finds it sooner.
 If you changed something a user would notice, add a line to `CHANGELOG.md`
 under `[Unreleased]`.
 
