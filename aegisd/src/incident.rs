@@ -117,8 +117,8 @@ impl EvidenceRecord {
 /// must survive a daemon restart.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActionRecord {
-    /// "hold" | "scope" | "freeze" | "nft_drop" | "thaw" | "unhold" |
-    /// "nft_remove" | "kill" | "lift_limits"
+    /// "hold" | "scope" | "attach" | "freeze" | "nft_drop" | "thaw" |
+    /// "unhold" | "nft_remove" | "kill" | "lift_limits" | "expired"
     pub kind: String,
     pub ok: bool,
     #[serde(default)]
@@ -127,6 +127,10 @@ pub struct ActionRecord {
     pub nft_handle: Option<u64>,
     #[serde(default)]
     pub pids: Vec<u32>,
+    /// A hold's start times, one per pid: release unholds a tgid only
+    /// while it is still the process that was held.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub start_times: Vec<u64>,
     #[serde(default)]
     pub error: Option<String>,
     pub ts: String,
@@ -576,6 +580,13 @@ impl IncidentStore {
         Ok(())
     }
 
+    /// The boot this store was opened in; an incident from any other
+    /// has nothing left on the host.
+    pub fn boot_id(&self) -> Option<String> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.boot_id.clone()
+    }
+
     pub fn list(&self) -> Vec<IncidentSummary> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.incidents
@@ -935,6 +946,7 @@ mod tests {
             unit: ok.then(|| "aegis-hold-1.scope".to_string()),
             nft_handle: None,
             pids: vec![10],
+            start_times: vec![],
             error: (!ok).then(|| "boom".to_string()),
             ts: "2026-10-21T09:00:00Z".into(),
         }

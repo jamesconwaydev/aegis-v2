@@ -18,7 +18,8 @@ use super::systemd::Run;
 use super::systemd::{Limits, Systemd};
 use crate::config::Mode;
 use crate::ebpf::Holds;
-use crate::incident::{ActionRecord, IncidentId, IncidentStore};
+use crate::incident::{verdict_rank, ActionRecord, IncidentId, IncidentStore};
+use crate::pipeline::{proc_start_matches, proc_start_time};
 use crate::proctable::{ProcKey, ProcTable};
 use crate::scoring::Tier;
 use crate::telemetry::{now_ns, rfc3339, Sinks, TelemetryRecord};
@@ -30,6 +31,9 @@ const THROTTLE_SLICE: &str = "aegis-throttle.slice";
 /// How long a throttle or quarantine waits for the writer thread to
 /// create its incident. Nothing is done to a tree that has no record.
 const INCIDENT_WAIT: Duration = Duration::from_secs(5);
+/// Most processes the `/proc` children walk adds to one quarantine: a
+/// tree that forks faster than it can be read is cut off, not chased.
+const MAX_FOUND: usize = 1024;
 
 /// Where a release or kill answers: Ok with a message, or Err with why.
 pub type Reply = tokio::sync::oneshot::Sender<Result<String, String>>;
@@ -81,6 +85,7 @@ pub fn spawn_enforcer(
         dropped: h.dropped.clone(),
         wait: INCIDENT_WAIT,
         unsaved: HashMap::new(),
+        children: proc_children,
     };
     std::thread::Builder::new()
         .name("aegis-enforce".into())
@@ -120,6 +125,32 @@ pub fn target_set(table: &ProcTable, members: &[ProcKey], me: u32) -> Vec<ProcKe
     out
 }
 
+/// Children of `k` from `/proc/<tgid>/task/*/children`, each keyed by its
+/// `/proc` start time; nothing once `k` is no longer that process.
+fn proc_children(k: ProcKey) -> Vec<ProcKey> {
+    if !proc_start_matches(k.tgid, k.start_time_ns) {
+        return Vec::new();
+    }
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", k.tgid)) else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter_map(|t| std::fs::read_to_string(t.path().join("children")).ok())
+        .flat_map(|s| {
+            s.split_whitespace()
+                .filter_map(|c| c.parse().ok())
+                .collect::<Vec<u32>>()
+        })
+        .filter_map(|tgid| {
+            Some(ProcKey {
+                tgid,
+                start_time_ns: proc_start_time(tgid)?,
+            })
+        })
+        .collect()
+}
+
 fn q_unit(id: &str) -> String {
     format!("aegis-incident-{id}-q.scope")
 }
@@ -139,6 +170,7 @@ fn act(kind: &str, unit: Option<&str>, pids: Vec<u32>, r: Result<Option<u64>>) -
         unit: unit.map(String::from),
         nft_handle,
         pids,
+        start_times: Vec::new(),
         error,
         ts: rfc3339(now_ns()),
     }
@@ -146,18 +178,19 @@ fn act(kind: &str, unit: Option<&str>, pids: Vec<u32>, r: Result<Option<u64>>) -
 
 /// The last thing that changed the tree's state, ignoring bookkeeping
 /// (holds, rules): a scope, attach or freeze means enforced; thaw,
-/// lift_limits or kill means an admin already ended it.
+/// lift_limits or kill means an admin already ended it, and expired
+/// that it was from an earlier boot.
+fn last_state(acts: &[ActionRecord]) -> Option<&ActionRecord> {
+    acts.iter().rev().filter(|a| a.ok).find(|a| {
+        matches!(
+            a.kind.as_str(),
+            "scope" | "attach" | "freeze" | "thaw" | "lift_limits" | "kill" | "expired"
+        )
+    })
+}
+
 fn state(acts: &[ActionRecord]) -> Option<&str> {
-    acts.iter()
-        .rev()
-        .filter(|a| a.ok)
-        .map(|a| a.kind.as_str())
-        .find(|k| {
-            matches!(
-                *k,
-                "scope" | "attach" | "freeze" | "thaw" | "lift_limits" | "kill"
-            )
-        })
+    last_state(acts).map(|a| a.kind.as_str())
 }
 
 /// nft rules added and not yet removed.
@@ -191,6 +224,8 @@ pub struct Enforcer {
     /// the verdict they earned. Release and kill read these too, and the
     /// next job for the incident writes them first.
     unsaved: HashMap<String, (Vec<ActionRecord>, Option<&'static str>)>,
+    /// Lists a process's children; tests pass a fake.
+    children: fn(ProcKey) -> Vec<ProcKey>,
 }
 
 impl Enforcer {
@@ -264,18 +299,53 @@ impl Enforcer {
     }
 
     fn throttle(&mut self, id: &str, pids: &[ProcKey]) {
-        // Already moved (a restart re-sending, say): a throttle scope
-        // must never pull a frozen tree out of its quarantine scope.
-        if state(&self.actions(id)).is_some() {
-            return;
-        }
         let unit = t_unit(id);
-        let r = self
-            .sys
-            .start_scope(&unit, THROTTLE_SLICE, pids, Some(self.limits));
-        let a = act("scope", Some(&unit), tgids(pids), r.map(|_| None));
+        // A newcomer to a throttled tree joins its scope. Anything else
+        // stands: a throttle scope must never pull a frozen tree out of
+        // its quarantine scope, nor undo a release.
+        let prior = self.actions(id);
+        let kind = match last_state(&prior) {
+            // The tree's own move failed: a newcomer must not start the
+            // scope with only itself in it.
+            None if prior.iter().any(|a| a.kind == "scope") => return,
+            None => "scope",
+            Some(a)
+                if matches!(a.kind.as_str(), "scope" | "attach")
+                    && a.unit.as_deref() == Some(unit.as_str()) =>
+            {
+                "attach"
+            }
+            Some(_) => return,
+        };
+        let r = if kind == "scope" {
+            self.sys
+                .start_scope(&unit, THROTTLE_SLICE, pids, Some(self.limits))
+        } else {
+            self.sys.attach(&unit, pids)
+        };
+        let a = act(kind, Some(&unit), tgids(pids), r.map(|_| None));
         let v = a.ok.then_some("throttled");
         self.finish(id, vec![a], v);
+    }
+
+    /// `pids` and every descendant `/proc` lists below them, walked until
+    /// nothing new turns up: children forked after the job was queued,
+    /// or whose Fork event was lost. pid 1, kthreadd and aegisd are never
+    /// added; nothing above `pids` is ever reached.
+    fn with_children(&self, pids: &[ProcKey]) -> Vec<ProcKey> {
+        let me = std::process::id();
+        let mut seen: HashSet<u32> = pids.iter().map(|k| k.tgid).collect();
+        let mut all = pids.to_vec();
+        let mut i = 0;
+        while i < all.len() && all.len() < pids.len() + MAX_FOUND {
+            for c in (self.children)(all[i]) {
+                if !matches!(c.tgid, 1 | 2) && c.tgid != me && seen.insert(c.tgid) {
+                    all.push(c);
+                }
+            }
+            i += 1;
+        }
+        all
     }
 
     /// Hold, move, freeze, cut off. Each step is recorded; the verdict
@@ -284,7 +354,7 @@ impl Enforcer {
     fn quarantine(&mut self, id: &str, pids: &[ProcKey]) {
         let prior = self.actions(id);
         // An admin released or killed it; that stands.
-        if matches!(state(&prior), Some("thaw" | "kill")) || pids.is_empty() {
+        if matches!(state(&prior), Some("thaw" | "kill" | "expired")) || pids.is_empty() {
             return;
         }
         let unit = q_unit(id);
@@ -303,7 +373,7 @@ impl Enforcer {
         let (mut held, mut errs) = (Vec::new(), Vec::new());
         for k in pids {
             match self.holds.hold(*k) {
-                Ok(()) => held.push(k.tgid),
+                Ok(()) => held.push(*k),
                 Err(e) => errs.push(format!("{e:#}")),
             }
         }
@@ -312,13 +382,31 @@ impl Enforcer {
         } else {
             Err(anyhow::anyhow!(errs.join("; ")))
         };
-        acts.push(act("hold", None, held, r));
+        let mut a = act("hold", None, tgids(&held), r);
+        a.start_times = held.iter().map(|k| k.start_time_ns).collect();
+        acts.push(a);
 
-        // A newcomer joins the scope the tree is already in.
+        // The held can no longer fork, so this walk ends. What it finds
+        // is moved and frozen with the tree but not held: /proc gives a
+        // start time only to the clock tick, and the kernel matches holds
+        // to the nanosecond. Each one's Fork event brings a job of its
+        // own, with the exact key, that holds it.
+        let all = self.with_children(pids);
+        let pids = &all[..];
+
+        // A newcomer joins the scope the tree is already in. If the
+        // tree's own move failed it is only held, like the tree: a scope
+        // holding the newcomer alone would freeze it and call the
+        // incident quarantined.
+        let tried = prior
+            .iter()
+            .any(|a| a.kind == "scope" && a.unit.as_deref() == Some(unit.as_str()));
         let moved = if scoped {
             let r = self.sys.attach(&unit, pids);
             acts.push(act("attach", Some(&unit), tgids(pids), r.map(|_| None)));
             acts.last().unwrap().ok
+        } else if tried {
+            false
         } else {
             let r = self.sys.start_scope(&unit, QUARANTINE_SLICE, pids, None);
             acts.push(act("scope", Some(&unit), tgids(pids), r.map(|_| None)));
@@ -352,12 +440,39 @@ impl Enforcer {
         let prior = self.actions(id);
         let unit = q_unit(id);
         self.refuse_ended(id, &prior)?;
+        if let Some(r) = self.expire(id) {
+            return r;
+        }
         let quarantined = prior
             .iter()
             .any(|a| holding(a) || (a.ok && a.unit.as_deref() == Some(unit.as_str())));
         let mut acts = Vec::new();
         let mut done = format!("released {id}: limits lifted");
         if quarantined {
+            // Unhold before the thaw: the tree is still frozen while the
+            // holds come off, so it never wakes to find every write,
+            // connect and fork refused.
+            let keys: BTreeSet<(u32, u64)> = prior
+                .iter()
+                .filter(|a| a.kind == "hold")
+                .flat_map(|a| a.pids.iter().copied().zip(a.start_times.iter().copied()))
+                .collect();
+            let errs: Vec<String> = keys
+                .iter()
+                .filter_map(|&(tgid, start_time_ns)| {
+                    let k = ProcKey {
+                        tgid,
+                        start_time_ns,
+                    };
+                    self.holds.release(k).err().map(|e| format!("{e:#}"))
+                })
+                .collect();
+            let r = if errs.is_empty() {
+                Ok(None)
+            } else {
+                Err(anyhow::anyhow!(errs.join("; ")))
+            };
+            acts.push(act("unhold", None, keys.iter().map(|k| k.0).collect(), r));
             // Always thaw: a freeze recorded as failed may still have
             // taken effect, and thawing an unfrozen unit is harmless.
             if prior.iter().any(|a| a.ok && a.kind == "scope") {
@@ -368,21 +483,6 @@ impl Enforcer {
                 }
                 acts.push(a);
             }
-            let pids: BTreeSet<u32> = prior
-                .iter()
-                .filter(|a| a.kind == "hold")
-                .flat_map(|a| a.pids.iter().copied())
-                .collect();
-            let errs: Vec<String> = pids
-                .iter()
-                .filter_map(|&p| self.holds.release(p).err().map(|e| format!("{e:#}")))
-                .collect();
-            let r = if errs.is_empty() {
-                Ok(None)
-            } else {
-                Err(anyhow::anyhow!(errs.join("; ")))
-            };
-            acts.push(act("unhold", None, pids.into_iter().collect(), r));
             self.remove_rules(&prior, &unit, &mut acts);
             done = format!("released {id}: thawed, network restored");
             // The tree stays in its -q scope, so its accounting
@@ -400,6 +500,9 @@ impl Enforcer {
         let prior = self.actions(id);
         let unit = q_unit(id);
         self.refuse_ended(id, &prior)?;
+        if let Some(r) = self.expire(id) {
+            return r;
+        }
         if !prior
             .iter()
             .any(|a| a.ok && a.unit.as_deref() == Some(unit.as_str()))
@@ -424,8 +527,25 @@ impl Enforcer {
         match state(prior) {
             Some("thaw" | "lift_limits") => Err(format!("{id} is already released")),
             Some("kill") => Err(format!("{id} is already killed")),
+            Some("expired") => Err(format!("{id} is from an earlier boot and already ended")),
             _ => Ok(()),
         }
+    }
+
+    /// An incident from an earlier boot: its scope and rule went with
+    /// that boot, and its tgids and nft handles may name something else
+    /// now. Nothing on the host is touched; it is recorded as ended.
+    fn expire(&mut self, id: &str) -> Option<Result<String, String>> {
+        let now = self.store.boot_id().unwrap_or_default();
+        if self.store.get(&IncidentId(id.into()))?.boot_id == now {
+            return None;
+        }
+        let a = act("expired", None, vec![], Ok(None));
+        Some(self.conclude(
+            id,
+            vec![a],
+            format!("{id} is from an earlier boot; nothing of it is left on this host"),
+        ))
     }
 
     fn remove_rules(&self, prior: &[ActionRecord], unit: &str, acts: &mut Vec<ActionRecord>) {
@@ -469,10 +589,17 @@ impl Enforcer {
         let (mut all, earlier) = self.unsaved.remove(id).unwrap_or_default();
         all.extend(acts);
         let verdict = verdict.or(earlier);
-        if let Err(e) = self
-            .store
-            .add_actions(&IncidentId(id.into()), all.clone(), verdict)
-        {
+        let iid = IncidentId(id.into());
+        let before = self.store.get(&iid).map_or(0, |i| verdict_rank(&i.verdict));
+        let saved = self.store.add_actions(&iid, all.clone(), verdict);
+        // Say so once, when the verdict rises: a newcomer joining a
+        // tree already quarantined is not news.
+        if let (Ok(()), Some(v)) = (&saved, verdict) {
+            if verdict_rank(v) > before {
+                self.report(id, done(v, &all));
+            }
+        }
+        if let Err(e) = saved {
             self.failed.fetch_add(1, Ordering::Relaxed);
             // Nothing else knows what is now on the host: say what to undo.
             let mut undo: Vec<String> = all
@@ -528,6 +655,27 @@ impl Enforcer {
             reasons: vec![reason],
         });
     }
+}
+
+/// The reason on the record that announces a verdict the enforcer
+/// earned.
+fn done(verdict: &str, acts: &[ActionRecord]) -> String {
+    if verdict == "throttled" {
+        return "enforcement done: moved into a CPU and memory limited scope".into();
+    }
+    let mut words: Vec<&str> = acts
+        .iter()
+        .filter(|a| a.ok)
+        .filter_map(|a| match a.kind.as_str() {
+            "hold" => Some("held"),
+            "scope" | "attach" => Some("moved"),
+            "freeze" => Some("frozen"),
+            "nft_drop" => Some("egress dropped"),
+            _ => None,
+        })
+        .collect();
+    words.dedup();
+    format!("enforcement done: {}", words.join(", "))
 }
 
 /// A hold that left pids held, even if part of it failed.
@@ -674,6 +822,7 @@ mod tests {
             dropped: Arc::default(),
             wait: Duration::ZERO,
             unsaved: HashMap::new(),
+            children: |_| Vec::new(),
         };
         Fx { e, id, dir }
     }
@@ -967,8 +1116,8 @@ mod tests {
         assert_eq!(
             kinds[4..],
             [
-                ("thaw".into(), true),
                 ("unhold".into(), true),
+                ("thaw".into(), true),
                 ("nft_remove".into(), true)
             ]
         );
@@ -1093,6 +1242,7 @@ mod tests {
             dropped: Arc::default(),
             wait: Duration::ZERO,
             unsaved: HashMap::new(),
+            children: |_| Vec::new(),
         };
         let r = run_reply(&mut e2, |reply| EnforceJob::Release {
             id: id.clone(),
@@ -1233,8 +1383,8 @@ mod tests {
                 "scope",
                 "freeze",
                 "nft_drop",
-                "thaw",
                 "unhold",
+                "thaw",
                 "nft_remove"
             ]
         );
@@ -1286,6 +1436,40 @@ mod tests {
                 f.id
             ))
         );
+    }
+
+    #[test]
+    fn a_newcomer_after_a_failed_move_is_held_not_scoped_alone() {
+        fn fail_scope(prog: &str, a: &[String]) -> Result<String> {
+            CALLS.with(|c| c.borrow_mut().push([&[prog.to_string()], a].concat()));
+            if prog.ends_with("busctl") {
+                bail!("busctl: exit Some(1)")
+            }
+            ok(prog, a)
+        }
+        let mut f = fx("q-nomove", fail_scope);
+        for k in [k(10), k(12)] {
+            f.e.run(EnforceJob::Quarantine {
+                id: f.id.clone(),
+                pids: vec![k],
+            });
+        }
+        f.e.run(EnforceJob::Throttle {
+            id: f.id.clone(),
+            pids: vec![k(13)],
+        });
+        // One StartTransientUnit, for the tree; nothing after it.
+        assert_eq!(take().len(), 1);
+        assert_eq!(f.e.holds.held(), 2);
+        assert_eq!(f.incident().verdict, "would_quarantine");
+        let mut f = fx("t-nomove", fail_scope);
+        for k in [k(10), k(12)] {
+            f.e.run(EnforceJob::Throttle {
+                id: f.id.clone(),
+                pids: vec![k],
+            });
+        }
+        assert_eq!(take().len(), 1);
     }
 
     #[test]
@@ -1342,5 +1526,170 @@ mod tests {
         assert!(rx.try_recv().unwrap().is_ok());
         let deletes = take().iter().filter(|a| a[1] == "delete").count();
         assert_eq!(deletes, 1);
+    }
+    #[test]
+    fn children_forked_before_the_hold_are_moved_with_the_tree() {
+        fn kids(p: ProcKey) -> Vec<ProcKey> {
+            match p.tgid {
+                10 => vec![k(20)],
+                // pid 1 can never be a child, but is refused even so.
+                20 => vec![k(21), k(1), k(10)],
+                _ => vec![],
+            }
+        }
+        let mut f = fx("kids", ok);
+        f.e.children = kids;
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let inc = f.incident();
+        assert_eq!(inc.verdict, "quarantined");
+        // Only the job's own keys are held; what /proc found is moved.
+        assert_eq!(inc.actions[0].pids, [10]);
+        assert_eq!(inc.actions[0].start_times, [110]);
+        assert_eq!(inc.actions[1].kind, "scope");
+        assert_eq!(inc.actions[1].pids, [10, 20, 21]);
+        let c = take();
+        assert!(
+            c[0].windows(5).any(|w| w == ["au", "3", "10", "20", "21"]),
+            "{:?}",
+            c[0]
+        );
+    }
+
+    #[test]
+    fn newcomer_to_a_throttled_tree_joins_its_scope() {
+        let mut f = fx("t-new", ok);
+        f.e.run(EnforceJob::Throttle {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        take();
+        f.e.run(EnforceJob::Throttle {
+            id: f.id.clone(),
+            pids: vec![k(12)],
+        });
+        let c = take();
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!(c[0].contains(&"AttachProcessesToUnit".into()));
+        assert!(c[0].contains(&format!("aegis-incident-{}.scope", f.id)));
+        assert_eq!(f.kinds(), [("scope".into(), true), ("attach".into(), true)]);
+        // Once quarantined, a throttle job never pulls anything back out.
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10), k(12)],
+        });
+        take();
+        f.e.run(EnforceJob::Throttle {
+            id: f.id.clone(),
+            pids: vec![k(13)],
+        });
+        assert!(take().is_empty());
+    }
+
+    #[test]
+    fn success_is_announced_once_with_the_verdict_earned() {
+        let mut f = fx("announce", ok);
+        // A throttle under a would_quarantine verdict raises nothing.
+        f.e.run(EnforceJob::Throttle {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        // A newcomer to the quarantined tree is not news.
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(12)],
+        });
+        let done: Vec<serde_json::Value> = f
+            .log()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v.to_string().contains("enforcement done"))
+            .collect();
+        assert_eq!(done.len(), 1, "{}", f.log());
+        assert_eq!(done[0]["verdict"], "quarantined");
+        assert_eq!(
+            done[0]["reasons"][0],
+            "enforcement done: held, moved, frozen, egress dropped"
+        );
+    }
+
+    #[test]
+    fn release_or_kill_from_an_earlier_boot_touches_nothing() {
+        for kill in [false, true] {
+            let mut f = fx(&format!("oldboot-{kill}"), ok);
+            let id = f.id.clone();
+            f.e.run(EnforceJob::Quarantine {
+                id: id.clone(),
+                pids: vec![k(10)],
+            });
+            take();
+            // After a reboot: a new store boot, an empty hold map, and
+            // tgid 10 now someone else's, held for another incident.
+            f.e.store = Arc::new(IncidentStore::open_at(&f.dir, Some("later".into()), 0).unwrap());
+            f.e.holds = Holds::default();
+            f.e.holds
+                .hold(ProcKey {
+                    tgid: 10,
+                    start_time_ns: 999,
+                })
+                .unwrap();
+            let job = |reply: Option<Reply>| {
+                if kill {
+                    EnforceJob::Kill {
+                        id: id.clone(),
+                        reply,
+                    }
+                } else {
+                    EnforceJob::Release {
+                        id: id.clone(),
+                        reply,
+                    }
+                }
+            };
+            let r = run_reply(&mut f.e, job);
+            assert_eq!(
+                r,
+                Ok(format!(
+                    "{id} is from an earlier boot; nothing of it is left on this host"
+                ))
+            );
+            assert!(take().is_empty());
+            assert_eq!(f.e.holds.held(), 1);
+            assert_eq!(f.kinds().last().unwrap(), &("expired".into(), true));
+            let r = run_reply(&mut f.e, job);
+            assert_eq!(
+                r,
+                Err(format!("{id} is from an earlier boot and already ended"))
+            );
+            assert!(take().is_empty());
+        }
+    }
+
+    #[test]
+    fn release_leaves_a_reused_tgid_held() {
+        let mut f = fx("reused", ok);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        // 10 exited (the kernel dropped its hold) and the tgid now
+        // belongs to a process held for another incident.
+        f.e.holds = Holds::default();
+        f.e.holds
+            .hold(ProcKey {
+                tgid: 10,
+                start_time_ns: 999,
+            })
+            .unwrap();
+        let id = f.id.clone();
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply });
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(f.e.holds.held(), 1);
     }
 }

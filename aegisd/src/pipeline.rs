@@ -334,6 +334,7 @@ impl Pipeline {
                     start_time_ns: ev.child_start_time_ns,
                 };
                 self.scorer.on_fork(&key, &child, ev.ts_ns);
+                self.enforce_fork(key, child);
                 // A child forked while its parent's exe is being verified
                 // shares the image, so it waits on the same verdict.
                 for w in self.pending.values_mut() {
@@ -858,6 +859,32 @@ impl Pipeline {
         });
     }
 
+    /// A child of a process already throttled or quarantined joins it at
+    /// once, scored or not: a quiet worker forked before the hold must
+    /// not stay behind in the old cgroup.
+    // Scans `enforced` per fork in enforce mode; index covered keys
+    // by incident if that ever shows up in a profile.
+    fn enforce_fork(&mut self, parent: ProcKey, child: ProcKey) {
+        if self.mode != Mode::Enforce
+            || matches!(child.tgid, 1 | 2)
+            || child.tgid == std::process::id()
+        {
+            return;
+        }
+        for (g, (tier, covered)) in &mut self.enforced {
+            if covered.contains(&parent) {
+                if covered.insert(child) {
+                    let (id, pids) = (g.clone(), vec![child]);
+                    self.to_enforce.push(match tier {
+                        Tier::Quarantine => EnforceJob::Quarantine { id, pids },
+                        _ => EnforceJob::Throttle { id, pids },
+                    });
+                }
+                return;
+            }
+        }
+    }
+
     /// Whether incident `g` should record this decision: its first, a
     /// tier rise, this process showing this signal kind for the first
     /// time, or a heartbeat since the incident last recorded.
@@ -1038,6 +1065,13 @@ pub fn proc_start_matches(tgid: u32, start_time_ns: u64) -> bool {
     let want = start_time_ns.saturating_add(boottime_offset_ns());
     let tick = 1_000_000_000 / clk_tck();
     got.abs_diff(want) <= tick
+}
+
+/// A process's start time from /proc, in the probe's clock. Good to the
+/// clock tick, which `proc_start_matches` allows for; a hold, which the
+/// kernel matches to the nanosecond, needs the probe's own value.
+pub fn proc_start_time(tgid: u32) -> Option<u64> {
+    Some(proc_start_ns(tgid)?.saturating_sub(boottime_offset_ns()))
 }
 
 /// CLOCK_BOOTTIME minus CLOCK_MONOTONIC, now: the time spent suspended
@@ -1856,6 +1890,46 @@ mod tests {
             [EnforceJob::Quarantine { pids, .. }] => assert_eq!(tgids(pids), [90]),
             j => panic!("{j:?}"),
         }
+    }
+
+    #[test]
+    fn a_quiet_child_of_an_enforced_tree_gets_a_job_at_its_fork() {
+        let (mut p, _d) = pipeline("enf-fork");
+        p.mode = Mode::Enforce;
+        split_chain(&mut p, 80, 81, 80);
+        p.to_enforce.clear();
+        // Never scores: forked between the decision and the hold.
+        p.handle(&fork(81, 91));
+        p.handle(&fork(91, 92));
+        // An unrelated fork, and a repeat, send nothing.
+        p.handle(&fork(79, 93));
+        p.handle(&fork(81, 91));
+        match &p.to_enforce[..] {
+            [EnforceJob::Quarantine { pids: a, .. }, EnforceJob::Quarantine { pids: b, .. }] => {
+                assert_eq!((tgids(a), tgids(b)), (vec![91], vec![92]));
+            }
+            j => panic!("{j:?}"),
+        }
+    }
+
+    #[test]
+    fn a_child_of_a_throttled_tree_is_throttled_too() {
+        let (mut p, _d) = pipeline("enf-fork-t");
+        p.mode = Mode::Enforce;
+        p.enforced
+            .insert("AEG-t".into(), (Tier::Throttle, [key(80)].into()));
+        p.handle(&fork(80, 90));
+        match &p.to_enforce[..] {
+            [EnforceJob::Throttle { id, pids }] => {
+                assert_eq!((id.as_str(), tgids(pids)), ("AEG-t", vec![90]));
+            }
+            j => panic!("{j:?}"),
+        }
+        // Audit mode queues nothing.
+        p.to_enforce.clear();
+        p.mode = Mode::Audit;
+        p.handle(&fork(80, 94));
+        assert!(p.to_enforce.is_empty());
     }
 
     #[test]

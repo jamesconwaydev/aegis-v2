@@ -78,16 +78,25 @@ impl Holds {
         Ok(())
     }
 
-    /// Releasing a process that has already exited is not an error.
-    pub fn release(&mut self, tgid: u32) -> Result<()> {
+    /// Releases `k` only if the entry is still for that process: a tgid
+    /// reused since may be held for another incident. Releasing a
+    /// process that has already exited is not an error.
+    pub fn release(&mut self, k: ProcKey) -> Result<()> {
+        let tgid = k.tgid;
         match &mut self.map {
-            Some(m) => match m.remove(&tgid) {
-                Err(MapError::SyscallError(e))
-                    if e.io_error.kind() == std::io::ErrorKind::NotFound => {}
-                r => r.with_context(|| format!("releasing {tgid}"))?,
+            Some(m) => match m.get(&tgid, 0) {
+                Ok(s) if s == k.start_time_ns => match m.remove(&tgid) {
+                    Err(MapError::SyscallError(e))
+                        if e.io_error.kind() == std::io::ErrorKind::NotFound => {}
+                    r => r.with_context(|| format!("releasing {tgid}"))?,
+                },
+                Ok(_) | Err(MapError::KeyNotFound) => {}
+                Err(e) => Err(e).with_context(|| format!("releasing {tgid}"))?,
             },
             None => {
-                self.mem.remove(&tgid);
+                if self.mem.get(&tgid) == Some(&k.start_time_ns) {
+                    self.mem.remove(&tgid);
+                }
             }
         }
         Ok(())
@@ -311,10 +320,29 @@ mod tests {
         };
         h.hold(k).unwrap();
         assert_eq!(h.held(), 1);
-        h.release(k.tgid).unwrap();
+        h.release(k).unwrap();
         assert_eq!(h.held(), 0);
         // Releasing a task the kernel already dropped on exit is fine.
-        h.release(k.tgid).unwrap();
+        h.release(k).unwrap();
+    }
+
+    #[test]
+    fn release_leaves_a_reused_tgid_held() {
+        let mut h = Holds::default();
+        let now = ProcKey {
+            tgid: 4242,
+            start_time_ns: 9,
+        };
+        h.hold(now).unwrap();
+        // The process held earlier under this tgid started at 7.
+        h.release(ProcKey {
+            tgid: 4242,
+            start_time_ns: 7,
+        })
+        .unwrap();
+        assert_eq!(h.held(), 1);
+        h.release(now).unwrap();
+        assert_eq!(h.held(), 0);
     }
 
     #[test]

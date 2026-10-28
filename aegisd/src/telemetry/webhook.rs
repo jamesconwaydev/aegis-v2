@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Webhooks: one POST when an incident first reaches throttle, one when
-//! it first reaches quarantine, and one for every enforcement failure.
+//! Webhooks: one POST each time an incident's verdict rises (would_throttle,
+//! throttled, would_quarantine, quarantined), and one for every
+//! enforcement failure.
 //!
 //! `emit` never blocks. Each webhook has a queue of `QUEUE` bodies and
 //! one worker thread; a body gets up to `ATTEMPTS` tries with `BACKOFF`
@@ -18,12 +19,13 @@ use ureq::tls::{RootCerts, TlsConfig};
 
 use super::{rfc3339, Sink, TelemetryRecord};
 use crate::config::{WebhookConfig, WebhookFormat};
+use crate::incident::verdict_rank;
 use crate::scoring::Tier;
 
 pub const QUEUE: usize = 256;
 const ATTEMPTS: usize = 3;
 const BACKOFF: [Duration; ATTEMPTS - 1] = [Duration::from_secs(1), Duration::from_secs(2)];
-/// Incidents remembered for the tier-rise check.
+/// Incidents remembered for the verdict-rise check.
 const MAX_TRACKED: usize = 4096;
 
 #[derive(Default)]
@@ -37,10 +39,11 @@ pub struct Webhook {
     tx: SyncSender<String>,
     counters: Arc<Counters>,
     format: WebhookFormat,
-    /// Highest tier already sent per incident.
+    /// Highest verdict rank already sent per incident: `quarantined`
+    /// after `would_quarantine` is news, a repeat is not.
     // Cleared when full, so a very old incident may notify
     // again; keep it in the incident store if that ever matters.
-    sent: Mutex<HashMap<String, Tier>>,
+    sent: Mutex<HashMap<String, u8>>,
 }
 
 impl Webhook {
@@ -121,8 +124,8 @@ impl Webhook {
         self.counters.failed.load(Ordering::Relaxed)
     }
 
-    /// Enforcement failures always go; anything else only when its tier
-    /// is higher than any already sent for the incident.
+    /// Enforcement failures always go; anything else only when its
+    /// verdict ranks above any already sent for the incident.
     fn worth_sending(&self, rec: &TelemetryRecord) -> bool {
         if is_failure(rec) {
             return true;
@@ -134,10 +137,11 @@ impl Webhook {
         if sent.len() >= MAX_TRACKED && !sent.contains_key(&rec.incident) {
             sent.clear();
         }
-        if sent.get(&rec.incident).is_some_and(|t| *t >= rec.tier) {
+        let rank = verdict_rank(rec.verdict);
+        if sent.get(&rec.incident).is_some_and(|r| *r >= rank) {
             return false;
         }
-        sent.insert(rec.incident.clone(), rec.tier);
+        sent.insert(rec.incident.clone(), rank);
         true
     }
 
@@ -185,9 +189,9 @@ pub fn error_kind(e: &ureq::Error) -> String {
 /// The enforcer's reports start `enforcement failed:` or `enforcement
 /// skipped:` in the first reason.
 fn is_failure(rec: &TelemetryRecord) -> bool {
-    rec.reasons
-        .first()
-        .is_some_and(|r| r.starts_with("enforcement "))
+    rec.reasons.first().is_some_and(|r| {
+        r.starts_with("enforcement failed:") || r.starts_with("enforcement skipped:")
+    })
 }
 
 impl Sink for Webhook {
@@ -348,6 +352,23 @@ mod tests {
         w.emit(&rec("AEG-3", Tier::Quarantine));
         w.emit(&rec("AEG-3", Tier::Throttle));
         rx.recv_timeout(WAIT).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn webhook_sends_the_action_after_its_prediction() {
+        let (url, rx) = server();
+        let w = Webhook::new(&cfg(url, WebhookFormat::Json)).unwrap();
+        w.emit(&rec("AEG-1", Tier::Quarantine));
+        rx.recv_timeout(WAIT).unwrap();
+        let mut done = rec("AEG-1", Tier::Quarantine);
+        done.verdict = "quarantined";
+        done.reasons = vec!["enforcement done: held, moved, frozen".into()];
+        w.emit(&done);
+        let (_, body) = rx.recv_timeout(WAIT).unwrap();
+        assert!(body.contains("\"quarantined\""), "{body}");
+        // Sent once: success is not a failure that always goes.
+        w.emit(&done);
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
