@@ -1,6 +1,6 @@
 # Installation
 
-Installing Aegis v0.1 from the release RPMs and starting it takes
+Installing Aegis v0.2 from the release RPMs and starting it takes
 about five minutes.
 
 ## Requirements
@@ -32,8 +32,8 @@ them, and install both:
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-dnf install ./aegis-v2-0.1.1-1.el10.x86_64.rpm \
-    ./aegis-v2-selinux-0.1.1-1.el10.noarch.rpm
+dnf install ./aegis-v2-0.2.0-1.el10.x86_64.rpm \
+    ./aegis-v2-selinux-0.2.0-1.el10.noarch.rpm
 ```
 
 From v0.2.0, each release also carries a signature over `SHA256SUMS`,
@@ -51,8 +51,9 @@ gh attestation verify aegis-v2-0.2.0-1.el10.x86_64.rpm \
     --repo jamesconwaydev/aegis-v2
 ```
 
-`dnf` pulls in `nftables` and `criu`, which the package requires. v0.1
-uses neither yet; later releases will (see the [roadmap](roadmap.md)).
+`dnf` pulls in `nftables` and `criu`, which the package requires.
+Enforce mode uses `nftables`; `criu` waits for live migration in
+v0.4.0 (see the [roadmap](roadmap.md)).
 When `selinux-policy-targeted` is installed, as it is on every stock
 Rocky host, `aegis-v2` requires the matching `aegis-v2-selinux`, so
 install the two together.

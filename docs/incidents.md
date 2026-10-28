@@ -25,7 +25,8 @@ went.
 The rules for the incident score are in
 [scoring](scoring.md#incidents-and-process-trees).
 
-Incidents never close in v0.1. Every incident counts as open, and
+Incidents don't close yet, released or killed ones included. Every
+incident counts as open, and
 `aegisctl status` reports how many are loaded as `open incidents`.
 
 ## Where they live
@@ -59,7 +60,7 @@ a process already in an incident stays in it across a daemon restart.
 `aegisctl incidents list` shows only those loaded incidents. Older ones
 stay on disk, and `aegisctl incidents show <id>` still finds them by id.
 
-v0.1 never deletes an incident. Remove old directories yourself when you
+aegisd never deletes an incident. Remove old directories yourself when you
 no longer need them.
 
 ## `incident.json`
@@ -91,7 +92,7 @@ no longer need them.
 | `created`, `updated`     | UTC, RFC 3339, to the second                |
 | `updated_ns`             | `updated` in Unix nanoseconds               |
 | `boot_id`                | the boot the process ids belong to          |
-| `mode`                   | `audit` in v0.1                             |
+| `mode`                   | `audit` or `enforce`, when last recorded    |
 | `verdict`                | see [Verdicts](#verdicts)                   |
 | `max_score`              | the highest score recorded                  |
 | `score`                  | the score at the last update                |

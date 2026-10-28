@@ -34,20 +34,24 @@ and hands you a single incident with the evidence attached.
 That's a real run of [`examples/lab/run.sh`](examples/lab) on a Rocky
 Linux 10.2 test VM. It uses nothing but copies of the host's own bash
 and strace, never leaves the host, and cleans up after itself. Run it on
-a throwaway VM and you'll get the same incident.
+a throwaway VM and you'll get the same incident. Run it with
+`MODE=enforce` against an aegisd in enforce mode and you'll also watch
+the tree get frozen and cut off, then killed when the script exits.
 
-## What v0.1 does today
+## What v0.2 does today
 
-v0.1 is an observer. It runs in audit mode only: it scores, records
-and reports, and it changes nothing on the host. No process is stopped,
-throttled, moved or sandboxed. Ask for `mode = "enforce"` and aegisd
-refuses to start, saying it's planned for v0.2.0.
+Out of the box, nothing changes: v0.2 starts in audit mode, where it
+scores, records and reports and leaves every process alone. Give it a
+few days of that. When the incidents it writes are ones you'd act on,
+set `mode = "enforce"` and it starts acting on them itself.
 
-Here's what you get:
+Here's what you get in either mode:
 
 - **Kernel probes** for every committed exec (the real path, not
-  `argv[0]`), fork, exit, successful `ptrace` attach, `memfd_create`, and outbound
-  TCP connects with their outcome.
+  `argv[0]`), fork, exit, successful `ptrace` attach, `memfd_create`,
+  and outbound TCP connects with their outcome. The environment of each
+  new program is read in the kernel at exec, before any of its code
+  runs, so a preloaded library can't hide from the check.
 - **A risk score per process** that halves every 30 seconds of quiet.
   An exec from `/tmp` adds 25, a memfd exec adds 65, an attach to a
   system daemon adds 45, a burst of outbound connects adds 40.
@@ -55,35 +59,53 @@ Here's what you get:
   `podman` only get a pass when the binary on disk is RPM-owned and
   unmodified, or matches a SHA-256 you pinned, and the process shows no
   sign of `LD_PRELOAD` or an attached debugger.
-- **Incidents, not alerts.** A process whose score reaches 50 opens a
-  `would_throttle` incident, and its children's signals count towards
-  the same one. At 80 it becomes `would_quarantine`. Each incident is a
-  directory under `/var/lib/aegis-v2/incidents`.
-- **Telemetry** to journald, a JSON-lines file, and OTLP logs.
+- **Incidents, not alerts.** A process whose score reaches 50 opens an
+  incident at the throttle tier, and its children's signals count
+  towards the same one. At 80 it reaches the quarantine tier. Each
+  incident is a directory under `/var/lib/aegis-v2/incidents`.
+- **Telemetry** to journald, a JSON-lines file, OTLP logs and metrics,
+  and webhooks (JSON or Slack) the moment an incident reaches a tier.
 - **`aegisctl`** for `status`, `preflight` and `incidents
-  list|show|timeline`, with `--json` on all of them.
+  list|show|timeline|release|kill`, with `--json` on all of them.
 - **RPMs** for x86_64 and aarch64, a hardened systemd unit, and an
   SELinux module that confines aegisd to its own domain.
 
+And in enforce mode, the tiers turn into actions:
+
+- **Throttle** moves the tree into its own scope under
+  `aegis-throttle.slice`, at 25% of one CPU and a 256 MiB soft memory
+  limit by default. It keeps running, slowly, and its score can still
+  climb.
+- **Quarantine** holds every process in the kernel first: thirteen BPF
+  LSM programs refuse it fork, connect, send, mount, `bpf()`, module
+  loading, ptrace, writes through any file descriptor, new user
+  namespaces and any signal to aegisd. Then systemd moves the tree into
+  its own scope under `aegis-quarantine.slice` and freezes it, and an
+  nftables rule drops its traffic.
+- **Nothing is killed for you.** A frozen tree waits for you to look.
+  `aegisctl incidents release <id>` thaws it and gives its network
+  back; `aegisctl incidents kill <id>` ends it.
+
+Enforce mode needs the BPF LSM and `nft`, and aegisd refuses to start in
+it without them.
+
 ### Today versus planned
 
-A `would_quarantine` verdict is a note, not an action. Anything marked
-"no" doesn't exist yet, and the [roadmap](docs/roadmap.md) explains how
-enforcement is meant to work when it does.
+|                                            | v0.2 (today) | Planned |
+| ------------------------------------------ | ------------ | ------- |
+| Kernel probes, scores, incidents           | yes          |         |
+| Verified-binary allowlists                 | yes          |         |
+| Environment read in the kernel at exec     | yes          |         |
+| journald, JSON-lines, OTLP logs, metrics   | yes          |         |
+| Webhooks                                   | yes          |         |
+| Throttle a process tree                    | enforce mode |         |
+| Hold, freeze and cut off a tree            | enforce mode |         |
+| Release or kill it with `aegisctl`         | yes          |         |
+| Answer its traffic with a honeypot         | no           | v0.3.0  |
+| Packet captures, STIX                      | no           | v0.3.0  |
+| A box with its own disk overlay, migration | no           | v0.4.0  |
 
-|                                      | v0.1 (today) | Planned |
-| ------------------------------------ | ------------ | ------- |
-| Kernel probes, scores, incidents     | yes          |         |
-| Verified-binary allowlists           | yes          |         |
-| journald, JSON-lines, OTLP logs      | yes          |         |
-| `would_throttle`, `would_quarantine` | recorded     |         |
-| Throttle a process tree              | no           | v0.2.0  |
-| Quarantine a process tree            | no           | v0.2.0  |
-| Cut a quarantined tree's network     | no           | v0.2.0  |
-| BPF LSM escape and write-deny hooks  | no           | v0.2.0  |
-| Webhooks, OTLP metrics               | no           | v0.2.0  |
-| Honeypot, pcaps, STIX                | no           | v0.3.0  |
-| Live migration, Release & Merge      | no           | v0.4.0  |
+The [roadmap](docs/roadmap.md) has the detail on what's next.
 
 ## What it can and can't catch
 
@@ -92,14 +114,16 @@ running a dropped payload from `/tmp`, `/var/tmp` or `/dev/shm`, running
 code that only exists in memory, attaching a debugger to pid 1 or a
 system service, and scanning outward over TCP.
 
-It won't reliably catch, in v0.1:
+It won't reliably catch, in v0.2:
 
 - **Root who knows it's there.** Root can stop aegisd, unload its probes
   or edit its config. Ship telemetry off the host so the record
   survives.
-- **Loader tricks done carefully.** The `LD_PRELOAD` and ptrace checks
-  read `/proc` just after the exec, and a careful attacker can scrub
-  that first. In-kernel capture is planned for v0.2.0.
+- **Loader tricks on processes older than aegisd.** A program started
+  after aegisd has its environment read in the kernel at exec. One that
+  was already running gets the old `/proc` read, and a library loaded
+  long ago may have scrubbed its `LD_PRELOAD` by then. A tracer that
+  attaches before the exec isn't seen either.
 - **Scripts run as `sh /tmp/x`.** The kernel ran the shell, so that's
   what Aegis sees. A script with a `#!` line run directly is caught.
 - **UDP, and scans spread across many processes.** Only TCP connects
@@ -107,7 +131,11 @@ It won't reliably catch, in v0.1:
 - **Allowlisting inside containers.** Container binaries never verify
   against the host's files, so allowlists don't apply to them.
 
-The [threat model](docs/threat-model.md) has every known gap and why.
+Enforce mode has edges of its own. The hold lands a few milliseconds
+after the score crosses the line, and anything the tree wrote before
+then is on disk. A restart of aegisd lifts the holds, though the freeze
+and the network rule stay. The [threat model](docs/threat-model.md) has
+every known gap and why.
 
 ### What it needs, and what it can touch
 
@@ -122,8 +150,11 @@ SELinux confines it to its own `aegisd_t` domain. Its control socket
 answers root only.
 
 That protects the host from a compromised aegisd. It doesn't protect
-aegisd from root, and in v0.1 nothing it does changes the host anyway:
-the end-to-end tests check that `/etc` is byte-for-byte unchanged.
+aegisd from root, though no debugger can attach to it, root's included.
+In audit mode nothing it does changes the host. In enforce mode, what it
+changes is what it creates: transient scopes under `aegis.slice` and an
+nftables table called `inet aegis`. Either way, the end-to-end tests
+check that `/etc` is byte-for-byte unchanged.
 [Installation](docs/installation.md#the-systemd-unit) has the
 full unit.
 
@@ -151,8 +182,10 @@ process tree
 The child's own `tmp_exec` doesn't raise the incident score: each kind
 counts once, at its strongest, across the tree. The two files are in
 [`examples/lab`](examples/lab), unedited, and
-[incidents](docs/incidents.md) documents every field. Nothing was
-throttled or quarantined, because v0.1 doesn't do that.
+[incidents](docs/incidents.md) documents every field. That run was in
+audit mode, so nothing was throttled or quarantined. In enforce mode the
+same chain is throttled at 65 and quarantined at 110, and the verdicts
+read `throttled` and `quarantined`.
 
 ## How the score adds up
 
@@ -164,11 +197,11 @@ throttled or quarantined, because v0.1 doesn't do that.
 | ptrace attach to pid 1 or a service   | 45   | `ptrace_system_daemon` |
 | 20 targets or 10 failed connects, 2 s | 40   | `egress_scan`          |
 
-| Score     | Verdict            | In v0.1                 |
-| --------- | ------------------ | ----------------------- |
-| below 50  | none               | debug log only          |
-| 50 to 79  | `would_throttle`   | incident on disk        |
-| 80 and up | `would_quarantine` | incident on disk        |
+| Score     | Audit mode         | Enforce mode     |
+| --------- | ------------------ | ---------------- |
+| below 50  | debug log only     | debug log only   |
+| 50 to 79  | `would_throttle`   | `throttled`      |
+| 80 and up | `would_quarantine` | `quarantined`    |
 
 Each signal kind counts once per process, so ten `memfd_create` calls
 are worth 20, not 200. Every component halves after 30 seconds of quiet:
@@ -187,7 +220,8 @@ flowchart LR
     D --> P["Process table<br/>+ verification"]
     P --> S["Scoring<br/>decay, allowlists"]
     S -->|"score ≥ 50"| I["Incident store<br/>/var/lib/aegis-v2"]
-    S -->|"score ≥ 50"| T["journald · JSONL · OTLP"]
+    S -->|"score ≥ 50"| T["journald · JSONL · OTLP · webhooks"]
+    S -->|"enforce mode"| E["Enforcer<br/>holds · systemd · nft"]
     C["aegisctl"] <-->|"/run/aegis-v2/aegisd.sock"| D
 ```
 
@@ -209,7 +243,10 @@ aegisctl incidents list
 Every incident you see after those few days is either something worth a
 look or a false positive you can allowlist. [Scoring](docs/scoring.md)
 covers the baselining, and [installation](docs/installation.md) covers
-aarch64 and what `preflight` wants from your kernel.
+aarch64 and what `preflight` wants from your kernel. Once the list is
+quiet, set `mode = "enforce"` in `/etc/aegis-v2/config.toml` and run
+`systemctl reload aegisd`; [configuration](docs/configuration.md#general)
+has what that turns on.
 
 ## Compatibility
 

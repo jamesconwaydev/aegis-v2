@@ -97,8 +97,9 @@ never inherits anything: processes are tracked by pid and start time.
 | 80 or more           | quarantine | `would_quarantine` |
 
 The thresholds are `score_threshold_throttle` and
-`score_threshold_quarantine` in `[general]`. In v0.1 a verdict is only
-recorded. Nothing is throttled or quarantined.
+`score_threshold_quarantine` in `[general]`. In audit mode a verdict is
+only recorded. In enforce mode the tier is acted on, and the verdict
+becomes `throttled` or `quarantined` once that worked.
 
 Log-tier decisions aren't written anywhere by default. Run aegisd with
 `--debug` to see every one on stderr.
@@ -212,8 +213,8 @@ run against a real Rocky 10 host. "throttle" and "quarantine" mean
 
 ## Baselining a host
 
-v0.1 changes nothing on the host, which makes it a safe place to find
-out what's normal before enforcement exists.
+Audit mode changes nothing on the host, which makes it a safe place to
+find out what's normal before you turn on enforce mode.
 
 1. Install and start aegisd, then leave it for 48 to 72 hours. Cover
    whatever the host does weekly if you can: backups, deploys, patching.

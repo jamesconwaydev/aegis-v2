@@ -1,10 +1,10 @@
 # Threat model
 
-Read this before you rely on Aegis v0.1.
+Read this before you rely on Aegis v0.2.
 
 ## What it's for
 
-Aegis v0.1 detects common post-exploitation behaviour on a Rocky Linux
+Aegis v0.2 detects common post-exploitation behaviour on a Rocky Linux
 10 host and records it as incidents:
 
 - running a dropped payload from a temp directory
@@ -12,9 +12,19 @@ Aegis v0.1 detects common post-exploitation behaviour on a Rocky Linux
 - attaching a debugger to pid 1 or a system service
 - scanning the network outward
 
-It's a detector in audit mode. It doesn't stop, slow, isolate or kill
-anything, and nothing it does changes the host. The e2e tests check
-that `/etc` is byte-for-byte unchanged across every scenario.
+In audit mode, the default, that's all it does. Nothing it does changes
+the host.
+
+In enforce mode it also acts on the incident's process tree. At the
+throttle tier it moves the tree into a scope with CPU and memory limits.
+At the quarantine tier it holds every process in the kernel, moves the
+tree into its own scope, freezes it and drops its traffic. It never
+kills anything unless you run `aegisctl incidents kill`. It never acts
+on pid 1, on aegisd, or on any ancestor of the tree, so the shell or
+service a payload came from is left alone.
+
+The end-to-end tests check that `/etc` is byte-for-byte unchanged
+across every scenario, enforce mode included.
 
 ## What it trusts
 
@@ -54,7 +64,9 @@ from its own directories, and its own SELinux domain. The control socket
 answers root only.
 
 That protects the host from a compromised aegisd. It doesn't protect
-aegisd from root.
+aegisd from root, with two exceptions. No other process can attach a
+debugger to aegisd, root's included, and a held process can't send it
+any signal. Root can still stop it through systemd.
 
 ## Known limitations
 
@@ -91,9 +103,10 @@ yet. The checks can still be beaten:
   as unreadable, so it fails closed: the process gets no allowlist
   credit.
 - Processes already running when aegisd starts never exec in front of
-  it, so their environment is read from `/proc/<pid>/environ`, the v0.1
-  way. That read sees the process's memory as it is now, and a library
-  already loaded could have scrubbed its `LD_PRELOAD` entry by then.
+  it, so their environment is read from `/proc/<pid>/environ`, as v0.1
+  read every process's. That read sees the process's memory as it is
+  now, and a library already loaded could have scrubbed its
+  `LD_PRELOAD` entry by then.
 - A ptrace attach is only seen when another process attaches to the
   target. `PTRACE_TRACEME`, or a seize set up before the exec, isn't
   seen.
@@ -123,7 +136,7 @@ answer "not owned", and aegisd caches that. Allowlisted binaries stay
 The egress scan signal counts connects per process. A scan spread
 across many processes, one connection each, never crosses the
 threshold in any of them. It also comes from TCP state changes only, so
-UDP traffic, UDP scans included, isn't observed in v0.1.
+UDP traffic, UDP scans included, isn't observed.
 
 ### btrfs subvolumes and overlayfs stay unverified
 
@@ -179,6 +192,44 @@ environment is read loses its allowlist credit the same way.
 Longer paths are truncated in events and incidents. A truncated path is
 never verified, and a path too long to render at all scores as a
 temp-directory exec.
+
+### Enforce mode acts after the fact
+
+The hold starts when aegisd writes the process into the kernel's hold
+map, not at the moment the score crosses the line. Between the two,
+the event travels to userspace, is scored, the incident is written to
+disk, and the enforcer takes the job: usually a few milliseconds, in
+which the tree can still fork, connect and write.
+
+### Writes before the hold reach the disk
+
+Once held, a process can't write through any file descriptor. Whatever
+it wrote before that is on disk, and a shared writable memory mapping
+it already had isn't a write the hook sees, so data written through one
+before the freeze lands too. There's no overlay to throw those writes
+away yet; that's the box planned for v0.4.0.
+
+### A restart lifts the holds
+
+The hold map lives in the kernel only while aegisd's programs are
+loaded. Restart aegisd and every hold is gone. The freeze and the
+nftables rule stay, because systemd and nftables keep them, so a
+quarantined tree is still frozen and cut off. `aegisctl incidents
+release` and `kill` read the recorded actions and still work.
+
+### A frozen process looks frozen
+
+Freezing is a cgroup state, and anything that inspects the process can
+see it: `systemctl status`, the scope's `cgroup.events`, a process
+listing that shows its cgroup. If an attacker has a second foothold
+outside the tree, it can tell the first one was caught.
+
+### A released process stays in the quarantine slice
+
+`aegisctl incidents release` thaws the tree, lifts its holds and
+removes its nftables rule, but leaves it in its scope under
+`aegis-quarantine.slice`. Its CPU and memory accounting stays there,
+and the limits of the unit it came from no longer apply to it.
 
 ### OTLP
 

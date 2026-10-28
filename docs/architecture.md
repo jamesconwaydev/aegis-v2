@@ -40,6 +40,8 @@ flowchart TD
     L --> SC["scorer + scan detector"]
     SC --> W["incident writer thread"]
     SC --> TS["telemetry sinks"]
+    SC -->|enforce mode| EF["enforcer thread"]
+    EF --> SD["systemd · nft · HELD map"]
     W --> D[("/var/lib/aegis-v2/incidents")]
     L <--> IPC["control socket"]
     IPC <--> CTL["aegisctl"]
@@ -47,9 +49,10 @@ flowchart TD
 
 ## Kernel side
 
-The probes attach at startup. aegisd fails to start unless all nine
-attach. The last five are ordinary tracepoints; `aegisctl status` shows
-them with a `tracepoint/` prefix.
+At startup aegisd attaches nine probes and the thirteen
+[hold](#the-hold) programs, and fails to start unless all of them
+attach. The last five probes are ordinary tracepoints; `aegisctl
+status` shows them with a `tracepoint/` prefix.
 
 | Probe               | Hook                              | Emits       |
 | ------------------- | --------------------------------- | ----------- |
@@ -65,7 +68,36 @@ them with a `tracepoint/` prefix.
 
 Two of them are BPF LSM programs, which is why the BPF LSM has to be
 enabled (see [preflight](preflight.md#bpf-lsm)). They only observe:
-both return 0, and the kernel's decision is never changed.
+both return 0, and the kernel's decision is never changed. Only the
+hold programs ever refuse anything.
+
+### The hold
+
+Thirteen more BPF LSM programs check one map, `HELD`, which holds a
+process's tgid and its leader's start time. A task that isn't in it
+costs one map lookup and is let through. A held task is refused:
+
+| Hook                                   | Refused for a held task    |
+| -------------------------------------- | -------------------------- |
+| `task_alloc`                           | fork and clone (`-EAGAIN`) |
+| `socket_connect`, `socket_sendmsg`     | connect and send           |
+| `sb_mount`, `move_mount`               | mounts                     |
+| `bpf`                                  | any `bpf()` call           |
+| `kernel_module_request`                | module loading             |
+| `kernel_read_file`, `kernel_load_data` | module loading             |
+| `ptrace_access_check`                  | ptrace as tracer           |
+| `file_permission`                      | writes through any fd      |
+| `userns_create`                        | new user namespaces        |
+| `task_kill`                            | any signal to aegisd       |
+
+`ptrace_access_check` has a second job that doesn't depend on `HELD`:
+it refuses a ptrace attach to aegisd from any other process, root's
+included. aegisd writes its own tgid into the `AEGISD` map before
+anything attaches.
+
+The exit tracepoint deletes a process's `HELD` entry, so a recycled pid
+starts unheld. aegisd refuses to hold tgids 0 to 2, itself, or a key
+with no start time.
 
 ### Exec
 
@@ -203,7 +235,8 @@ defer queue overflow.
 ### Scoring and incidents
 
 The scorer turns signals into a per-process score and a tier; see
-[scoring](scoring.md). A decision at throttle or above goes two ways:
+[scoring](scoring.md). A decision at throttle or above goes two ways,
+and a third in enforce mode:
 
 - to the **incident writer**, a separate thread fed by a 256-slot
   queue, which writes the incident to disk with `fsync`. If the queue
@@ -211,12 +244,42 @@ The scorer turns signals into a per-process score and a tier; see
   `aegisctl status`), and the next decision records in its place.
 - to the **telemetry sinks**, from the event loop. Each sink is best
   effort and never blocks the loop. See [telemetry](telemetry.md).
+- in enforce mode, to the **enforcer**, below.
 
 Once an incident is open, a decision only goes either way when it adds
 something: the incident's tier rose, a process showed a signal kind for
 the first time, or 60 seconds have passed since the incident last
 recorded. The rest are counted as `incident repeats not recorded`. See
 [incidents](incidents.md#how-an-incident-forms).
+
+### Enforcer
+
+One thread carries out enforce mode, fed by a 256-slot queue the event
+loop fills without waiting. A full queue drops the job and counts it
+(`enforce jobs dropped`). For each job the enforcer waits up to
+5 seconds for the incident to be on disk, and does nothing to a tree
+that has no record. It checks the mode again just before acting, so a
+reload to audit stops jobs still in flight.
+
+What it acts on is the incident's live members and everything below
+them, never pid 1, kthreadd, aegisd, or an ancestor of the tree.
+
+- **Throttle:** systemd `StartTransientUnit` moves the tree into
+  `aegis-incident-<id>.scope` under `aegis-throttle.slice`, with the
+  `[throttle]` CPU quota and `MemoryHigh`.
+- **Quarantine:** write every pid into `HELD`, move the tree into
+  `aegis-incident-<id>-q.scope` under `aegis-quarantine.slice`, freeze
+  it, then add an nftables rule in the `inet aegis` table that drops
+  the scope's traffic by cgroup. A process joining the tree later is
+  held and attached to the frozen scope.
+
+The enforcer calls `busctl`, `systemctl` and `nft` by absolute path,
+with separate arguments and no shell, and a 5-second timeout each.
+Every step is recorded in the incident's `actions` with its unit name
+or nft handle, and every failure goes to telemetry. Release and kill
+read those records back, so they work after a restart and in audit
+mode. The verdict becomes `throttled` or `quarantined` only when the
+step it names worked.
 
 ### Control socket
 
@@ -231,15 +294,16 @@ starting.
 ### Reload and shutdown
 
 `SIGHUP` (`systemctl reload aegisd`) re-reads the config. A bad file is
-logged and the old config stays. Scoring, thresholds and allowlists
-apply at once. Telemetry and the incident directory take effect at the
-next restart. The verdict cache is emptied, so every allowlisted path
-is verified again.
+logged and the old config stays. The mode, scoring, thresholds and
+allowlists apply at once. Telemetry, `[throttle]` and the incident
+directory take effect at the next restart. The verdict cache is
+emptied, so every allowlisted path is verified again.
 
 On `SIGTERM`, aegisd scores every held signal, detaches the probes,
 lets the incident writer finish its queue, removes the socket, and
-exits 0. If the probe event stream ends for any other reason, aegisd
-exits non-zero, and systemd restarts it.
+exits 0. Detaching the hold programs lifts every hold; a frozen scope
+and its nftables rule stay. If the probe event stream ends for any
+other reason, aegisd exits non-zero, and systemd restarts it.
 
 ## Where to go next
 

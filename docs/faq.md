@@ -2,18 +2,30 @@
 
 ## Does Aegis block anything?
 
-Not in v0.1. It runs in audit mode only and changes nothing on the
-host. Its verdicts, `would_throttle` and `would_quarantine`, say what a
-later release would do. Enforce mode is planned for v0.2.0; see the
-[roadmap](roadmap.md).
+Only if you ask it to. It starts in audit mode, which changes nothing
+on the host: its verdicts, `would_throttle` and `would_quarantine`, say
+what it would have done. Set `mode = "enforce"` and it does it. A
+throttled tree runs slowly; a quarantined one is held, frozen and cut
+off from the network until you release or kill it.
 
-## Then why run it now?
+## Why start in audit mode?
 
-To learn what normal looks like on your hosts before anything acts on
-it. A few days in audit mode turns up the tools that need allowlisting,
-so that when enforcement arrives, it doesn't fire on your own backup
-job. It's also a working detector: an incident is worth reading
-whether or not anything was stopped.
+So it learns what normal looks like on your hosts before anything acts
+on it. A few days of audit mode turns up the tools that need
+allowlisting, which means enforce mode doesn't freeze your own backup
+job. It's also a working detector on its own: an incident is worth
+reading whether or not anything was stopped.
+
+## It quarantined something I need. Now what?
+
+```sh
+aegisctl incidents release <id>
+```
+
+That thaws the tree, lifts the holds and gives it its network back.
+Then allowlist what caught it, so it doesn't happen again. The process
+stays in its quarantine scope until it exits; see the
+[threat model](threat-model.md#a-released-process-stays-in-the-quarantine-slice).
 
 ## How is it different from Falco or Tracee?
 
@@ -21,8 +33,9 @@ Those emit an alert per rule match. Aegis adds signals up per process
 and across a process tree, with decay, so a single odd event stays
 quiet and a chain of them becomes one incident with all its evidence.
 Its allowlists also require the binary to verify against the RPM
-database or a pin, never a name. v0.1 has five signals; Falco and Tracee
-ship far larger rule sets.
+database or a pin, never a name. And in enforce mode it acts on what it
+finds, where they report it. It has five signals; Falco and Tracee ship
+far larger rule sets.
 
 ## Which distributions does it support?
 
@@ -40,12 +53,12 @@ so allowlists don't apply to them. See the
 
 ## How much does it cost to run?
 
-Overhead hasn't been measured for v0.1, so there are no numbers to
-quote yet. Measuring it is on the roadmap for v1.0.0. aegisd does its
-own work in one event loop, with up to four threads verifying binaries,
-up to 16 reading the environments of processes that predate it, one
-writing incidents, and one
-sending OTLP batches when that sink is on.
+Overhead hasn't been measured yet, so there are no numbers to quote.
+Measuring it is on the roadmap for v1.0.0. aegisd does its own work in
+one event loop, with up to four threads verifying binaries, up to 16
+reading the environments of processes that predate it, one writing
+incidents, one carrying out enforce mode's actions, one sending OTLP
+batches when that sink is on, and one per webhook.
 
 ## Will an update to a package cause false positives?
 
@@ -77,14 +90,16 @@ line and column of the problem.
 ## Does it send anything anywhere?
 
 Only what you configure. journald is always on and local. The JSONL
-file and OTLP export are off until you turn them on, and SELinux blocks
+file, OTLP export and webhooks are off until you turn them on, and
+SELinux blocks
 network access until you enable `aegisd_can_network_connect`. aegisd
 never contacts anything else.
 
 ## Why does the package require `criu` and `nftables`?
 
-Later releases use them: `nftables` for egress control in v0.2.0, and
-`criu` for live migration in v0.4.0. v0.1 uses neither.
+Enforce mode uses `nftables` to cut a quarantined tree off the network.
+`criu` is for live migration, planned for v0.4.0; nothing uses it
+yet.
 
 ## Why is the eBPF code GPL?
 

@@ -33,7 +33,9 @@ Requires:       (%{name}-selinux = %{version}-%{release} if selinux-policy-%{sel
 %description
 aegisd watches every exec, fork, ptrace, memfd and outbound connect
 through eBPF, scores each process for risk, and records an incident
-when one crosses the line. aegisctl asks it what it has seen.
+when one crosses the line. In enforce mode it also throttles or
+quarantines the process tree. aegisctl asks it what it has seen, and
+releases or kills what it holds.
 
 %package selinux
 Summary:        SELinux policy module for aegisd
@@ -50,9 +52,10 @@ Requires(post): policycoreutils
 %description selinux
 Confines aegisd to the aegisd_t domain: the BPF and perf access its
 probes need, read access to /proc and to executables, the rpm
-database, and its own state, socket and log directories. Outbound
-network for the OTLP sink sits behind the aegisd_can_network_connect
-boolean, off by default.
+database, its own state, socket and log directories, and the systemd
+and nftables calls enforce mode makes. Outbound network for OTLP and
+webhooks sits behind the aegisd_can_network_connect boolean, off by
+default.
 
 %prep
 
@@ -129,6 +132,17 @@ systemctl try-restart aegisd.service 2>/dev/null || :
 %{_datadir}/selinux/packages/%{selinuxtype}/aegis.pp
 
 %changelog
+* Wed Oct 28 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.2.0-1
+- Enforce mode: throttle and quarantine a process tree, with release
+  and kill through aegisctl.
+- Hold a caught tree in the kernel with BPF LSM programs until it is
+  frozen, and refuse any debugger on aegisd.
+- Read the environment in the kernel at exec for the injection checks.
+- Webhooks, and OTLP metrics beside the logs.
+- SELinux policy 0.2.0: aegisd may run busctl, systemctl and nft.
+- On erase, stop the aegis slices, remove the nftables table and
+  reload systemd.
+
 * Wed Oct 21 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.1.1-1
 - List a member that joined at an exec under the image it runs.
 - Record signals by their weight key, not a Rust debug string.

@@ -36,7 +36,7 @@ aegisctl status
 Shows the daemon's version, mode and health counters, then its probes.
 
 ```text
-version                                0.1.1
+version                                0.2.0
 mode                                   audit
 uptime                                 2h 14m
 events                                 1843920
@@ -66,8 +66,8 @@ What each row means, with its key in `--json` output:
 - **events** (`events_total`): probe events processed.
 - **dropped events** (`dropped_events`): events the kernel ring buffer
   had no room for.
-- **open incidents** (`incidents_open`): incidents loaded. All of them
-  are open in v0.1.
+- **open incidents** (`incidents_open`): incidents loaded. Incidents
+  don't close yet, so that's all of them.
 - **incident write errors** (`incident_errors`): incident writes that
   failed.
 - **incidents dropped** (`incident_dropped`): decisions lost to a full

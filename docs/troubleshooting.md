@@ -21,8 +21,9 @@ aegisd --check-config
 Fix the file, then `systemctl start aegisd`. The unit doesn't retry on
 status 78, because the same file would fail the same way.
 
-The most common cause in v0.1 is `mode = "enforce"`, which isn't
-available yet. Set it back to `"audit"`.
+The most common cause is `mode = "enforce"` on a host without the BPF
+LSM or `nft`. The error says which; fix that, or set the mode back to
+`"audit"`.
 
 ### It fails while loading the probes
 
@@ -36,8 +37,8 @@ or a missing program. Run `aegisctl preflight`:
   offsets it needs.
 - **`kernel` FAIL:** the kernel is older than 6.12.
 
-aegisd attaches all nine probes or none, and won't run with a partial
-set.
+aegisd attaches all its probes and hold programs or none, and won't run
+with a partial set.
 
 ### It keeps restarting with `probe event stream ended`
 
@@ -158,7 +159,7 @@ empties the cache.
 On btrfs subvolumes and overlayfs, the device number the kernel reports
 for an executed file doesn't match what `stat` reports, so aegisd can't
 confirm it's the same file. Those binaries stay `unverified`, and
-allowlists don't apply to them. There's no workaround in v0.1; XFS and
+allowlists don't apply to them. There's no workaround yet; XFS and
 ext4 aren't affected. See the [threat model](threat-model.md).
 
 ### A process lost its score after the host resumed from suspend
