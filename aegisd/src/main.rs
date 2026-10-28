@@ -42,9 +42,9 @@ use crate::verify::{Rpm, Verification, Verifier};
 const INCIDENT_QUEUE: usize = 256;
 /// How often the loop flushes expired deferred signals.
 const TICK: Duration = Duration::from_millis(500);
-/// Every this many ticks, sweep the process table (so ~60 s).
 /// How often counters go out as OTLP metrics.
 const METRICS_EVERY: Duration = Duration::from_secs(60);
+/// Every this many ticks, sweep the process table (so ~60 s).
 const SWEEP_TICKS: u64 = 120;
 /// Every this many ticks (10 s), check that each quarantined tree still
 /// has its nft drop rule. Cheap with nothing quarantined: no nft call.
