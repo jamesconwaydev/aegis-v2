@@ -6,6 +6,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An nftables reload no longer gives quarantined trees their network
+  back.** In v0.2.0, `systemctl reload nftables` (or any ruleset flush)
+  deleted the `inet aegis` table and every drop rule in it, and nothing
+  put them back. Now aegisd checks every 10 seconds and re-adds the
+  table and each missing rule, recording an `nft_drop` that says why.
+  In audit mode it only restores rules enforce mode added. Release and
+  kill also stop trusting the handle they recorded, which a reload
+  could hand to another incident's rule: they look the rule up by the
+  tree's cgroup and delete only that. Kill looks it up before the
+  SIGKILL, while nftables can still name the cgroup. If the rule's
+  already gone, release still succeeds and says so. (#53)
+
 ## [0.2.0] - 2026-10-28
 
 v0.1 watched and wrote things down. v0.2.0 is the first release that

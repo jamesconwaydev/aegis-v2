@@ -133,6 +133,11 @@ pub struct ActionRecord {
     pub start_times: Vec<u64>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Why it was done when that isn't the verdict: an `nft_drop`
+    /// re-added after a ruleset flush, an `nft_remove` whose rule was
+    /// already gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub ts: String,
 }
 
@@ -948,6 +953,7 @@ mod tests {
             pids: vec![10],
             start_times: vec![],
             error: (!ok).then(|| "boom".to_string()),
+            detail: None,
             ts: "2026-10-21T09:00:00Z".into(),
         }
     }

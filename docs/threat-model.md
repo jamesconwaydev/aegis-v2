@@ -283,19 +283,30 @@ and the nftables rule went with the old boot. Release or kill of an
 incident from an earlier boot touches nothing on the host and records
 it as ended.
 
-### Reloading nftables frees quarantined trees
+### Reloading nftables opens a gap of about ten seconds
 
 Reloading nftables (`systemctl reload nftables`, or any
-`nft flush ruleset`) removes aegisd's `inet aegis` table, and every
-quarantined tree's drop rule with it, silently. A frozen tree can't use
-the network anyway, but one of its locks is gone: anything that thaws
-it finds its network back. Don't reload nftables while a tree is
-quarantined. If you did, release the affected incidents one at a time
-and check `nft list table inet aegis` after each: once the table is
-recreated, rule handles can be reused within the same boot, so a
-release could delete another incident's rule. Release then reports the
-missing rule as an error. The tree is still released. A fix that puts
-the table back is planned for v0.2.1.
+`nft flush ruleset`) takes aegisd's `inet aegis` table with it, and
+every quarantined tree's drop rule too. aegisd checks every 10 seconds
+and puts back the table and each missing rule. So for up to 10 seconds
+a quarantined tree has no drop rule, and up to 20 if a check found the
+enforcer's queue full and was dropped. A check also waits its turn
+behind whatever the enforcer is already doing. Through all of it the
+tree stays frozen and held, so it can't use the network unless
+something thaws it. Each rule put back is recorded on its incident as
+an `nft_drop` that says why. This is a poll, not a watch on nftables.
+
+In audit mode the check only puts back a rule that enforce mode added.
+If a quarantine's own rule failed, enforce mode adds it late on a
+check. Audit mode never does, because that would be a new action.
+
+Release and kill no longer trust the handle they recorded, since a
+reload lets nftables hand that number to someone else's rule. They look
+the rule up by the tree's cgroup in the live table and delete that one
+only. Kill looks before it sends SIGKILL, because once the scope
+empties nftables shows the rule by a bare cgroup id, not the path.
+Release of a scope that's already gone falls back to the recorded
+handle, but only when that handle's rule shows such a bare id.
 
 ### Incident scopes are delegated
 

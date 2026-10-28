@@ -214,6 +214,10 @@ pub fn run_bounded<S: AsRef<std::ffi::OsStr>>(
 ) -> Option<RpmRun> {
     let mut child = Command::new(prog)
         .args(args)
+        // Error text is matched (nft's "No such file or directory"), so
+        // it must not be translated.
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
