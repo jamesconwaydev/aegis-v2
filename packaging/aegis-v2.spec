@@ -145,6 +145,12 @@ systemctl try-restart aegisd.service 2>/dev/null || :
 %{_datadir}/selinux/packages/%{selinuxtype}/aegis.pp
 
 %changelog
+* Wed Oct 28 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.2.3-1
+- Fix a start-time overflow that hid live processes on hosts up for
+  more than about 5.8 years.
+- Keep drop rules through an nftables reload that lands mid-job, and
+  for trees moved but not frozen.
+
 * Wed Oct 28 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.2.2-1
 - Update webpki-root-certs to 1.0.11 (RUSTSEC-2026-0383).
 

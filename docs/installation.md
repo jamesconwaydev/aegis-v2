@@ -32,8 +32,8 @@ them, and install both:
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-dnf install ./aegis-v2-0.2.2-1.el10.x86_64.rpm \
-    ./aegis-v2-selinux-0.2.2-1.el10.noarch.rpm
+dnf install ./aegis-v2-0.2.3-1.el10.x86_64.rpm \
+    ./aegis-v2-selinux-0.2.3-1.el10.noarch.rpm
 ```
 
 From v0.2.0, each release also carries a signature over `SHA256SUMS`,
@@ -47,7 +47,7 @@ id='^https://github\.com/jamesconwaydev/aegis-v2/\.github/workflows/release\.yml
 cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
     --certificate-identity-regexp "$id" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
-gh attestation verify aegis-v2-0.2.2-1.el10.x86_64.rpm \
+gh attestation verify aegis-v2-0.2.3-1.el10.x86_64.rpm \
     --repo jamesconwaydev/aegis-v2
 ```
 
