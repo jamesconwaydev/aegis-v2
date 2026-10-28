@@ -6,6 +6,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Releases are published with a cosign signature over `SHA256SUMS`,
+  build provenance attestations, and SPDX and CycloneDX SBOMs.
+  [Installation](docs/installation.md#install-the-rpms) shows how to
+  verify them.
+
 ## [0.1.1] - 2026-10-21
 
 Two fixes the new lab demo caught in the evidence v0.1.0 writes.
