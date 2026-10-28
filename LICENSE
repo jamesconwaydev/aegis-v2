@@ -1,0 +1,16 @@
+Aegis v2 is licensed in two parts.
+
+The userspace code (aegisd, aegisctl and every crate except aegis-ebpf)
+is dual-licensed under either of
+
+  * the MIT License (LICENSE-MIT), or
+  * the Apache License, Version 2.0 (LICENSE-APACHE),
+
+at your option. SPDX: MIT OR Apache-2.0
+
+The eBPF programs in aegis-ebpf are licensed under the GNU General
+Public License, version 2 only (LICENSE-GPL-2.0), because the kernel
+requires it. SPDX: GPL-2.0-only
+
+Every source file states its licence in an SPDX header on its first
+line.
