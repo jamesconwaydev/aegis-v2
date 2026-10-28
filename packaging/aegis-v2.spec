@@ -86,16 +86,28 @@ install -Dpm 0644 -t %{buildroot}%{_licensedir}/%{name} \
 %{_bindir}/aegisctl preflight || :
 
 %preun
+# On erase, warn while aegisctl is still here to release what enforce
+# mode holds. Removal goes ahead either way.
+if [ $1 -eq 0 ] && [ -n "$(systemctl list-units --all --plain --no-legend 'aegis-incident-*' 2>/dev/null)" ]; then
+    echo "aegis-v2: process trees are still throttled or quarantined." >&2
+    echo "aegis-v2: run 'aegisctl incidents list', then release or kill each one." >&2
+fi
 %systemd_preun aegisd.service
 
 %postun
 %systemd_postun_with_restart aegisd.service
-# On erase, enforce mode's slices outlive the package: stop them, which
-# kills any tree still quarantined, since nothing is left to release it.
-# Drop its nftables table, and have systemd forget the removed unit.
+# On erase, enforce mode's slices and nftables table outlive the package.
+# Clean them up only when no incident scope is left: stopping the slice
+# would kill a held tree, and deleting the table would free a
+# quarantined one's network. Otherwise leave both and say how to finish.
 if [ $1 -eq 0 ]; then
-    systemctl stop aegis.slice 2>/dev/null || :
-    nft delete table inet aegis 2>/dev/null || :
+    if [ -z "$(systemctl list-units --all --plain --no-legend 'aegis-incident-*' 2>/dev/null)" ]; then
+        systemctl stop aegis.slice 2>/dev/null || :
+        nft delete table inet aegis 2>/dev/null || :
+    else
+        echo "aegis-v2: left aegis-incident-* scopes, aegis.slice and the inet aegis table in place." >&2
+        echo "aegis-v2: see 'Uninstall' in docs/installation.md to thaw, end and clean them up." >&2
+    fi
     systemctl daemon-reload 2>/dev/null || :
 fi
 
@@ -141,7 +153,8 @@ systemctl try-restart aegisd.service 2>/dev/null || :
 - Webhooks, and OTLP metrics beside the logs.
 - SELinux policy 0.2.0: aegisd may run busctl, systemctl and nft.
 - On erase, stop the aegis slices, remove the nftables table and
-  reload systemd.
+  reload systemd, unless a throttled or quarantined tree is left, which
+  is kept and warned about.
 
 * Wed Oct 21 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.1.1-1
 - List a member that joined at an exec under the image it runs.
