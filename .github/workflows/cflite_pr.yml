@@ -25,6 +25,10 @@ jobs:
   fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    permissions:
+      contents: read
+      # Code-change mode lists earlier runs' artifacts through the API.
+      actions: read
     steps:
       - name: Build fuzzers
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1

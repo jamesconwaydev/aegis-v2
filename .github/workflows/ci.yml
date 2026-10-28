@@ -54,6 +54,16 @@ jobs:
           persist-credentials: false
       - run: rustup component add rustfmt
       - run: cargo fmt --all -- --check
+      # The eBPF crate and the fuzz targets build with the same nightly,
+      # pinned twice because the image can't read fuzz/.
+      - name: One nightly for eBPF and fuzzing
+        run: |
+          a=$(sed -n 's/^ *AEGIS_EBPF_TOOLCHAIN=\([^ ]*\).*/\1/p' build/Containerfile)
+          b=$(sed -n 's/^channel = "\(.*\)"$/\1/p' fuzz/rust-toolchain.toml)
+          if [ -z "$a" ] || [ "$a" != "$b" ]; then
+            echo "build/Containerfile has '$a', fuzz/rust-toolchain.toml has '$b'" >&2
+            exit 1
+          fi
 
   deny:
     needs: changes
