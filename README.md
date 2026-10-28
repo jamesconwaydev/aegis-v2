@@ -6,6 +6,7 @@
 [![License: MIT OR Apache-2.0][license-badge]](#license)
 [![Rocky Linux 10][rocky-badge]][wiki-install]
 [![OpenSSF Scorecard][scorecard-badge]][scorecard]
+[![OpenSSF Best Practices][bp-badge]][bp]
 [![Discussions][discussions-badge]][discussions]
 
 [ci-badge]: https://img.shields.io/github/actions/workflow/status/jamesconwaydev/aegis-v2/ci.yml?branch=main&label=CI
@@ -16,6 +17,8 @@
 [rocky-badge]: https://img.shields.io/badge/Rocky%20Linux-10-10b981
 [scorecard-badge]: https://api.scorecard.dev/projects/github.com/jamesconwaydev/aegis-v2/badge
 [scorecard]: https://scorecard.dev/viewer/?uri=github.com/jamesconwaydev/aegis-v2
+[bp-badge]: https://www.bestpractices.dev/projects/16018/badge
+[bp]: https://www.bestpractices.dev/projects/16018
 [discussions-badge]: https://img.shields.io/github/discussions/jamesconwaydev/aegis-v2
 [discussions]: https://github.com/jamesconwaydev/aegis-v2/discussions
 [wiki]: https://github.com/jamesconwaydev/aegis-v2/wiki
