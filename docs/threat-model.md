@@ -296,6 +296,14 @@ tree stays frozen and held, so it can't use the network unless
 something thaws it. Each rule put back is recorded on its incident as
 an `nft_drop` that says why. This is a poll, not a watch on nftables.
 
+The check also covers a tree that was moved into its quarantine scope
+but never frozen, because both freeze attempts failed. Its incident
+stays `would_quarantine`, yet it got a drop rule, and it gets that rule
+back after a reload for as long as any of its processes are left in
+the scope. While aegisd runs its kernel holds refuse connects anyway.
+The rule is what's left if aegisd restarts, since the holds go with
+it.
+
 In audit mode the check only puts back a rule that enforce mode added.
 If a quarantine's own rule failed, enforce mode adds it late on a
 check. Audit mode never does, because that would be a new action.

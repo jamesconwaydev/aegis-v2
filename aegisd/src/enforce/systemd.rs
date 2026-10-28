@@ -102,13 +102,23 @@ impl Systemd {
     /// exit non-zero after the freeze took effect, so the exit status
     /// alone cannot tell.
     pub fn is_frozen(&self, slice: &str, scope: &str) -> Result<bool> {
+        self.event(slice, scope, "frozen 1")
+    }
+
+    /// Does the scope still hold a process? False once its cgroup is gone.
+    pub fn is_populated(&self, slice: &str, scope: &str) -> Result<bool> {
+        self.event(slice, scope, "populated 1")
+    }
+
+    fn event(&self, slice: &str, scope: &str, line: &str) -> Result<bool> {
         let path = format!(
             "/sys/fs/cgroup/{}/cgroup.events",
             super::nft::Nft::scope_cgroup(slice, scope)
         );
         match (self.events)(&path) {
-            Ok(t) => Ok(t.lines().any(|l| l.trim() == "frozen 1")),
-            // No cgroup: every process is gone, so nothing is frozen.
+            Ok(t) => Ok(t.lines().any(|l| l.trim() == line)),
+            // No cgroup: every process is gone, so nothing is frozen
+            // and nothing is left in it.
             Err(e)
                 if e.downcast_ref::<std::io::Error>()
                     .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>

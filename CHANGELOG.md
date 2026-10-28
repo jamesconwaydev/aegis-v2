@@ -22,6 +22,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   aegisd looks at the table again when an nft call fails: a missing
   table is recreated and the rule added once more, and a rule that's
   already gone is recorded as "the rule was already gone".
+- A tree that aegisd moved into its quarantine scope but couldn't
+  freeze (verdict `would_quarantine`) had a drop rule, and lost it for
+  good to the first nftables reload. Its kernel holds kept blocking
+  connects while aegisd ran, but they go when aegisd restarts, and then
+  nothing did. The 10-second check now puts its rule back too, while
+  any of the tree is still in the scope. In audit mode, as before, only
+  a rule that enforce mode added comes back.
 
 ## [0.2.2] - 2026-10-28
 
