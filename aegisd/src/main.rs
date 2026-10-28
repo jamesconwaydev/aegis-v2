@@ -385,8 +385,8 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
         }
         // Any arm can score (a verdict or deadline releases a deferred
         // signal), so jobs are handed over after each, never waited on.
-        for job in pipe.to_enforce.drain(..) {
-            enforcer.queue(job);
+        for job in std::mem::take(&mut pipe.to_enforce) {
+            enforcer.queue_about(job, |id, k| pipe.about(id, k));
         }
     }
 

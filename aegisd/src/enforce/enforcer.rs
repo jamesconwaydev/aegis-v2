@@ -126,10 +126,20 @@ impl EnforcerHandle {
     /// logged; a dropped throttle or quarantine also goes to telemetry,
     /// so a webhook says the tree was left alone.
     pub fn queue(&self, job: EnforceJob) {
+        self.queue_about(job, |_, _| (0.0, String::new()));
+    }
+
+    /// `queue`, with `about` giving a dropped job's incident score and
+    /// root process name (from its id and first process) for telemetry.
+    pub fn queue_about(
+        &self,
+        job: EnforceJob,
+        about: impl FnOnce(&str, Option<ProcKey>) -> (f64, String),
+    ) {
         let fork = matches!(job, EnforceJob::Fork { .. });
         if fork {
             if self.forks.load(Ordering::Relaxed) >= FORK_SLOTS {
-                return self.drop_job(&job);
+                return self.drop_job(&job, about);
             }
             self.forks.fetch_add(1, Ordering::Relaxed);
         }
@@ -143,12 +153,16 @@ impl EnforcerHandle {
                 if fork {
                     self.forks.fetch_sub(1, Ordering::Relaxed);
                 }
-                self.drop_job(&job);
+                self.drop_job(&job, about);
             }
         }
     }
 
-    fn drop_job(&self, job: &EnforceJob) {
+    fn drop_job(
+        &self,
+        job: &EnforceJob,
+        about: impl FnOnce(&str, Option<ProcKey>) -> (f64, String),
+    ) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
         let (id, tier, pid) = match job {
             EnforceJob::Fork { id, .. } => {
@@ -167,15 +181,16 @@ impl EnforcerHandle {
         };
         let reason = "enforcement failed: queue full, nothing was done".to_string();
         eprintln!("aegisd: {id}: {reason}");
+        let (score, comm) = about(id, pid.copied());
         self.sinks.emit(&TelemetryRecord {
             ts_unix_ns: now_ns(),
             incident: id.clone(),
             tier,
             verdict: crate::incident::verdict(tier).unwrap_or("would_throttle"),
-            score: 0.0,
+            score,
             mode: Mode::Enforce,
             tgid: pid.map_or(0, |k| k.tgid),
-            comm: String::new(),
+            comm,
             exe: None,
             target: None,
             reasons: vec![reason],
@@ -2208,6 +2223,33 @@ mod tests {
         let log = std::fs::read_to_string(&path).unwrap();
         assert_eq!(log.lines().count(), 1, "{log}");
         assert!(log.contains("enforcement failed: queue full") && log.contains("AEG-g"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_dropped_escalation_carries_the_score_and_root_name() {
+        let path =
+            std::env::temp_dir().join(format!("aegis-enf-{}-full.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (tx, _rx) = sync_channel(0);
+        let h = EnforcerHandle::new(tx, Arc::new(Sinks::jsonl_at(&path)));
+        h.queue_about(
+            EnforceJob::Quarantine {
+                id: "AEG-h".into(),
+                pids: vec![k(11)],
+            },
+            |id, k| {
+                assert_eq!((id, k.map(|k| k.tgid)), ("AEG-h", Some(11)));
+                (72.5, "payload".into())
+            },
+        );
+        let log = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(
+            (v["score"].as_f64(), v["comm"].as_str()),
+            (Some(72.5), Some("payload"))
+        );
+        assert_eq!(v["tgid"], 11);
         let _ = std::fs::remove_file(&path);
     }
 
