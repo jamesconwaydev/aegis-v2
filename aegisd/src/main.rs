@@ -393,7 +393,9 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     sd_notify("STOPPING=1");
     eprintln!("aegisd: stopping");
     // Anything still waiting on a verdict is scored now, as Unverified,
-    // and reaches the writer before its channel closes.
+    // and reaches the writer before its channel closes. An escalation
+    // this scores is recorded but not enforced: its job is never queued,
+    // so the incident stays at would_* and nothing is done to the tree.
     pipe.flush_all();
     server.abort();
     // A job cut off mid-way could leave a tree moved or frozen with

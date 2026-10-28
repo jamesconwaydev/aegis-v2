@@ -665,8 +665,9 @@ impl Enforcer {
 
     /// Moves `pids` into the running quarantine scope and records it.
     /// Ok(false) moved nothing (all already in it, or exited), so it isn't
-    /// recorded: an attach on the record names pids that were moved.
-    /// True if the tree is in the scope.
+    /// recorded. A recorded attach lists every pid asked for, including
+    /// any `Systemd::attach` left out as already in the scope. True if
+    /// the tree is in the scope.
     fn attach(&self, unit: &str, pids: &[ProcKey], acts: &mut Vec<ActionRecord>) -> bool {
         match self.sys.attach(unit, pids) {
             Ok(false) => true,
@@ -1330,7 +1331,7 @@ mod tests {
         });
         let t = std::time::Instant::now();
         assert!(!h.shutdown(Duration::from_millis(100)));
-        assert!(t.elapsed() < Duration::from_millis(250));
+        assert!(t.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

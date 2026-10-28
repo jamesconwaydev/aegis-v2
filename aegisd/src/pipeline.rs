@@ -959,10 +959,6 @@ impl Pipeline {
         }
     }
 
-    /// Sum over kinds of the max decayed component across the live
-    /// members of group `g`.
-    // Scans every member of every group; index by group if
-    // incidents ever hold thousands of processes.
     /// Incident `g`'s score now and its root process's name, for a
     /// record about a job that never ran. Before the writer thread has
     /// recorded the incident, the root is `first`: a job's first process
@@ -982,6 +978,10 @@ impl Pipeline {
         (self.incident_score(g, 0), comm)
     }
 
+    /// Sum over kinds of the max decayed component across the live
+    /// members of group `g`.
+    // Scans every member of every group; index by group if
+    // incidents ever hold thousands of processes.
     fn incident_score(&self, g: &str, now_ns: u64) -> f64 {
         let members: Vec<&ProcKey> = self
             .groups

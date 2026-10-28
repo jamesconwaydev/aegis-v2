@@ -325,10 +325,15 @@ allowlists apply at once. Telemetry, `[throttle]` and the incident
 directory take effect at the next restart. The verdict cache is
 emptied, so every allowlisted path is verified again.
 
-On `SIGTERM`, aegisd scores every held signal, detaches the probes,
-lets the incident writer finish its queue, removes the socket, and
-exits 0. Detaching the hold programs lifts every hold; a frozen scope
-and its nftables rule stay. If the probe event stream ends for any
+On `SIGTERM`, aegisd scores every held signal, gives the enforcer up
+to 5 seconds to finish the job it's on and anything still queued,
+detaches the probes, lets the incident writer finish its queue, removes
+the socket, and exits 0. Detaching the hold programs lifts every hold;
+a frozen scope and its nftables rule stay.
+
+Those last-moment scores are recorded but never enforced. An
+escalation they cause is written down, and nothing is done to the tree
+for it. If the probe event stream ends for any
 other reason, aegisd exits non-zero, and systemd restarts it.
 
 ## Where to go next
