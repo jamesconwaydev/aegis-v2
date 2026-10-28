@@ -138,7 +138,7 @@ impl Systemd {
         if pids.is_empty() {
             return Ok(false);
         }
-        self.with_live(unit, &pids, |p| {
+        let r = self.with_live(unit, &pids, |p| {
             let mut a: Vec<String> = [
                 "call",
                 "org.freedesktop.systemd1",
@@ -154,8 +154,15 @@ impl Systemd {
             a.push(p.len().to_string());
             a.extend(p.iter().map(|k| k.tgid.to_string()));
             (self.run)(BUSCTL, &a).map(drop)
-        })
-        .map(|()| true)
+        });
+        match r {
+            Ok(()) => Ok(true),
+            // Every one exited before systemd looked: nothing was left
+            // to move, so nothing failed. A short-lived child (the `seq`
+            // of a `$(...)`) is often gone before its job runs.
+            Err(_) if pids.iter().all(|k| !(self.alive)(k.tgid, k.start_time_ns)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// A pid that exits before systemd looks fails the whole call, so on
@@ -205,7 +212,7 @@ impl Systemd {
         ]
         .map(String::from)
         .into();
-        a.push(if limits.is_some() { "5" } else { "3" }.into());
+        a.push(if limits.is_some() { "6" } else { "4" }.into());
         a.extend(["PIDs", "au"].map(String::from));
         a.push(pids.len().to_string());
         a.extend(pids.iter().map(|k| k.tgid.to_string()));
@@ -217,6 +224,14 @@ impl Systemd {
             a.extend(["MemoryHigh", "t"].map(String::from));
             a.push(l.memory_high_bytes.to_string());
         }
+        // systemd 257 refuses AttachProcessesToUnit on a scope that
+        // isn't delegated ("Process migration not available on
+        // non-delegated units"), and newcomers join by that call.
+        // Delegation changes nothing else here: systemd still applies
+        // the limits, freezes, thaws and kills the scope, and enables no
+        // controllers below it, so its processes stay in the scope's own
+        // cgroup. A root process could leave any cgroup anyway.
+        a.extend(["Delegate", "b", "true"].map(String::from));
         a.extend(["Description", "s"].map(String::from));
         a.push(format!("Aegis incident {id}"));
         a.push("0".into());
@@ -327,7 +342,7 @@ mod tests {
             .unwrap();
         let mut want: Vec<&str> = HEAD.to_vec();
         want.extend([
-            "3",
+            "4",
             "PIDs",
             "au",
             "2",
@@ -336,6 +351,9 @@ mod tests {
             "Slice",
             "s",
             "aegis-quarantine.slice",
+            "Delegate",
+            "b",
+            "true",
             "Description",
             "s",
             "Aegis incident AEG-x-q",
@@ -360,7 +378,11 @@ mod tests {
             j.contains("CPUQuotaPerSecUSec t 250000 MemoryHigh t 268435456"),
             "{j}"
         );
-        assert_eq!(c[0][8], "5");
+        assert_eq!(c[0][8], "6");
+        assert!(
+            j.contains("MemoryHigh t 268435456 Delegate b true Description"),
+            "{j}"
+        );
     }
 
     #[test]
@@ -456,5 +478,18 @@ mod tests {
         let c = take();
         assert_eq!(c.len(), 1);
         assert_eq!(c[0][c[0].len() - 2..], ["1".to_string(), "10".into()]);
+    }
+
+    #[test]
+    fn attach_of_processes_all_gone_moves_nothing_and_fails_nothing() {
+        fn fail(_: &str, a: &[String]) -> Result<String> {
+            CALLS.with(|c| c.borrow_mut().push(a.to_vec()));
+            bail!("Call failed: No such process")
+        }
+        take();
+        let s = Systemd::with(fail, alive_10);
+        assert!(!s.attach("u.scope", &[k(11), k(12)]).unwrap());
+        // One still alive: its failure is a failure.
+        assert!(s.attach("u.scope", &[k(10), k(11)]).is_err());
     }
 }
