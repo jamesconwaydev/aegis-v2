@@ -27,12 +27,14 @@ release it or kill it.
   the new `[throttle]` settings: `cpu_quota_percent` (25% of one CPU)
   and `memory_high_mb` (256 MiB). It keeps running, and keeps being
   scored. (#29)
-- **Quarantine.** At the quarantine tier every process in the tree is
-  held in the kernel, moved into `aegis-incident-<id>-q.scope` under
-  `aegis-quarantine.slice`, frozen, and its traffic dropped by an
-  nftables rule. A process that joins the tree later is held and lands
-  frozen in the same scope. Pid 1, kthreadd, aegisd and the tree's
-  ancestors are never touched. (#29)
+- **Quarantine.** At the quarantine tier the tree's members are held in
+  the kernel, then moved into `aegis-incident-<id>-q.scope` under
+  `aegis-quarantine.slice` with any children aegisd finds under them in
+  `/proc`, frozen, and cut off by an nftables rule. A second walk after
+  the freeze attaches anything new. For 30 seconds after the decision,
+  each child the tree forks gets its own job: held and frozen under a
+  quarantine, moved into the scope under a throttle. Pid 1, kthreadd,
+  aegisd and the tree's ancestors are never touched. (#29)
 - **The hold.** Thirteen BPF LSM programs refuse a held process fork and
   clone, connect, send, mount, `bpf()`, module loading, ptrace, writes
   through any file descriptor, new user namespaces, and any signal to
@@ -40,20 +42,25 @@ release it or kill it.
   Separately, in audit mode too, no other process can ptrace aegisd,
   root included: `strace -p`, `gdb -p` and `/proc/<pid>/mem` get
   `EPERM`. Root can still stop it. (#26)
-- **`aegisctl incidents release` and `kill`.** Release thaws a
-  quarantined tree, lifts its holds and restores its network, or lifts
-  a throttle's limits. Kill sends SIGKILL to a quarantined tree, frozen
-  or not. Both work from the recorded actions, so they still work after
-  a restart and in audit mode. (#30)
+- **`aegisctl incidents release` and `kill`.** Release lifts a
+  quarantined tree's holds while it's still frozen, thaws it and
+  restores its network, or lifts a throttle's limits. Kill sends
+  SIGKILL to a quarantined tree, frozen or not. Both work from the
+  recorded actions, so they still work after a daemon restart and in
+  audit mode. After a reboot there's nothing left to release: either
+  one, on an incident from an earlier boot, touches nothing on the host
+  and records it as ended. (#30)
 - **Actions on the record.** Each incident now carries an `actions`
   list: what was done, to which pids, with the unit name or nft handle
   needed to undo it, and any error. Verdicts gain `throttled` and
   `quarantined`, which an incident only reaches once the action worked.
-  Incidents written by v0.1 still load. (#28)
+  Reaching one sends a record to telemetry with a reason starting
+  `enforcement done:`. Incidents written by v0.1 still load. (#28)
 - **Webhooks.** `[[telemetry.webhook]]` posts JSON or a Slack message
-  when an incident first reaches throttle, again when it first reaches
-  quarantine, and on every enforcement failure. They fire in audit mode
-  too. (#33)
+  each time an incident's verdict rises (`would_throttle`, `throttled`,
+  `would_quarantine`, `quarantined`), and on every enforcement failure,
+  including a job dropped because the enforcer's queue was full. They
+  fire in audit mode too. (#33)
 - **OTLP metrics.** Every 60 seconds aegisd sends its event, drop,
   enforcement and telemetry counters, and its open incidents by
   verdict, to `<endpoint>/v1/metrics`. (#34)
@@ -112,6 +119,18 @@ release it or kill it.
   v0.4.0.
 - Holds don't survive an aegisd restart. The freeze and the network
   rule do.
+- A child aegisd finds in `/proc` but never saw fork is frozen and cut
+  off, not held, so it can act until the freeze. If the enforcer falls
+  more than 30 seconds behind, children a throttled tree starts in that
+  time can stay outside its limits.
+- If the move into the quarantine scope fails, aegisd doesn't retry it,
+  not even after a restart. The tree stays held but not frozen, at
+  `would_quarantine`, until you kill or release it.
+- `systemctl reload nftables`, or any full ruleset flush, deletes the
+  `inet aegis` table and with it every quarantined tree's drop rule.
+  The freeze still holds them. After that, rule handles can be reused
+  within the boot, so release affected incidents one at a time. A fix
+  that puts the table back is planned for v0.2.1.
 - A frozen process looks frozen to anything that inspects it, and a
   released one stays under `aegis-quarantine.slice`.
 - An environment longer than 32 KiB counts as unreadable, so the

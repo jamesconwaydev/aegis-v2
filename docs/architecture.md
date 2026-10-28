@@ -256,7 +256,9 @@ recorded. The rest are counted as `incident repeats not recorded`. See
 
 One thread carries out enforce mode, fed by a 256-slot queue the event
 loop fills without waiting. A full queue drops the job and counts it
-(`enforce jobs dropped`). For each job the enforcer waits up to
+(`enforce jobs dropped`); a dropped throttle or quarantine also goes to
+telemetry as `enforcement failed: queue full, nothing was done`. For
+each job the enforcer waits up to
 5 seconds for the incident to be on disk, and does nothing to a tree
 that has no record. It checks the mode again just before acting, so a
 reload to audit stops jobs still in flight.
@@ -267,19 +269,34 @@ them, never pid 1, kthreadd, aegisd, or an ancestor of the tree.
 - **Throttle:** systemd `StartTransientUnit` moves the tree into
   `aegis-incident-<id>.scope` under `aegis-throttle.slice`, with the
   `[throttle]` CPU quota and `MemoryHigh`.
-- **Quarantine:** write every pid into `HELD`, move the tree into
-  `aegis-incident-<id>-q.scope` under `aegis-quarantine.slice`, freeze
-  it, then add an nftables rule in the `inet aegis` table that drops
-  the scope's traffic by cgroup. A process joining the tree later is
-  held and attached to the frozen scope.
+- **Quarantine:** write the job's pids into `HELD`, walk
+  `/proc/<tgid>/task/*/children` down from them for children aegisd
+  never saw fork, move all of it into `aegis-incident-<id>-q.scope`
+  under `aegis-quarantine.slice`, freeze it, walk once more and attach
+  anything new, then add an nftables rule in the `inet aegis` table that
+  drops the scope's traffic by cgroup. Walked children aren't held:
+  `/proc` gives start times to the clock tick, and a hold has to match
+  the kernel's to the nanosecond.
+- **Children forked later:** for 30 seconds after the decision, the
+  event loop turns each fork by a covered process into a job of its
+  own, which holds the child and attaches it to the frozen scope, or to
+  the throttle scope. These jobs may take at most half the queue, so
+  they can't crowd out an escalation. A release or kill request stops
+  them for that incident.
+- **Release:** remove the holds while the tree is still frozen, thaw
+  it, then delete its nftables rule. A throttle's limits are lifted
+  instead.
+- **Earlier boot:** release or kill of an incident whose `boot_id`
+  isn't this boot's runs nothing and records `expired`.
 
 The enforcer calls `busctl`, `systemctl` and `nft` by absolute path,
 with separate arguments and no shell, and a 5-second timeout each.
 Every step is recorded in the incident's `actions` with its unit name
 or nft handle, and every failure goes to telemetry. Release and kill
-read those records back, so they work after a restart and in audit
-mode. The verdict becomes `throttled` or `quarantined` only when the
-step it names worked.
+read those records back, so they work after a daemon restart and in
+audit mode. The verdict becomes `throttled` or `quarantined` only when
+the step it names worked, and then one record announces it to
+telemetry, with a reason starting `enforcement done:`.
 
 ### Control socket
 

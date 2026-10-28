@@ -115,6 +115,10 @@ Better you hear it here than find out during an incident.
   script run directly through its `#!` line is caught.
 - **Writes made before the hold.** The hold lands milliseconds after the
   score crosses 80, and anything written before then is on disk.
+- **An nftables reload.** `systemctl reload nftables` flushes the
+  ruleset, and with it every quarantined tree's drop rule. The freeze
+  still holds them, but don't reload while one is quarantined. Putting
+  the table back is planned for v0.2.1.
 
 The [threat model][wiki-threat] lists every known gap and why it's there.
 

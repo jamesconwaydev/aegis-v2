@@ -69,8 +69,10 @@ unit doesn't retry. Fix the file and start it again.
   (see the [overview](overview.md#throttle-and-quarantine)). aegisd
   refuses `"enforce"` unless the BPF LSM is on (`bpf` in
   `/sys/kernel/security/lsm`; see [preflight](preflight.md#bpf-lsm))
-  and `nft` exists at `/usr/sbin/nft` or `/usr/bin/nft`. The error
-  points at the `mode` line, as above. A reload that fails this check
+  and a file exists at `/usr/sbin/nft` or `/usr/bin/nft`. The check
+  accepts either, but enforce mode runs `/usr/sbin/nft`, which is where
+  Rocky's `nftables` package installs it. The error points at the
+  `mode` line, as above. A reload that fails this check
   keeps the old configuration.
 
   A reload to `"audit"` stops new actions at once, including any still

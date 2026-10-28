@@ -231,6 +231,24 @@ aegisd doesn't rotate it. Set up logrotate with `copytruncate`; see
 An endpoint with `user:pass@` in it is rejected at load; put credentials
 in `[telemetry.otlp.headers]`.
 
+## A quarantined tree got its network back
+
+Check that the table is still there:
+
+```sh
+nft list table inet aegis
+```
+
+If it isn't, something flushed the ruleset: `systemctl reload
+nftables`, a firewall tool, or `nft flush ruleset`. That removes the
+table and every quarantined tree's drop rule with it, and aegisd
+doesn't put it back yet (planned for v0.2.1). The trees are still
+frozen, so they can't use the network until something thaws them.
+Release or kill the affected incidents one at a time, checking the
+table after each; see the
+[threat model](threat-model.md#reloading-nftables-frees-quarantined-trees).
+Avoid reloading nftables while a tree is quarantined.
+
 ## A tree is still frozen after uninstalling
 
 Removing the package while a tree was quarantined or throttled leaves

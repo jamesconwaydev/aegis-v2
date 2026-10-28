@@ -17,8 +17,10 @@ the host.
 
 In enforce mode it also acts on the incident's process tree. At the
 throttle tier it moves the tree into a scope with CPU and memory limits.
-At the quarantine tier it holds every process in the kernel, moves the
-tree into its own scope, freezes it and drops its traffic. It never
+At the quarantine tier it holds the tree's processes in the kernel,
+moves the tree into its own scope, freezes it and drops its traffic.
+[Below](#children-of-a-caught-tree) is exactly which processes get
+which. It never
 kills anything unless you run `aegisctl incidents kill`. It never acts
 on pid 1, on aegisd, or on any ancestor of the tree, so the shell or
 service a payload came from is left alone.
@@ -216,6 +218,43 @@ the event travels to userspace, is scored, the incident is written to
 disk, and the enforcer takes the job: usually a few milliseconds, in
 which the tree can still fork, connect and write.
 
+### Children of a caught tree
+
+A tree can fork in that gap, and aegisd chases what it forks in three
+ways:
+
+- **Fork events.** For 30 seconds after a throttle or quarantine
+  decision, every child a covered process forks gets a job of its own.
+  Under a quarantine it's held and attached to the frozen scope, where
+  it stops. Under a throttle it joins the throttle scope.
+- **A `/proc` walk.** When aegisd quarantines a tree, it also moves and
+  freezes any child it finds in `/proc`, including children whose fork
+  it never saw.
+- **A second walk** after the freeze, which attaches anything new to
+  the frozen scope.
+
+A child is held (writes, connects and forks refused) only once aegisd
+sees its fork event. If the event was lost (say, an attacker flooded
+the ring buffer), that child is frozen and cut off from the network
+like the rest of the tree. It isn't held, though, so for the few
+milliseconds before the freeze it can still act. A process it forks
+after the second walk, whose own fork event is also lost, can stay
+outside the scope. Closing this needs a kernel-side change and is
+planned.
+
+The 30 seconds start at the decision, not the move. If aegisd's
+enforcer falls more than 30 seconds behind, processes a throttled tree
+starts in that time may stay outside its limits. A quarantine isn't
+affected: its walk runs when its job does.
+
+### A failed move isn't retried
+
+If aegisd can't move a tree into its quarantine scope, it doesn't try
+again, not even after a restart. The tree stays held but not frozen,
+and the incident stays `would_quarantine` with the error recorded. Kill
+the tree yourself, or release it. Later processes that join the tree
+are held the same way.
+
 ### Writes before the hold reach the disk
 
 Once held, a process can't write through any file descriptor. Whatever
@@ -232,6 +271,24 @@ nftables rule stay, because systemd and nftables keep them, so a
 quarantined tree is still frozen and cut off. `aegisctl incidents
 release` and `kill` read the recorded actions and still work.
 
+After a reboot there's nothing left to release: the scope, the freeze
+and the nftables rule went with the old boot. Release or kill of an
+incident from an earlier boot touches nothing on the host and records
+it as ended.
+
+### Reloading nftables frees quarantined trees
+
+Reloading nftables (`systemctl reload nftables`, or any
+`nft flush ruleset`) removes aegisd's `inet aegis` table, and every
+quarantined tree's drop rule with it, silently. A frozen tree can't use
+the network anyway, but one of its two locks is gone: anything that
+thaws it finds its network back. Don't reload
+nftables while a tree is quarantined. If you did, release the affected
+incidents one at a time and check `nft list table inet aegis` after
+each: once the table is recreated, rule handles can be reused within
+the same boot, so a release could delete another incident's rule. A
+fix that puts the table back is planned for v0.2.1.
+
 ### A frozen process looks frozen
 
 Freezing is a cgroup state, and anything that inspects the process can
@@ -241,7 +298,7 @@ outside the tree, it can tell the first one was caught.
 
 ### A released process stays in the quarantine slice
 
-`aegisctl incidents release` thaws the tree, lifts its holds and
+`aegisctl incidents release` lifts the tree's holds, thaws it and
 removes its nftables rule, but leaves it in its scope under
 `aegis-quarantine.slice`. Its CPU and memory accounting stays there,
 and the limits of the unit it came from no longer apply to it.

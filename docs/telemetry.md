@@ -32,10 +32,10 @@ Every sink carries these facts:
 | Fact       | Meaning                                              |
 | ---------- | ---------------------------------------------------- |
 | incident   | the incident id                                      |
-| verdict    | `would_throttle` or `would_quarantine`               |
+| verdict    | one of the four [verdicts](incidents.md#verdicts)    |
 | tier       | `throttle` or `quarantine`                           |
 | score      | the decision's score                                 |
-| mode       | `audit`                                              |
+| mode       | `audit` or `enforce`                                 |
 | tgid       | the process the decision was about                   |
 | comm       | its self-reported name                               |
 | path       | its executable, as UTF-8 with invalid bytes replaced |
@@ -60,8 +60,8 @@ structured entries:
 | `AEGIS_INCIDENT`    | the incident id                            |
 | `AEGIS_SCORE`       | the score, one decimal place               |
 | `AEGIS_TIER`        | `throttle` or `quarantine`                 |
-| `AEGIS_VERDICT`     | `would_throttle` or `would_quarantine`     |
-| `AEGIS_MODE`        | `audit`                                    |
+| `AEGIS_VERDICT`     | the verdict, as in the record above        |
+| `AEGIS_MODE`        | `audit` or `enforce`                       |
 | `AEGIS_TGID`        | the process id                             |
 | `AEGIS_COMM`        | the process name                           |
 | `AEGIS_EXE`         | the executable path, UTF-8                 |
@@ -237,9 +237,9 @@ are the value at that moment.
 
 Journald is for the log you read afterwards. A webhook is for the
 moment an incident opens and nobody is reading anything. aegisd posts to
-a URL you choose when an incident first reaches throttle, again when it
-first reaches quarantine, and whenever enforcement fails. A busy
-incident that stays at one tier sends nothing more.
+a URL you choose each time an incident's verdict rises, and whenever
+enforcement fails. A busy incident whose verdict stays put sends
+nothing more.
 
 ```toml
 [[telemetry.webhook]]
@@ -265,16 +265,23 @@ system trust store.
 
 ### When it sends
 
-A webhook sends in audit mode and in enforce mode, so a `would_throttle`
-tells you what enforce mode would have done. It sends for:
+A webhook sends in audit mode and in enforce mode. Verdicts rank
+`would_throttle`, `throttled`, `would_quarantine`, `quarantined`, and a
+webhook sends the first record for an incident at each rank above the
+last one it sent. In audit mode that's at most two: `would_throttle`
+tells you what enforce mode would have done. In enforce mode the
+prediction goes out first and the action follows once it worked, so a
+quarantine typically sends `would_quarantine`, then `quarantined` with
+a reason such as `enforcement done: members held, moved, frozen, egress
+dropped`. A throttle's reads `enforcement done: moved into a CPU and
+memory limited scope`.
 
-- the first record at throttle for an incident;
-- the first record at quarantine for that incident, throttled or not
-  before;
-- every enforcement failure (`enforcement failed:` or `enforcement
-  skipped:` as the reason).
+It also sends every enforcement failure, whatever its rank, with a
+reason starting `enforcement failed:` or `enforcement skipped:`. That
+includes a throttle or quarantine dropped because the enforcer's queue
+was full: `enforcement failed: queue full, nothing was done`.
 
-It doesn't send a second record at a tier it has already reported. The
+It doesn't send a second record at a rank it has already reported. The
 webhook remembers its last 4,096 incidents; past that it forgets them
 all and an old incident that records again may notify again.
 
@@ -297,7 +304,8 @@ all and an old incident that records again may notify again.
 ```
 
 `slack` posts the same one-line message journald gets, as the only
-field Slack needs. For an enforcement failure the reason follows it.
+field Slack needs. For an enforcement failure the reason follows it;
+the verdict says when enforcement worked.
 
 <!-- markdownlint-disable MD013 -->
 ```json

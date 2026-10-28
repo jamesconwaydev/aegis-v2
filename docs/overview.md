@@ -76,12 +76,16 @@ scope under `aegis-throttle.slice`, with a CPU quota and a soft memory
 limit. The tree keeps running, slowly, and can still climb to
 quarantine.
 
-A **quarantine** goes further. First every process in the tree is
-*held*: BPF LSM programs refuse it fork, connect, send, mount, `bpf()`,
+A **quarantine** goes further. First the tree's members are *held*:
+BPF LSM programs refuse them fork, connect, send, mount, `bpf()`,
 module loading, ptrace, writes and new user namespaces. Then systemd
-moves the tree into its own scope under `aegis-quarantine.slice` and
-freezes it, and an nftables rule drops its traffic. A process that
-joins the tree later is held and frozen the same way.
+moves the tree, with any children aegisd finds under it, into its own
+scope under `aegis-quarantine.slice` and freezes it, and an nftables
+rule drops its traffic. A child forked in the first 30 seconds after
+the decision is held and frozen the same way. One whose fork aegisd
+never saw is frozen and cut off but not held; the
+[threat model](threat-model.md#children-of-a-caught-tree) has the
+detail.
 
 Nothing is killed for you. `aegisctl incidents release <id>` undoes a
 throttle or a quarantine, and `aegisctl incidents kill <id>` ends a

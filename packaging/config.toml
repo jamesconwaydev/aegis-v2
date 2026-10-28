@@ -57,9 +57,9 @@ dir = "/var/lib/aegis-v2/incidents"
 # [telemetry.otlp.headers]
 # Authorization = "Bearer <token>"
 #
-# Webhooks: one POST when an incident first reaches throttle, one when it
-# first reaches quarantine, and one per enforcement failure. Repeat the
-# table for more than one. Same SELinux boolean as OTLP.
+# Webhooks: one POST each time an incident's verdict rises (would_throttle,
+# throttled, would_quarantine, quarantined), and one per enforcement
+# failure. Repeat the table for more than one. Same SELinux boolean as OTLP.
 # [[telemetry.webhook]]
 # url = "https://hooks.slack.com/services/<path>"   # http:// or https://
 # format = "json"                        # or "slack"

@@ -22,7 +22,7 @@ reading whether or not anything was stopped.
 aegisctl incidents release <id>
 ```
 
-That thaws the tree, lifts the holds and gives it its network back.
+That lifts the holds, thaws the tree and gives it its network back.
 Then allowlist what caught it, so it doesn't happen again. The process
 stays in its quarantine scope until it exits; see the
 [threat model](threat-model.md#a-released-process-stays-in-the-quarantine-slice).
