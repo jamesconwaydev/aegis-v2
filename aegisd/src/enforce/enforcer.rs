@@ -447,7 +447,12 @@ impl Enforcer {
             self.sys
                 .start_scope(&unit, THROTTLE_SLICE, pids, Some(self.limits))
         } else {
-            self.sys.attach(&unit, pids)
+            match self.sys.attach(&unit, pids) {
+                // All already in the scope (born there): nothing to
+                // record, and no rewrite of incident.json per fork.
+                Ok(false) => return,
+                r => r.map(drop),
+            }
         };
         let a = act(kind, Some(&unit), tgids(pids), r.map(|_| None));
         let v = a.ok.then_some("throttled");
@@ -1930,5 +1935,36 @@ mod tests {
         assert_eq!(kinds, ["hold", "scope", "freeze", "attach", "nft_drop"]);
         assert_eq!(inc.actions[1].pids, [10, 20]);
         assert_eq!(inc.actions[3].pids, [22]);
+    }
+
+    #[test]
+    fn forks_born_in_the_throttle_scope_leave_the_record_alone() {
+        thread_local! { static UNIT: RefCell<String> = const { RefCell::new(String::new()) }; }
+        fn cg(_: u32) -> Option<String> {
+            UNIT.with(|u| {
+                let u = u.borrow();
+                (!u.is_empty()).then(|| format!("0::/aegis.slice/aegis-throttle.slice/{u}\n"))
+            })
+        }
+        let mut f = fx("t-born", ok);
+        f.e.sys = Systemd::with(ok, alive).with_cgroup(cg);
+        f.e.run(EnforceJob::Throttle {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let file = f.dir.join(&f.id).join("incident.json");
+        let before = std::fs::read(&file).unwrap();
+        UNIT.with(|u| *u.borrow_mut() = format!("aegis-incident-{}.scope", f.id));
+        take();
+        for c in 0..100 {
+            f.e.run(EnforceJob::Fork {
+                id: f.id.clone(),
+                tier: Tier::Throttle,
+                pid: k(1000 + c),
+            });
+        }
+        assert!(take().is_empty());
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        UNIT.with(|u| u.borrow_mut().clear());
     }
 }

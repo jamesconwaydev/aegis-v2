@@ -124,8 +124,8 @@ impl Systemd {
     /// cgroup stops as it lands (cgroup-v2.rst, "Cgroup Freezer"), so
     /// there is no second freeze. A process already in `unit` (a child
     /// forked there after the move) is left out, and if that is all of
-    /// them busctl isn't run at all.
-    pub fn attach(&self, unit: &str, pids: &[ProcKey]) -> Result<()> {
+    /// them busctl isn't run at all. Ok(false) when nothing was moved.
+    pub fn attach(&self, unit: &str, pids: &[ProcKey]) -> Result<bool> {
         let tail = format!("/{unit}");
         let pids: Vec<ProcKey> = pids
             .iter()
@@ -136,7 +136,7 @@ impl Systemd {
             })
             .collect();
         if pids.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         self.with_live(unit, &pids, |p| {
             let mut a: Vec<String> = [
@@ -155,6 +155,7 @@ impl Systemd {
             a.extend(p.iter().map(|k| k.tgid.to_string()));
             (self.run)(BUSCTL, &a).map(drop)
         })
+        .map(|()| true)
     }
 
     /// A pid that exits before systemd looks fails the whole call, so on
@@ -449,9 +450,9 @@ mod tests {
         }
         take();
         let s = Systemd::with(ok, alive_10).with_cgroup(cg);
-        s.attach("u.scope", &[k(11)]).unwrap();
+        assert!(!s.attach("u.scope", &[k(11)]).unwrap());
         assert!(take().is_empty());
-        s.attach("u.scope", &[k(10), k(11)]).unwrap();
+        assert!(s.attach("u.scope", &[k(10), k(11)]).unwrap());
         let c = take();
         assert_eq!(c.len(), 1);
         assert_eq!(c[0][c[0].len() - 2..], ["1".to_string(), "10".into()]);
