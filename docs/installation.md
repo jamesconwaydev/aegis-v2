@@ -204,6 +204,9 @@ nftables rules:
 nft delete table inet aegis
 ```
 
+If that says there's no such table, nothing ever needed one: aegisd only
+creates it for the first quarantine. Carry on.
+
 Leave `aegis.slice` alone if any scope you kept is still listed: it's
 harmless, and gone at the next boot. Only if every scope left is one you
 want ended, stop the slice, which kills everything under it:

@@ -313,7 +313,8 @@ handle, but only when that handle's rule shows such a bare id.
 Both incident scopes, `aegis-incident-<id>.scope` and
 `aegis-incident-<id>-q.scope`, are started with `Delegate=yes`.
 systemd only lets a process join a running scope that way, and
-newcomers join by that call. It changes less than it sounds:
+newcomers join by that call, `AttachProcessesToUnit`. It changes less
+than it sounds:
 
 - The scope's cgroup stays root-owned. A process in it that isn't root
   can't create cgroups, change limits, thaw, or move itself out, any

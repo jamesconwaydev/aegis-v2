@@ -38,13 +38,15 @@ REPO = f"https://github.com/{REPO_PATH}"
 
 # Inline links and images, with an optional title, and reference-style
 # definitions. Targets with spaces or nested brackets aren't supported.
-INLINE = re.compile(r'(!?)\[([^\]]*)\]\(([^)\s]+)((?:\s+"[^"]*")?)\)')
+INLINE = re.compile(r'(!?)\[((?:[^\[\]]|!\[[^\]]*\]\([^)]*\))*)\]\(([^)\s]+)((?:\s+"[^"]*")?)\)')
 REFDEF = re.compile(r"^( {0,3}\[[^\]]+\]:[ \t]*)(\S+)", re.M)
 
 
 def rewrite(target, ref, image=False):
     if re.match(r"[a-z]+:|#", target):
         return target
+    if target.startswith("/"):
+        sys.exit(f"absolute link target {target}: use a path relative to docs/")
     path, _, anchor = target.partition("#")
     anchor = "#" + anchor if anchor else ""
     full = posixpath.normpath(posixpath.join("docs", path))
@@ -60,6 +62,7 @@ def rewrite(target, ref, image=False):
 def convert(text, ref):
     def inline(m):
         bang, label, target, title = m.groups()
+        label = INLINE.sub(inline, label)  # an image nested in a link
         return f"{bang}[{label}]({rewrite(target, ref, bool(bang))}{title})"
 
     text = INLINE.sub(inline, text)
@@ -80,10 +83,19 @@ def check():
         "[a](sub/../faq.md)": "[a](FAQ)",
         "![g](../assets/x.gif)": f"![g]({raw}/assets/x.gif)",
         '![g](./pic.png "t")': f'![g]({raw}/docs/pic.png "t")',
+        "[![g](../assets/x.gif)](faq.md)": f"[![g]({raw}/assets/x.gif)](FAQ)",
+        "[![g](p.png)](../a.md#s)": f"[![g]({raw}/docs/p.png)]({blob}/a.md#s)",
         "[x]: ../SECURITY.md": f"[x]: {blob}/SECURITY.md",
         "  [y]: ./roadmap.md#v1": "  [y]: Roadmap#v1",
         "[z]: https://x.org": "[z]: https://x.org",
     }
+    for bad in ("[a](/foo.md)", "![a](/x.png)", "[x]: /foo"):
+        try:
+            convert(bad, "v9")
+        except SystemExit as e:
+            assert "absolute" in str(e), e
+        else:
+            raise AssertionError(f"{bad!r} was accepted")
     for given, want in cases.items():
         got = convert(given, "v9")
         assert got == want, f"{given!r}: got {got!r}, want {want!r}"

@@ -30,8 +30,11 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           if [ "$GITHUB_EVENT_NAME" != release ]; then echo "go=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          # sort -V ranks v0.3.0-rc1 above v0.3.0; a pre-release suffix
+          # must rank below its final, so swap the first dash for a tilde,
+          # which sorts before everything, and swap it back.
           newest=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --limit 100 \
-            --json tagName --jq '.[].tagName' | sort -V | tail -1)
+            --json tagName --jq '.[].tagName' | sed 's/-/~/' | sort -V | tail -1 | sed 's/~/-/')
           if [ "$newest" = "$TAG" ]; then
             echo "go=true" >> "$GITHUB_OUTPUT"
           else
