@@ -87,6 +87,8 @@ pub struct EnforcerHandle {
     sinks: Arc<Sinks>,
     /// Fork jobs are being dropped and that has been logged.
     fork_drops_logged: AtomicBool,
+    /// A reassert is queued and hasn't started; the enforcer clears it.
+    reassert_pending: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -100,6 +102,7 @@ impl EnforcerHandle {
             forks: Arc::default(),
             sinks,
             fork_drops_logged: AtomicBool::new(false),
+            reassert_pending: Arc::default(),
             thread: None,
         }
     }
@@ -137,6 +140,12 @@ impl EnforcerHandle {
         about: impl FnOnce(&str, Option<ProcKey>) -> (f64, String),
     ) {
         let fork = matches!(job, EnforceJob::Fork { .. });
+        // A stuck enforcer must not collect one every 10 seconds, which
+        // would crowd out escalations and admin requests.
+        let reassert = matches!(job, EnforceJob::Reassert);
+        if reassert && self.reassert_pending.swap(true, Ordering::Relaxed) {
+            return;
+        }
         if fork {
             if self.forks.load(Ordering::Relaxed) >= FORK_SLOTS {
                 return self.drop_job(&job, about);
@@ -152,6 +161,9 @@ impl EnforcerHandle {
             Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
                 if fork {
                     self.forks.fetch_sub(1, Ordering::Relaxed);
+                }
+                if reassert {
+                    self.reassert_pending.store(false, Ordering::Relaxed);
                 }
                 self.drop_job(&job, about);
             }
@@ -224,6 +236,7 @@ pub fn spawn_enforcer(
         unsaved: HashMap::new(),
         children: proc_children,
         forks: h.forks.clone(),
+        reassert_pending: h.reassert_pending.clone(),
     };
     let t = std::thread::Builder::new()
         .name("aegis-enforce".into())
@@ -360,17 +373,19 @@ pub fn summary_state(acts: &[ActionRecord], earlier_boot: bool) -> Option<&'stat
         return None;
     }
     let scoped = acts.iter().any(|a| a.ok && a.kind == "scope");
+    // A release pushes unhold before thaw: with a scope it only counts
+    // once the thaw did too, or the tree is still frozen.
     let last = acts.iter().rev().filter(|a| a.ok).find(|a| {
         matches!(
             a.kind.as_str(),
-            "scope" | "attach" | "freeze" | "thaw" | "lift_limits" | "kill" | "expired" | "unhold"
-        )
+            "scope" | "attach" | "freeze" | "thaw" | "lift_limits" | "kill" | "expired"
+        ) || (a.kind == "unhold" && !scoped)
     });
     let quarantine = |a: &ActionRecord| a.unit.as_deref().is_some_and(|u| u.ends_with("-q.scope"));
     Some(match last.map(|a| (a.kind.as_str(), a)) {
         Some(("kill", _)) => "killed",
         Some(("thaw" | "lift_limits", _)) => "released",
-        Some(("unhold", _)) if !scoped => "released",
+        Some(("unhold", _)) => "released",
         Some(("expired", _)) => "expired",
         _ if earlier_boot => "expired",
         Some((_, a)) if quarantine(a) => {
@@ -423,6 +438,8 @@ pub struct Enforcer {
     children: fn(ProcKey) -> Vec<ProcKey>,
     /// Shared with the handle: fork jobs still queued.
     forks: Arc<AtomicUsize>,
+    /// Shared with the handle: a reassert is queued.
+    reassert_pending: Arc<AtomicBool>,
 }
 
 impl Enforcer {
@@ -454,7 +471,10 @@ impl Enforcer {
                     let _ = tx.send(r);
                 }
             }
-            EnforceJob::Reassert => self.reassert(),
+            EnforceJob::Reassert => {
+                self.reassert_pending.store(false, Ordering::Relaxed);
+                self.reassert();
+            }
         }
     }
 
@@ -1255,6 +1275,7 @@ mod tests {
             unsaved: HashMap::new(),
             children: |_| Vec::new(),
             forks: Arc::default(),
+            reassert_pending: Arc::default(),
         };
         Fx { e, id, dir }
     }
@@ -1532,6 +1553,31 @@ mod tests {
         let e = r.unwrap_err();
         assert!(e.contains("systemctl thaw"), "{e}");
         assert!(!e.contains("thawed"), "{e}");
+    }
+
+    #[test]
+    fn a_release_whose_thaw_failed_still_reads_quarantined() {
+        fn fail_thaw(prog: &str, a: &[String]) -> Result<String> {
+            if a.first().is_some_and(|s| s == "thaw") {
+                bail!("systemctl thaw: exit Some(1): timed out")
+            }
+            ok(prog, a)
+        }
+        let mut f = fx("rel-state", ok);
+        f.e.sys = Systemd::with(fail_thaw, alive).with_events(frozen);
+        let id = f.id.clone();
+        f.e.run(EnforceJob::Quarantine {
+            id: id.clone(),
+            pids: vec![k(10)],
+        });
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release {
+            id: id.clone(),
+            reply,
+        });
+        assert!(r.is_err());
+        let acts = f.incident().actions;
+        assert!(acts.iter().any(|a| a.ok && a.kind == "unhold"));
+        assert_eq!(summary_state(&acts, false), Some("quarantined"));
     }
 
     #[test]
@@ -1853,6 +1899,7 @@ mod tests {
             unsaved: HashMap::new(),
             children: |_| Vec::new(),
             forks: Arc::default(),
+            reassert_pending: Arc::default(),
         };
         let r = run_reply(&mut e2, |reply| EnforceJob::Release {
             id: id.clone(),
@@ -2341,6 +2388,26 @@ mod tests {
         let log = std::fs::read_to_string(&path).unwrap();
         assert_eq!(log.lines().count(), 1, "{log}");
         assert!(log.contains("enforcement failed: queue full") && log.contains("AEG-g"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reasserts_do_not_pile_up_behind_a_stuck_enforcer() {
+        let path =
+            std::env::temp_dir().join(format!("aegis-enf-{}-reassert.jsonl", std::process::id()));
+        let (tx, rx) = sync_channel(QUEUE);
+        let h = EnforcerHandle::new(tx, Arc::new(Sinks::jsonl_at(&path)));
+        for _ in 0..5 {
+            h.queue(EnforceJob::Reassert);
+        }
+        assert_eq!(rx.try_iter().count(), 1);
+        assert_eq!(h.dropped.load(Ordering::Relaxed), 0);
+        // Once the enforcer starts one, the next tick may queue another.
+        let mut f = fx("re-dedupe", ok);
+        f.e.reassert_pending = h.reassert_pending.clone();
+        f.e.run(EnforceJob::Reassert);
+        h.queue(EnforceJob::Reassert);
+        assert_eq!(rx.try_iter().count(), 1);
         let _ = std::fs::remove_file(&path);
     }
 
