@@ -6,6 +6,8 @@
 [![License: MIT OR Apache-2.0][license-badge]](#license)
 [![Rocky Linux 10][rocky-badge]](docs/installation.md)
 [![Rust 1.98+][msrv-badge]](docs/development.md#minimum-rust-version)
+[![OpenSSF Scorecard][scorecard-badge]][scorecard]
+[![Discussions][discussions-badge]][discussions]
 
 [ci-badge]: https://img.shields.io/github/actions/workflow/status/jamesconwaydev/aegis-v2/ci.yml?branch=main&label=CI
 [ci]: https://github.com/jamesconwaydev/aegis-v2/actions/workflows/ci.yml
@@ -14,6 +16,10 @@
 [license-badge]: https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue
 [rocky-badge]: https://img.shields.io/badge/Rocky%20Linux-10-10b981
 [msrv-badge]: https://img.shields.io/badge/rust-1.98%2B-orange
+[scorecard-badge]: https://api.scorecard.dev/projects/github.com/jamesconwaydev/aegis-v2/badge
+[scorecard]: https://scorecard.dev/viewer/?uri=github.com/jamesconwaydev/aegis-v2
+[discussions-badge]: https://img.shields.io/github/discussions/jamesconwaydev/aegis-v2
+[discussions]: https://github.com/jamesconwaydev/aegis-v2/discussions
 
 # Aegis v2
 

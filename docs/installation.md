@@ -36,6 +36,21 @@ dnf install ./aegis-v2-0.1.1-1.el10.x86_64.rpm \
     ./aegis-v2-selinux-0.1.1-1.el10.noarch.rpm
 ```
 
+From v0.2.0, each release also carries a signature over `SHA256SUMS`,
+build provenance for every file, and an SBOM of the Rust dependencies in
+SPDX and CycloneDX. If you want proof the RPMs came from this
+repository's Release workflow, and not just that they downloaded intact,
+check both before you install:
+
+```sh
+id='^https://github\.com/jamesconwaydev/aegis-v2/\.github/workflows/release\.yml@refs/tags/v'
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+    --certificate-identity-regexp "$id" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify aegis-v2-0.2.0-1.el10.x86_64.rpm \
+    --repo jamesconwaydev/aegis-v2
+```
+
 `dnf` pulls in `nftables` and `criu`, which the package requires. v0.1
 uses neither yet; later releases will (see the [roadmap](roadmap.md)).
 When `selinux-policy-targeted` is installed, as it is on every stock

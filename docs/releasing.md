@@ -55,16 +55,31 @@ On a `v*.*.*` tag:
    release notes.
 2. **rpm:** builds the x86_64 RPMs on an x86_64 runner and the aarch64
    RPM on an arm64 runner, each in the Rocky 10 build container.
-3. **publish:** writes `SHA256SUMS` over every RPM and creates the
-   GitHub release with the notes, marked as a pre-release for `v0.*`
-   tags.
+3. **publish:** writes SPDX and CycloneDX SBOMs from `Cargo.lock`,
+   then `SHA256SUMS` over the RPMs and SBOMs. It attests build
+   provenance for every file listed in `SHA256SUMS`, signs
+   `SHA256SUMS` keylessly with cosign, and creates a **draft** release
+   with the notes, marked as a pre-release for `v0.*` tags.
 
 The release carries:
 
 - `aegis-v2-<version>-1.el10.x86_64.rpm`
 - `aegis-v2-<version>-1.el10.aarch64.rpm`
 - `aegis-v2-selinux-<version>-1.el10.noarch.rpm`
-- `SHA256SUMS`
+- `aegis-v2-v<version>.spdx.json` and `aegis-v2-v<version>.cdx.json`
+- `SHA256SUMS` and `SHA256SUMS.sigstore.json`
+
+## Publishing the draft
+
+Releases are immutable once published: the files and the tag can't
+change after that. So the workflow stops at a draft. Download it, check
+the files and the signature the way
+[installation](installation.md#install-the-rpms) describes, read the
+notes, then publish:
+
+```sh
+gh release edit v0.2.0 --draft=false
+```
 
 ## After publishing
 
@@ -74,13 +89,16 @@ the end-to-end scenarios against it. See
 
 ## If something goes wrong
 
-A failure in **check** or **rpm** publishes nothing. Fix it on a branch,
-merge, delete the tag locally and on GitHub, and tag again:
+A failure in any job publishes nothing, and a bad draft can be deleted.
+Fix it on a branch, merge, delete the tag locally and on GitHub, and tag
+again:
 
 ```sh
 git tag -d v0.2.0
 git push origin :refs/tags/v0.2.0
 ```
 
-Once a release is published, don't move its tag. Fix forward with a
-patch release instead.
+Tags matching `v*` are protected by a ruleset, so deleting one means
+turning that ruleset off for the moment, in **Settings → Rules →
+Rulesets → protect-tags**. Once a release is published, its tag can't
+move at all. Fix forward with a patch release instead.

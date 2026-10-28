@@ -1,3 +1,6 @@
 ignores:
   - CODE_OF_CONDUCT.md # Contributor Covenant, kept verbatim
   - .github/** # templates GitHub fills in, not documents
+config:
+  MD024:
+    siblings_only: true # Keep a Changelog repeats "Added" in every release
