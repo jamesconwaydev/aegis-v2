@@ -38,6 +38,8 @@ const MAX_FOUND: usize = 1024;
 /// escalations, scored newcomers, releases and kills, so a tree forking
 /// in a loop can never crowd those out.
 const FORK_SLOTS: usize = QUEUE / 2;
+/// How long a failed freeze waits before its one retry.
+const FREEZE_RETRY: Duration = Duration::from_millis(200);
 
 /// Where a release or kill answers: Ok with a message, or Err with why.
 pub type Reply = tokio::sync::oneshot::Sender<Result<String, String>>;
@@ -550,12 +552,19 @@ impl Enforcer {
         };
         let mut now_frozen = frozen;
         if moved && !frozen {
-            let r = self.sys.freeze(&unit);
+            let is_frozen = || matches!(self.sys.is_frozen(QUARANTINE_SLICE, &unit), Ok(true));
+            let mut r = self.sys.freeze(&unit);
+            if r.is_err() && !is_frozen() {
+                // busctl returns once the start job is queued, not done:
+                // on a loaded host the scope may not be active yet.
+                std::thread::sleep(FREEZE_RETRY);
+                r = self.sys.freeze(&unit);
+            }
             // The command can fail after the freeze took effect; the
             // kernel has the last word. The error stays on the record.
             let mut a = act("freeze", Some(&unit), vec![], r.map(|_| None));
             if !a.ok {
-                a.ok = matches!(self.sys.is_frozen(QUARANTINE_SLICE, &unit), Ok(true));
+                a.ok = is_frozen();
             }
             now_frozen = a.ok;
             acts.push(a);
@@ -1282,6 +1291,32 @@ mod tests {
             log.contains("enforcement failed: systemctl freeze"),
             "{log}"
         );
+    }
+
+    #[test]
+    fn a_freeze_that_finds_the_scope_not_yet_started_is_tried_again() {
+        // The first freeze fails (the start job is still running); the
+        // second, after a pause, works.
+        fn first_freeze_fails(prog: &str, a: &[String]) -> Result<String> {
+            let tried = CALLS.with(|c| c.borrow().iter().any(|c| c[1] == "freeze"));
+            if a.first().is_some_and(|s| s == "freeze") && !tried {
+                CALLS.with(|c| c.borrow_mut().push([&[prog.to_string()], a].concat()));
+                bail!("systemctl freeze: exit Some(1): unit not active")
+            }
+            ok(prog, a)
+        }
+        let mut f = fx("qretry", first_freeze_fails);
+        f.e.sys = Systemd::with(first_freeze_fails, alive).with_events(no_cgroup);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let freezes = take().iter().filter(|c| c[1] == "freeze").count();
+        assert_eq!(freezes, 2);
+        let inc = f.incident();
+        assert_eq!(inc.verdict, "quarantined");
+        let freeze = inc.actions.iter().find(|a| a.kind == "freeze").unwrap();
+        assert!(freeze.ok && freeze.error.is_none(), "{freeze:?}");
     }
 
     #[test]
