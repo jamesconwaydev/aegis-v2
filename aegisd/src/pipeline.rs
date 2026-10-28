@@ -1992,7 +1992,10 @@ mod tests {
         let (mut p, _d) = pipeline("enf-fork-many");
         p.mode = Mode::Enforce;
         throttled(&mut p, "AEG-t", 80);
-        for c in 1000..2000 {
+        // aegisd never acts on itself, so its own pid (the test's, which
+        // can fall in this range) is skipped.
+        let me = std::process::id();
+        for c in (1000..).filter(|&c| c != me).take(1000) {
             p.handle(&fork(80, c));
             p.handle(&ev(EventKind::Exit, c));
         }
