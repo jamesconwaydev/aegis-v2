@@ -87,6 +87,10 @@ never saw is frozen and cut off but not held; the
 [threat model](threat-model.md#children-of-a-caught-tree) has the
 detail.
 
+Both are transient systemd scopes, delegated (`Delegate=yes`) so
+systemd lets aegisd move later processes into them; the cgroups stay
+root-owned, so a tree that isn't root gains nothing from it.
+
 Nothing is killed for you. `aegisctl incidents release <id>` undoes a
 throttle or a quarantine, and `aegisctl incidents kill <id>` ends a
 quarantined tree. See [aegisctl](aegisctl.md#incidents-release-id).

@@ -54,7 +54,8 @@ VERSION=0.2.0 ARCH=x86_64   # or aarch64
 base=https://github.com/jamesconwaydev/aegis-v2/releases/download/v$VERSION
 curl -fsSLO "$base/aegis-v2-$VERSION-1.el10.$ARCH.rpm" \
      -O "$base/aegis-v2-selinux-$VERSION-1.el10.noarch.rpm"
-dnf install ./aegis-v2-*.rpm
+dnf install "./aegis-v2-$VERSION-1.el10.$ARCH.rpm" \
+    "./aegis-v2-selinux-$VERSION-1.el10.noarch.rpm"
 aegisctl preflight
 systemctl enable --now aegisd
 ```
@@ -83,7 +84,8 @@ a held tree waits for one of two commands: `aegisctl incidents release
 - **Watches from the kernel.** eBPF probes on exec (the real path, not
   `argv[0]`), fork, exit, ptrace attach, `memfd_create` and outbound TCP
   connects. Each new program's environment is read at exec, before its
-  first instruction, so a preloaded library has nowhere to hide.
+  first instruction, so a preloaded library can't scrub itself before
+  the check.
 - **Scores behaviour, not names.** An exec from `/tmp` adds 25, a memfd
   exec 65, an attach to a system daemon 45, a connect burst 40. Scores
   halve every 30 seconds of quiet, and a whole tree counts as one.
@@ -99,9 +101,9 @@ a held tree waits for one of two commands: `aegisctl incidents release
   writes), freezes it with systemd, and drops its traffic in nftables.
   Nothing gets killed unless you say so.
 - **Runs tight.** Six capabilities instead of all of them, a read-only
-  filesystem outside its own two directories, its own SELinux domain, and
-  a control socket that answers root only. `/etc` is left byte for byte
-  as it was.
+  filesystem outside its own state, socket and log directories, its own
+  SELinux domain, and a control socket that answers root only. `/etc`
+  is left byte for byte as it was.
 
 ## What it won't catch
 
@@ -116,8 +118,8 @@ Better you hear it here than find out during an incident.
 - **Writes made before the hold.** The hold lands milliseconds after the
   score crosses 80, and anything written before then is on disk.
 - **An nftables reload.** `systemctl reload nftables` flushes the
-  ruleset, and with it every quarantined tree's drop rule. The freeze
-  still holds them, but don't reload while one is quarantined. Putting
+  ruleset, and with it every quarantined tree's drop rule. They stay
+  frozen, but don't reload while one is quarantined. Putting
   the table back is planned for v0.2.1.
 
 The [threat model][wiki-threat] lists every known gap and why it's there.

@@ -235,6 +235,8 @@ cleared first. It passes when:
   `none`, or one incident with `would_throttle`, `would_quarantine`,
   `throttled` or `quarantined`,
 - its `check`, if it has one, passes once the verdict settles,
+- in enforce mode, no incident recorded a failed action, read after the
+  harness has released or killed it,
 - no SELinux denial mentioning aegis was logged since the scenario
   started. `ausearch` must find some audit event in that window, or the
   check fails: an empty answer means the log isn't being read, and

@@ -245,7 +245,8 @@ table and every quarantined tree's drop rule with it, and aegisd
 doesn't put it back yet (planned for v0.2.1). The trees are still
 frozen, so they can't use the network until something thaws them.
 Release or kill the affected incidents one at a time, checking the
-table after each; see the
+table after each. Release then reports the missing rule as an error;
+the tree is still released. See the
 [threat model](threat-model.md#reloading-nftables-frees-quarantined-trees).
 Avoid reloading nftables while a tree is quarantined.
 

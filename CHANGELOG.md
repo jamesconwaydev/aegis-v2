@@ -35,6 +35,12 @@ release it or kill it.
   each child the tree forks gets its own job: held and frozen under a
   quarantine, moved into the scope under a throttle. Pid 1, kthreadd,
   aegisd and the tree's ancestors are never touched. (#29)
+- **Delegated incident scopes.** Both incident scopes are started with
+  `Delegate=yes`, because systemd only lets a process join a running
+  scope that way. Their cgroups stay root-owned, so a tree that isn't
+  root gains nothing, and limits, freezing and kill still cover
+  everything below the scope. The end-to-end suite now fails any
+  enforce-mode scenario whose incident records a failed action.
 - **The hold.** Thirteen BPF LSM programs refuse a held process fork and
   clone, connect, send, mount, `bpf()`, module loading, ptrace, writes
   through any file descriptor, new user namespaces, and any signal to
@@ -123,12 +129,13 @@ release it or kill it.
   off, not held, so it can act until the freeze. If the enforcer falls
   more than 30 seconds behind, children a throttled tree starts in that
   time can stay outside its limits.
-- If the move into the quarantine scope fails, aegisd doesn't retry it,
-  not even after a restart. The tree stays held but not frozen, at
-  `would_quarantine`, until you kill or release it.
+- If the move into the quarantine scope fails, aegisd doesn't retry it.
+  The tree stays held but not frozen, at `would_quarantine`. A restart
+  doesn't retry the move either, and it lifts the holds, so after one
+  the tree runs free until you kill or release it.
 - `systemctl reload nftables`, or any full ruleset flush, deletes the
   `inet aegis` table and with it every quarantined tree's drop rule.
-  The freeze still holds them. After that, rule handles can be reused
+  They stay frozen. After that, rule handles can be reused
   within the boot, so release affected incidents one at a time. A fix
   that puts the table back is planned for v0.2.1.
 - A frozen process looks frozen to anything that inspects it, and a

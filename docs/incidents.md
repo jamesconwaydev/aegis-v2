@@ -113,10 +113,11 @@ after the action succeeded. If it failed, the verdict stays at
 `would_*` and the failure is in `actions`. A verdict never moves down.
 
 If aegisd can't move a tree into its quarantine scope, it doesn't try
-again, not even after a restart. The tree stays held but not frozen,
-and the incident stays `would_quarantine` with the error recorded. Kill
-the tree yourself, or release it. Later processes that join the tree
-are held the same way.
+again. The tree stays held but not frozen, and the incident stays
+`would_quarantine` with the error recorded. Later processes that join
+the tree are held the same way. A restart doesn't retry the move, and it
+lifts the holds, so after one the tree runs free. Kill it yourself, or
+release it.
 
 ### Action entries
 
@@ -155,6 +156,11 @@ while it's still the process that was held.
 | `kill`        | the processes killed                          |
 | `lift_limits` | a throttle's CPU and memory limits lifted     |
 | `expired`     | release or kill of an earlier boot's incident |
+
+`systemctl show` on a `scope` or `attach` unit reports `Delegate=yes`.
+That's deliberate: systemd only lets processes join a running scope
+that's delegated. The [threat model](threat-model.md#incident-scopes-are-delegated)
+says what that does and doesn't allow.
 
 ### Process entries
 

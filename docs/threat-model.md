@@ -224,9 +224,11 @@ A tree can fork in that gap, and aegisd chases what it forks in three
 ways:
 
 - **Fork events.** For 30 seconds after a throttle or quarantine
-  decision, every child a covered process forks gets a job of its own.
-  Under a quarantine it's held and attached to the frozen scope, where
-  it stops. Under a throttle it joins the throttle scope.
+  decision, every child a covered process forks gets a job of its own,
+  unless its fork jobs fill their half of the enforcer's queue (128
+  jobs), when the rest are dropped and counted. Under a quarantine
+  it's held and attached to the frozen scope, where it stops. Under a
+  throttle it joins the throttle scope.
 - **A `/proc` walk.** When aegisd quarantines a tree, it also moves and
   freezes any child it finds in `/proc`, including children whose fork
   it never saw.
@@ -237,23 +239,28 @@ A child is held (writes, connects and forks refused) only once aegisd
 sees its fork event. If the event was lost (say, an attacker flooded
 the ring buffer), that child is frozen and cut off from the network
 like the rest of the tree. It isn't held, though, so for the few
-milliseconds before the freeze it can still act. A process it forks
-after the second walk, whose own fork event is also lost, can stay
-outside the scope. Closing this needs a kernel-side change and is
+milliseconds before the freeze it can still act. A process that child
+forks before the move and then orphans, by exiting so the process is
+reparented out of the tree, can stay outside the scope, whether or not
+its own fork event arrives. So can anything past the walk's
+1,024-process limit. Closing this needs a kernel-side change and is
 planned.
 
-The 30 seconds start at the decision, not the move. If aegisd's
-enforcer falls more than 30 seconds behind, processes a throttled tree
+A throttle never walks `/proc`, so it relies on fork jobs alone. The 30
+seconds start at the decision, not the move. If aegisd's enforcer falls
+more than 30 seconds behind, or a throttled tree's fork jobs are
+dropped because they filled their half of the queue, the processes it
 starts in that time may stay outside its limits. A quarantine isn't
 affected: its walk runs when its job does.
 
 ### A failed move isn't retried
 
 If aegisd can't move a tree into its quarantine scope, it doesn't try
-again, not even after a restart. The tree stays held but not frozen,
-and the incident stays `would_quarantine` with the error recorded. Kill
-the tree yourself, or release it. Later processes that join the tree
-are held the same way.
+again. The tree stays held but not frozen, and the incident stays
+`would_quarantine` with the error recorded. Later processes that join
+the tree are held the same way. A restart doesn't retry the move, and it
+lifts the holds, so after one the tree runs free. Kill it yourself, or
+release it.
 
 ### Writes before the hold reach the disk
 
@@ -281,13 +288,32 @@ it as ended.
 Reloading nftables (`systemctl reload nftables`, or any
 `nft flush ruleset`) removes aegisd's `inet aegis` table, and every
 quarantined tree's drop rule with it, silently. A frozen tree can't use
-the network anyway, but one of its two locks is gone: anything that
-thaws it finds its network back. Don't reload
-nftables while a tree is quarantined. If you did, release the affected
-incidents one at a time and check `nft list table inet aegis` after
-each: once the table is recreated, rule handles can be reused within
-the same boot, so a release could delete another incident's rule. A
-fix that puts the table back is planned for v0.2.1.
+the network anyway, but one of its locks is gone: anything that thaws
+it finds its network back. Don't reload nftables while a tree is
+quarantined. If you did, release the affected incidents one at a time
+and check `nft list table inet aegis` after each: once the table is
+recreated, rule handles can be reused within the same boot, so a
+release could delete another incident's rule. Release then reports the
+missing rule as an error. The tree is still released. A fix that puts
+the table back is planned for v0.2.1.
+
+### Incident scopes are delegated
+
+Both incident scopes, `aegis-incident-<id>.scope` and
+`aegis-incident-<id>-q.scope`, are started with `Delegate=yes`.
+systemd only lets a process join a running scope that way, and
+newcomers join by that call. It changes less than it sounds:
+
+- The scope's cgroup stays root-owned. A process in it that isn't root
+  can't create cgroups, change limits, thaw, or move itself out, any
+  more than it could before.
+- A process running as root inside a throttled or quarantined tree can
+  create sub-cgroups under the scope, or leave it, as root always could;
+  that sits under [a root attacker can stop it](#a-root-attacker-can-stop-it).
+  Delegation only means systemd leaves those sub-cgroups alone.
+- Limits, freezing and kill are hierarchical. CPU and memory limits
+  bind the whole subtree, a frozen scope freezes every cgroup below it,
+  and a kill reaches every process under it, sub-cgroups included.
 
 ### A frozen process looks frozen
 
