@@ -148,7 +148,7 @@ impl<D: RpmDb> Verifier<D> {
         }
         let (v, cacheable) = self.compute(exe, f, md, pinned);
         if cacheable {
-            // ponytail: unbounded, but bounded by the number of distinct
+            // Unbounded, but bounded by the number of distinct
             // executables seen; add an LRU if it ever grows.
             self.cache.lock().unwrap().insert(id, v.clone());
         }

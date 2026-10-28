@@ -186,13 +186,13 @@ pub struct Pipeline {
     /// The executables worth verifying: `Allowlist::verify_paths`.
     verify_paths: BTreeSet<PathBuf>,
     /// Per incident id, what it has recorded so far.
-    // ponytail: one entry per incident for the daemon's life, like the
+    // One entry per incident for the daemon's life, like the
     // store's own map; evict both together if that ever matters.
     spoken: HashMap<String, Spoken>,
     /// Per incident id, the tier enforcement was last asked for and the
     /// processes it covered: each kind is sent once, and after that only
     /// a newcomer to a quarantined tree gets a job of its own.
-    // ponytail: kept for the daemon's life, like `spoken`.
+    // Kept for the daemon's life, like `spoken`.
     enforced: HashMap<String, (Tier, HashSet<ProcKey>)>,
     /// Enforcement for the caller to queue (enforce mode only).
     pub to_enforce: Vec<EnforceJob>,
@@ -828,7 +828,7 @@ impl Pipeline {
                 .filter(|k| !covered.contains(k))
                 .collect();
             if !pids.is_empty() {
-                // ponytail: covered before the job reaches the queue, so a
+                // Covered before the job reaches the queue, so a
                 // dropped newcomer job (counted) is never retried.
                 covered.extend(&pids);
                 self.to_enforce
@@ -892,7 +892,7 @@ impl Pipeline {
 
     /// Sum over kinds of the max decayed component across the live
     /// members of group `g`.
-    // ponytail: scans every member of every group; index by group if
+    // Scans every member of every group; index by group if
     // incidents ever hold thousands of processes.
     fn incident_score(&self, g: &str, now_ns: u64) -> f64 {
         let members: Vec<&ProcKey> = self

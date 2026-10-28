@@ -199,7 +199,7 @@ impl ProcTable {
     }
 
     /// The live process with this tgid, if we know it.
-    // ponytail: linear scan; index by tgid if the table gets large.
+    // Linear scan; index by tgid if the table gets large.
     pub fn by_tgid(&self, tgid: u32) -> Option<&ProcInfo> {
         self.procs.values().find(|p| p.key.tgid == tgid)
     }

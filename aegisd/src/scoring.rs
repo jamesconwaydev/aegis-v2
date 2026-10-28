@@ -133,7 +133,7 @@ pub fn signals_for(ev: &Event, table: &ProcTable, daemon: &dyn DaemonClassifier)
     vec![sig]
 }
 
-// ponytail: newest 32 kept per process; raise it if incidents need more.
+// Newest 32 kept per process; raise it if incidents need more.
 const MAX_EVIDENCE: usize = 32;
 
 /// A signal counts by kind, not by instance: ten memfd_creates from one
@@ -217,7 +217,7 @@ impl Scorer {
         self.allow = cfg.allowlist.clone();
     }
 
-    // ponytail: scores are decayed before this `>=`, so signals whose
+    // Scores are decayed before this `>=`, so signals whose
     // weights sum exactly to a threshold never reach it (any gap between
     // them decays the sum just under). Keep canonical bursts clear of the
     // line, as memfd_exec 65 does, or add an epsilon here if that stops
@@ -433,7 +433,7 @@ type Target = (IpAddr, u16);
 #[derive(Default)]
 struct Window {
     /// (ts_ns, target, failed), oldest first.
-    // ponytail: one entry per connect inside the window, so a process
+    // One entry per connect inside the window, so a process
     // connecting very fast holds that many; cap the deque if that bites.
     conns: VecDeque<(u64, Target, bool)>,
     targets: HashMap<Target, u32>,

@@ -38,7 +38,7 @@ pub struct Webhook {
     counters: Arc<Counters>,
     format: WebhookFormat,
     /// Highest tier already sent per incident.
-    // ponytail: cleared when full, so a very old incident may notify
+    // Cleared when full, so a very old incident may notify
     // again; keep it in the incident store if that ever matters.
     sent: Mutex<HashMap<String, Tier>>,
 }

@@ -316,7 +316,7 @@ impl IncidentStore {
     /// Only incidents updated in the last 30 days are loaded into memory,
     /// and only those from this boot (same `boot_id`) feed the process index. Older
     /// ones stay on disk: `get` still finds them, `list` does not.
-    /// ponytail: no eviction while running and `list` is recent-only; add
+    /// No eviction while running and `list` is recent-only; add
     /// an eviction pass and a disk scan if either matters.
     pub fn open_at(dir: &Path, boot_id: Option<String>, now_secs: u64) -> Result<Self> {
         private_dir(dir)?;

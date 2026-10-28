@@ -98,7 +98,7 @@ pub fn spawn_enforcer(
 /// of the tree (the admin's shell, sshd) is never reached; a process
 /// between two members is under the upper one and is kept. pid 1,
 /// kthreadd and aegisd are dropped whatever the table says.
-// ponytail: walks every process's parent chain, O(table x depth); index
+// Walks every process's parent chain, O(table x depth); index
 // children by parent if incidents get large. `parent_chain` stops at 64
 // levels, so a descendant deeper than that below a member is left out:
 // it fails towards acting on less.
@@ -385,7 +385,7 @@ impl Enforcer {
             acts.push(act("unhold", None, pids.into_iter().collect(), r));
             self.remove_rules(&prior, &unit, &mut acts);
             done = format!("released {id}: thawed, network restored");
-            // ponytail: the tree stays in its -q scope, so its accounting
+            // The tree stays in its -q scope, so its accounting
             // lives under aegis-quarantine.slice. Moving it back to its
             // original unit is AttachProcessesToUnit, if that's ever wanted.
         } else {
