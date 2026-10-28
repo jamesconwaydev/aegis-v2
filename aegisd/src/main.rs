@@ -499,6 +499,7 @@ fn enforce_admin_in(
         let _ = reply.send(Response::Error("not an incident id".into()));
         return;
     }
+    let queued = format!("still queued; check `aegisctl incidents show {id}` shortly");
     let (tx, rx) = oneshot::channel();
     let reply_to = Some(tx);
     let job = if kill {
@@ -521,7 +522,9 @@ fn enforce_admin_in(
             Ok(Ok(Ok(done))) => Response::Done(done),
             Ok(Ok(Err(e))) => Response::Error(e),
             Ok(Err(_)) => Response::Error("the enforcer stopped before answering".into()),
-            Err(_) => Response::Error("timed out waiting for the enforcer".into()),
+            // The job still runs once the enforcer gets to it, so the
+            // admin must not be told to send it again.
+            Err(_) => Response::Error(queued),
         };
         let _ = reply.send(r);
     });
@@ -657,9 +660,13 @@ mod tests {
     async fn admin_requests_time_out_and_relay_answers() {
         let (q, rx) = sync_channel(2);
         let r = ask(ID, &q, Duration::from_millis(20)).await;
+        // Not "timed out": the job still runs, so asking again would
+        // queue it twice.
         assert_eq!(
             r,
-            Response::Error("timed out waiting for the enforcer".into())
+            Response::Error(format!(
+                "still queued; check `aegisctl incidents show {ID}` shortly"
+            ))
         );
         // The first job is still queued; answer the second one.
         let _stale = rx.recv().unwrap();

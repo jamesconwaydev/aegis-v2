@@ -279,8 +279,10 @@ Errors go to stderr, prefixed with `aegisctl:`, with exit code 1.
   overloaded.
 - `aegisd: enforcer busy, try again`: release and kill (from v0.2.0)
   found the enforcer's queue full.
-- `aegisd: timed out waiting for the enforcer`: it was still working
-  after 30 s. Check the incident before retrying.
+- ``aegisd: still queued; check `aegisctl incidents show <id>` shortly``:
+  the enforcer was still busy after 30 s. Your request hasn't been
+  lost, it runs when the enforcer gets to it, so don't send it again.
+  (Before v0.2.1 this said `timed out waiting for the enforcer`.)
 
 Replies over 16 MiB are refused rather than read.
 
