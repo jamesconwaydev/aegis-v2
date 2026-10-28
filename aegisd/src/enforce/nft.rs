@@ -3,24 +3,43 @@ use anyhow::{anyhow, Context, Result};
 
 use super::systemd::{run_cmd, Run};
 
-const NFT: &str = "/usr/sbin/nft";
+/// Where nft may live, in the order looked. The config check accepts
+/// enforce mode only if one of these exists, and nft runs from the first
+/// that does, so the two always agree.
+pub const NFT_PATHS: [&str; 2] = ["/usr/sbin/nft", "/usr/bin/nft"];
 
 pub struct Nft {
     run: Run,
+    paths: Vec<String>,
 }
 
 impl Nft {
     pub fn new() -> Self {
-        Self::with(run_cmd)
+        Self {
+            run: run_cmd,
+            paths: NFT_PATHS.map(String::from).into(),
+        }
     }
 
+    /// For tests: always `/usr/sbin/nft`, whatever this machine has.
+    #[cfg(test)]
     pub fn with(run: Run) -> Self {
-        Self { run }
+        Self {
+            run,
+            paths: vec![NFT_PATHS[0].into()],
+        }
     }
 
     fn nft(&self, args: &[&str]) -> Result<String> {
         let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        (self.run)(NFT, &a)
+        // Looked up per call: nftables may be installed after aegisd
+        // starts in audit mode, then a reload turns enforce mode on.
+        let prog = self
+            .paths
+            .iter()
+            .find(|p| std::path::Path::new(p).is_file())
+            .unwrap_or(&self.paths[0]);
+        (self.run)(prog, &a)
     }
 
     /// `add` is a no-op when the table and chain already exist.
@@ -128,6 +147,29 @@ mod tests {
     }
     fn junk(_: &str, _: &[String]) -> Result<String> {
         Ok("nothing\n".into())
+    }
+
+    #[test]
+    fn nft_runs_from_the_first_path_that_exists() {
+        thread_local! { static PROG: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
+        fn rec(p: &str, _: &[String]) -> Result<String> {
+            PROG.with(|x| *x.borrow_mut() = p.into());
+            Ok(String::new())
+        }
+        let d = std::env::temp_dir().join(format!("aegis-nft-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (missing, found) = (d.join("sbin-nft"), d.join("bin-nft"));
+        std::fs::write(&found, "").unwrap();
+        let n = Nft {
+            run: rec,
+            paths: [&missing, &found].map(|p| p.display().to_string()).into(),
+        };
+        n.remove(1).unwrap();
+        assert_eq!(
+            PROG.with(|x| x.borrow().clone()),
+            found.display().to_string()
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

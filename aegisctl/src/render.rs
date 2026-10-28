@@ -146,13 +146,16 @@ pub fn incidents(list: &[IncidentSummary]) -> String {
     if list.is_empty() {
         return "No incidents.\n".into();
     }
-    let mut rows = vec![["ID", "VERDICT", "SCORE", "ROOT PID", "CREATED", "UPDATED"]
-        .map(String::from)
-        .to_vec()];
+    let mut rows = vec![[
+        "ID", "VERDICT", "STATE", "SCORE", "ROOT PID", "CREATED", "UPDATED",
+    ]
+    .map(String::from)
+    .to_vec()];
     for i in list {
         rows.push(vec![
             i.id.clone(),
             i.verdict.clone(),
+            i.state.clone().unwrap_or_else(|| "-".into()),
             format!("{:.1}", i.max_score),
             i.root_tgid.to_string(),
             i.created.clone(),
@@ -442,6 +445,25 @@ mod tests {
             "released AEG-1: thawed, network restored\n"
         );
         assert_eq!(done("killed\x1b[2J"), "killed\\x1b[2J\n");
+    }
+
+    #[test]
+    fn incident_list_shows_the_state_or_a_dash() {
+        let row = |state: Option<&str>| IncidentSummary {
+            id: "AEG-1".into(),
+            created: "c".into(),
+            updated: "u".into(),
+            verdict: "quarantined".into(),
+            max_score: 95.0,
+            root_tgid: 7,
+            actions: 4,
+            state: state.map(String::from),
+        };
+        let o = incidents(&[row(Some("released")), row(None)]);
+        let lines: Vec<Vec<&str>> = o.lines().map(|l| l.split_whitespace().collect()).collect();
+        assert_eq!(lines[0][1..3], ["VERDICT", "STATE"]);
+        assert_eq!(lines[1][1..3], ["quarantined", "released"]);
+        assert_eq!(lines[2][1..3], ["quarantined", "-"]);
     }
 
     #[test]

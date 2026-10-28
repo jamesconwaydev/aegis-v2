@@ -115,10 +115,30 @@ aegisctl incidents list
 
 <!-- markdownlint-disable MD013 -->
 ```text
-ID                                    VERDICT           SCORE  ROOT PID  CREATED               UPDATED
-AEG-20261019-093000-0123456789abcdef  would_quarantine  85.0   4242      2026-10-19T09:30:00Z  2026-10-19T09:30:02Z
+ID                                    VERDICT           STATE     SCORE  ROOT PID  CREATED               UPDATED
+AEG-20261019-093000-0123456789abcdef  would_quarantine  -         85.0   4242      2026-10-19T09:30:00Z  2026-10-19T09:30:02Z
+AEG-20261020-141500-fedcba9876543210  quarantined       released  92.5   5150      2026-10-20T14:15:00Z  2026-10-20T14:31:40Z
 ```
 <!-- markdownlint-enable MD013 -->
+
+`VERDICT` is history: what aegisd decided, and it never goes back down.
+`STATE` (from v0.2.1) is what's in place right now:
+
+| `STATE`       | What it means                                              |
+| ------------- | ---------------------------------------------------------- |
+| `throttled`   | the tree runs in its CPU- and memory-limited scope         |
+| `quarantined` | the tree is in its quarantine scope, frozen                |
+| `held`        | kernel holds only: the move or the freeze failed           |
+| `released`    | you ended it with `incidents release`                      |
+| `killed`      | you ended it with `incidents kill`                         |
+| `expired`     | it's from an earlier boot, so nothing of it is left        |
+| `-`           | nothing was ever enforced, as in every audit-mode incident |
+
+The second row above, then, was quarantined and later let go. One
+catch with `held`: the holds live in aegisd, so an aegisd restart lifts
+them and the tree runs free, while the list still says `held`. Release
+or kill it before you restart. `--json` carries the same value as
+`state`, or `null` for `-`.
 
 `SCORE` is the highest score the incident reached. The list holds
 incidents updated in the last 30 days; older ones are still on disk.
@@ -268,8 +288,10 @@ Errors go to stderr, prefixed with `aegisctl:`, with exit code 1.
   overloaded.
 - `aegisd: enforcer busy, try again`: release and kill (from v0.2.0)
   found the enforcer's queue full.
-- `aegisd: timed out waiting for the enforcer`: it was still working
-  after 30 s. Check the incident before retrying.
+- ``aegisd: still queued; check `aegisctl incidents show <id>` shortly``:
+  the enforcer was still busy after 25 s. Your request isn't lost. It
+  runs when the enforcer gets to it, so don't send it again.
+  (Before v0.2.1 this said `timed out waiting for the enforcer`.)
 
 Replies over 16 MiB are refused rather than read.
 

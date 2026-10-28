@@ -38,6 +38,8 @@ const MAX_FOUND: usize = 1024;
 /// escalations, scored newcomers, releases and kills, so a tree forking
 /// in a loop can never crowd those out.
 const FORK_SLOTS: usize = QUEUE / 2;
+/// How long a failed freeze waits before its one retry.
+const FREEZE_RETRY: Duration = Duration::from_millis(200);
 
 /// Where a release or kill answers: Ok with a message, or Err with why.
 pub type Reply = tokio::sync::oneshot::Sender<Result<String, String>>;
@@ -85,6 +87,7 @@ pub struct EnforcerHandle {
     sinks: Arc<Sinks>,
     /// Fork jobs are being dropped and that has been logged.
     fork_drops_logged: AtomicBool,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl EnforcerHandle {
@@ -97,7 +100,25 @@ impl EnforcerHandle {
             forks: Arc::default(),
             sinks,
             fork_drops_logged: AtomicBool::new(false),
+            thread: None,
         }
+    }
+
+    /// Closes the queue and waits up to `cap` for the enforcer to finish
+    /// the job in hand and those still queued. False if it hadn't.
+    pub fn shutdown(self, cap: Duration) -> bool {
+        let Self { tx, thread, .. } = self;
+        drop(tx);
+        let Some(t) = thread else { return true };
+        let until = std::time::Instant::now() + cap;
+        while !t.is_finished() {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = t.join();
+        true
     }
 
     /// Queues a job without waiting. Fork jobs take at most
@@ -105,10 +126,20 @@ impl EnforcerHandle {
     /// logged; a dropped throttle or quarantine also goes to telemetry,
     /// so a webhook says the tree was left alone.
     pub fn queue(&self, job: EnforceJob) {
+        self.queue_about(job, |_, _| (0.0, String::new()));
+    }
+
+    /// `queue`, with `about` giving a dropped job's incident score and
+    /// root process name (from its id and first process) for telemetry.
+    pub fn queue_about(
+        &self,
+        job: EnforceJob,
+        about: impl FnOnce(&str, Option<ProcKey>) -> (f64, String),
+    ) {
         let fork = matches!(job, EnforceJob::Fork { .. });
         if fork {
             if self.forks.load(Ordering::Relaxed) >= FORK_SLOTS {
-                return self.drop_job(&job);
+                return self.drop_job(&job, about);
             }
             self.forks.fetch_add(1, Ordering::Relaxed);
         }
@@ -122,12 +153,16 @@ impl EnforcerHandle {
                 if fork {
                     self.forks.fetch_sub(1, Ordering::Relaxed);
                 }
-                self.drop_job(&job);
+                self.drop_job(&job, about);
             }
         }
     }
 
-    fn drop_job(&self, job: &EnforceJob) {
+    fn drop_job(
+        &self,
+        job: &EnforceJob,
+        about: impl FnOnce(&str, Option<ProcKey>) -> (f64, String),
+    ) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
         let (id, tier, pid) = match job {
             EnforceJob::Fork { id, .. } => {
@@ -146,15 +181,16 @@ impl EnforcerHandle {
         };
         let reason = "enforcement failed: queue full, nothing was done".to_string();
         eprintln!("aegisd: {id}: {reason}");
+        let (score, comm) = about(id, pid.copied());
         self.sinks.emit(&TelemetryRecord {
             ts_unix_ns: now_ns(),
             incident: id.clone(),
             tier,
             verdict: crate::incident::verdict(tier).unwrap_or("would_throttle"),
-            score: 0.0,
+            score,
             mode: Mode::Enforce,
             tgid: pid.map_or(0, |k| k.tgid),
-            comm: String::new(),
+            comm,
             exe: None,
             target: None,
             reasons: vec![reason],
@@ -172,7 +208,7 @@ pub fn spawn_enforcer(
     enforcing: Arc<AtomicBool>,
 ) -> EnforcerHandle {
     let (tx, rx) = sync_channel(QUEUE);
-    let h = EnforcerHandle::new(tx, sinks.clone());
+    let mut h = EnforcerHandle::new(tx, sinks.clone());
     let mut e = Enforcer {
         store,
         holds,
@@ -189,7 +225,7 @@ pub fn spawn_enforcer(
         children: proc_children,
         forks: h.forks.clone(),
     };
-    std::thread::Builder::new()
+    let t = std::thread::Builder::new()
         .name("aegis-enforce".into())
         .spawn(move || {
             for job in rx {
@@ -197,6 +233,7 @@ pub fn spawn_enforcer(
             }
         })
         .expect("spawning the enforcer thread");
+    h.thread = Some(t);
     h
 }
 
@@ -309,6 +346,46 @@ fn last_state(acts: &[ActionRecord]) -> Option<&ActionRecord> {
 
 fn state(acts: &[ActionRecord]) -> Option<&str> {
     last_state(acts).map(|a| a.kind.as_str())
+}
+
+/// What enforcement left in place, for `incidents list`. Ended:
+/// killed, released (thaw, lift_limits, or an unhold with no scope:
+/// a hold-only tree let go), expired (an earlier boot, whose scopes and
+/// holds went with it). In place: throttled (in the throttle scope),
+/// quarantined (in the -q scope and frozen), held (kernel holds only:
+/// the move failed, or the tree was moved but never frozen). None if
+/// nothing was ever enforced. Unlike `state`, this reads unhold too.
+pub fn summary_state(acts: &[ActionRecord], earlier_boot: bool) -> Option<&'static str> {
+    if !acts.iter().any(|a| a.ok || holding(a)) {
+        return None;
+    }
+    let scoped = acts.iter().any(|a| a.ok && a.kind == "scope");
+    let last = acts.iter().rev().filter(|a| a.ok).find(|a| {
+        matches!(
+            a.kind.as_str(),
+            "scope" | "attach" | "freeze" | "thaw" | "lift_limits" | "kill" | "expired" | "unhold"
+        )
+    });
+    let quarantine = |a: &ActionRecord| a.unit.as_deref().is_some_and(|u| u.ends_with("-q.scope"));
+    Some(match last.map(|a| (a.kind.as_str(), a)) {
+        Some(("kill", _)) => "killed",
+        Some(("thaw" | "lift_limits", _)) => "released",
+        Some(("unhold", _)) if !scoped => "released",
+        Some(("expired", _)) => "expired",
+        _ if earlier_boot => "expired",
+        Some((_, a)) if quarantine(a) => {
+            let frozen = acts
+                .iter()
+                .any(|f| f.ok && f.kind == "freeze" && f.unit == a.unit);
+            if frozen {
+                "quarantined"
+            } else {
+                "held"
+            }
+        }
+        Some(("scope" | "attach", _)) => "throttled",
+        _ => "held",
+    })
 }
 
 /// nft rules added and not yet removed.
@@ -538,9 +615,7 @@ impl Enforcer {
             .iter()
             .any(|a| a.kind == "scope" && a.unit.as_deref() == Some(unit.as_str()));
         let moved = if scoped {
-            let r = self.sys.attach(&unit, pids);
-            acts.push(act("attach", Some(&unit), tgids(pids), r.map(|_| None)));
-            acts.last().unwrap().ok
+            self.attach(&unit, pids, &mut acts)
         } else if tried {
             false
         } else {
@@ -550,12 +625,19 @@ impl Enforcer {
         };
         let mut now_frozen = frozen;
         if moved && !frozen {
-            let r = self.sys.freeze(&unit);
+            let is_frozen = || matches!(self.sys.is_frozen(QUARANTINE_SLICE, &unit), Ok(true));
+            let mut r = self.sys.freeze(&unit);
+            if r.is_err() && !is_frozen() {
+                // busctl returns once the start job is queued, not done:
+                // on a loaded host the scope may not be active yet.
+                std::thread::sleep(FREEZE_RETRY);
+                r = self.sys.freeze(&unit);
+            }
             // The command can fail after the freeze took effect; the
             // kernel has the last word. The error stays on the record.
             let mut a = act("freeze", Some(&unit), vec![], r.map(|_| None));
             if !a.ok {
-                a.ok = matches!(self.sys.is_frozen(QUARANTINE_SLICE, &unit), Ok(true));
+                a.ok = is_frozen();
             }
             now_frozen = a.ok;
             acts.push(a);
@@ -566,8 +648,7 @@ impl Enforcer {
             // Joining the frozen scope stops it.
             let late = self.with_children(pids).split_off(pids.len());
             if !late.is_empty() {
-                let r = self.sys.attach(&unit, &late);
-                acts.push(act("attach", Some(&unit), tgids(&late), r.map(|_| None)));
+                self.attach(&unit, &late, &mut acts);
             }
         }
         if moved && !ruled {
@@ -580,6 +661,23 @@ impl Enforcer {
         }
         let v = (moved && now_frozen).then_some("quarantined");
         self.finish(id, acts, v);
+    }
+
+    /// Moves `pids` into the running quarantine scope and records it.
+    /// Ok(false) moved nothing (all already in it, or exited), so it isn't
+    /// recorded. A recorded attach lists every pid asked for, including
+    /// any `Systemd::attach` left out as already in the scope. True if
+    /// the tree is in the scope.
+    fn attach(&self, unit: &str, pids: &[ProcKey], acts: &mut Vec<ActionRecord>) -> bool {
+        match self.sys.attach(unit, pids) {
+            Ok(false) => true,
+            r => {
+                let a = act("attach", Some(unit), tgids(pids), r.map(|_| None));
+                let ok = a.ok;
+                acts.push(a);
+                ok
+            }
+        }
     }
 
     fn release(&mut self, id: &str) -> Result<String, String> {
@@ -1193,6 +1291,49 @@ mod tests {
         t
     }
 
+    fn slow(_: &str, _: &[String]) -> Result<String> {
+        std::thread::sleep(Duration::from_millis(300));
+        Ok(String::new())
+    }
+
+    fn spawn_slow(f: &Fx) -> EnforcerHandle {
+        spawn_enforcer(
+            f.e.store.clone(),
+            Holds::default(),
+            Systemd::with(slow, alive),
+            Nft::with(slow),
+            f.e.limits,
+            f.e.sinks.clone(),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    #[test]
+    fn shutdown_waits_for_the_job_in_hand() {
+        let f = fx("stop", ok);
+        let h = spawn_slow(&f);
+        h.queue(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        assert!(h.shutdown(Duration::from_secs(10)));
+        // Moved and frozen, and on the record before shutdown returned.
+        assert_eq!(f.incident().verdict, "quarantined");
+    }
+
+    #[test]
+    fn shutdown_gives_up_at_the_cap() {
+        let f = fx("stop-cap", ok);
+        let h = spawn_slow(&f);
+        h.queue(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let t = std::time::Instant::now();
+        assert!(!h.shutdown(Duration::from_millis(100)));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn target_set_never_includes_ancestors() {
         // 1 -> 50 (bash) -> 80 (member) -> 81 (its child, unscored).
@@ -1282,6 +1423,32 @@ mod tests {
             log.contains("enforcement failed: systemctl freeze"),
             "{log}"
         );
+    }
+
+    #[test]
+    fn a_freeze_that_finds_the_scope_not_yet_started_is_tried_again() {
+        // The first freeze fails (the start job is still running); the
+        // second, after a pause, works.
+        fn first_freeze_fails(prog: &str, a: &[String]) -> Result<String> {
+            let tried = CALLS.with(|c| c.borrow().iter().any(|c| c[1] == "freeze"));
+            if a.first().is_some_and(|s| s == "freeze") && !tried {
+                CALLS.with(|c| c.borrow_mut().push([&[prog.to_string()], a].concat()));
+                bail!("systemctl freeze: exit Some(1): unit not active")
+            }
+            ok(prog, a)
+        }
+        let mut f = fx("qretry", first_freeze_fails);
+        f.e.sys = Systemd::with(first_freeze_fails, alive).with_events(no_cgroup);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let freezes = take().iter().filter(|c| c[1] == "freeze").count();
+        assert_eq!(freezes, 2);
+        let inc = f.incident();
+        assert_eq!(inc.verdict, "quarantined");
+        let freeze = inc.actions.iter().find(|a| a.kind == "freeze").unwrap();
+        assert!(freeze.ok && freeze.error.is_none(), "{freeze:?}");
     }
 
     #[test]
@@ -1390,6 +1557,35 @@ mod tests {
     }
 
     #[test]
+    fn a_newcomer_already_in_the_quarantine_scope_records_no_attach() {
+        thread_local! { static UNIT: RefCell<String> = const { RefCell::new(String::new()) }; }
+        fn cg(_: u32) -> Option<String> {
+            UNIT.with(|u| {
+                let u = u.borrow();
+                (!u.is_empty()).then(|| format!("0::/aegis.slice/aegis-quarantine.slice/{u}\n"))
+            })
+        }
+        let mut f = fx("q-born", ok);
+        f.e.sys = Systemd::with(ok, alive).with_cgroup(cg);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        UNIT.with(|u| *u.borrow_mut() = q_unit(&f.id));
+        take();
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(12)],
+        });
+        UNIT.with(|u| u.borrow_mut().clear());
+        assert!(take().is_empty());
+        // Held, but nothing moved: no attach claiming pid 12 was.
+        let kinds = f.kinds();
+        assert_eq!(kinds[4..], [("hold".into(), true)]);
+        assert_eq!(f.incident().verdict, "quarantined");
+    }
+
+    #[test]
     fn throttle_starts_a_limited_scope() {
         let mut f = fx("t", ok);
         f.e.run(EnforceJob::Throttle {
@@ -1474,6 +1670,83 @@ mod tests {
         let (r, mut rx) = reply();
         e.run(job(r));
         rx.try_recv().unwrap()
+    }
+
+    #[test]
+    fn the_incident_list_shows_what_enforcement_left_in_place() {
+        fn state(f: &Fx) -> Option<String> {
+            f.e.store.list()[0].state.clone()
+        }
+        fn quarantine(f: &mut Fx) {
+            f.e.run(EnforceJob::Quarantine {
+                id: f.id.clone(),
+                pids: vec![k(10)],
+            });
+        }
+        fn end(f: &mut Fx, kill: bool) {
+            let id = f.id.clone();
+            let r = run_reply(&mut f.e, |reply| match kill {
+                true => EnforceJob::Kill { id, reply },
+                false => EnforceJob::Release { id, reply },
+            });
+            assert!(r.is_ok(), "{r:?}");
+        }
+        fn no_move(p: &str, a: &[String]) -> Result<String> {
+            if a.get(4).is_some_and(|m| m == "StartTransientUnit") {
+                bail!("busctl: refused")
+            }
+            ok(p, a)
+        }
+
+        // Nothing enforced, then quarantined, then released by thaw.
+        let mut f = fx("state-q", ok);
+        assert_eq!(state(&f), None);
+        quarantine(&mut f);
+        assert_eq!(state(&f).as_deref(), Some("quarantined"));
+        end(&mut f, false);
+        assert_eq!(state(&f).as_deref(), Some("released"));
+
+        let mut f = fx("state-k", ok);
+        quarantine(&mut f);
+        end(&mut f, true);
+        assert_eq!(state(&f).as_deref(), Some("killed"));
+
+        // Throttled, then released by lifting the limits.
+        let mut f = fx("state-t", ok);
+        f.e.run(EnforceJob::Throttle {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        assert_eq!(state(&f).as_deref(), Some("throttled"));
+        end(&mut f, false);
+        assert_eq!(state(&f).as_deref(), Some("released"));
+
+        // The move failed: kernel holds only. Released, it says so.
+        let mut f = fx("state-h", no_move);
+        quarantine(&mut f);
+        assert_eq!(f.incident().verdict, "would_quarantine");
+        assert_eq!(state(&f).as_deref(), Some("held"));
+        end(&mut f, false);
+        assert_eq!(state(&f).as_deref(), Some("released"));
+
+        // Moved but never frozen: held too, not quarantined.
+        let mut f = fx("state-nf", fail_freeze);
+        f.e.sys = Systemd::with(fail_freeze, alive).with_events(no_cgroup);
+        quarantine(&mut f);
+        assert_eq!(f.incident().verdict, "would_quarantine");
+        assert_eq!(state(&f).as_deref(), Some("held"));
+
+        // From an earlier boot: expired, whether or not anyone tried to
+        // end it, and nothing enforced still reads as none.
+        let mut f = fx("state-boot", ok);
+        quarantine(&mut f);
+        f.e.store = Arc::new(IncidentStore::open_at(&f.dir, Some("later".into()), 0).unwrap());
+        assert_eq!(state(&f).as_deref(), Some("expired"));
+        end(&mut f, false);
+        assert_eq!(state(&f).as_deref(), Some("expired"));
+        let f = fx("state-boot-none", ok);
+        let st = IncidentStore::open_at(&f.dir, Some("later".into()), 0).unwrap();
+        assert_eq!(st.list()[0].state, None);
     }
 
     #[test]
@@ -2068,6 +2341,33 @@ mod tests {
         let log = std::fs::read_to_string(&path).unwrap();
         assert_eq!(log.lines().count(), 1, "{log}");
         assert!(log.contains("enforcement failed: queue full") && log.contains("AEG-g"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_dropped_escalation_carries_the_score_and_root_name() {
+        let path =
+            std::env::temp_dir().join(format!("aegis-enf-{}-full.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (tx, _rx) = sync_channel(0);
+        let h = EnforcerHandle::new(tx, Arc::new(Sinks::jsonl_at(&path)));
+        h.queue_about(
+            EnforceJob::Quarantine {
+                id: "AEG-h".into(),
+                pids: vec![k(11)],
+            },
+            |id, k| {
+                assert_eq!((id, k.map(|k| k.tgid)), ("AEG-h", Some(11)));
+                (72.5, "payload".into())
+            },
+        );
+        let log = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(
+            (v["score"].as_f64(), v["comm"].as_str()),
+            (Some(72.5), Some("payload"))
+        );
+        assert_eq!(v["tgid"], 11);
         let _ = std::fs::remove_file(&path);
     }
 

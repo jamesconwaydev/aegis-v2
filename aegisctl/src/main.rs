@@ -56,7 +56,7 @@ enum Inc {
 }
 
 const MAX_REPLY: usize = 16 * 1024 * 1024;
-const DEADLINE: Duration = Duration::from_secs(30);
+const DEADLINE: Duration = aegis_proto::REPLY_DEADLINE;
 
 /// Read one line, at most MAX_REPLY bytes, within DEADLINE overall.
 fn read_reply(s: &mut UnixStream) -> Result<Vec<u8>, String> {
@@ -67,7 +67,7 @@ fn read_reply(s: &mut UnixStream) -> Result<Vec<u8>, String> {
         let left = DEADLINE
             .checked_sub(start.elapsed())
             .filter(|d| !d.is_zero())
-            .ok_or("no reply from aegisd within 30 s")?;
+            .ok_or_else(|| format!("no reply from aegisd within {} s", DEADLINE.as_secs()))?;
         s.set_read_timeout(Some(left.min(Duration::from_secs(10))))
             .map_err(|e| e.to_string())?;
         let n = match s.read(&mut chunk) {

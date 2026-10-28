@@ -42,13 +42,16 @@ use crate::verify::{Rpm, Verification, Verifier};
 const INCIDENT_QUEUE: usize = 256;
 /// How often the loop flushes expired deferred signals.
 const TICK: Duration = Duration::from_millis(500);
-/// Every this many ticks, sweep the process table (so ~60 s).
 /// How often counters go out as OTLP metrics.
 const METRICS_EVERY: Duration = Duration::from_secs(60);
+/// Every this many ticks, sweep the process table (so ~60 s).
 const SWEEP_TICKS: u64 = 120;
 /// Every this many ticks (10 s), check that each quarantined tree still
 /// has its nft drop rule. Cheap with nothing quarantined: no nft call.
 const REASSERT_TICKS: u64 = 20;
+
+/// How long shutdown waits for the enforcer to finish its jobs.
+const ENFORCER_STOP: Duration = Duration::from_secs(5);
 
 /// sysexits.h EX_CONFIG.
 const EX_CONFIG: u8 = 78;
@@ -382,17 +385,27 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
         }
         // Any arm can score (a verdict or deadline releases a deferred
         // signal), so jobs are handed over after each, never waited on.
-        for job in pipe.to_enforce.drain(..) {
-            enforcer.queue(job);
+        for job in std::mem::take(&mut pipe.to_enforce) {
+            enforcer.queue_about(job, |id, k| pipe.about(id, k));
         }
     }
 
     sd_notify("STOPPING=1");
     eprintln!("aegisd: stopping");
     // Anything still waiting on a verdict is scored now, as Unverified,
-    // and reaches the writer before its channel closes.
+    // and reaches the writer before its channel closes. An escalation
+    // this scores is recorded but not enforced: its job is never queued,
+    // so the incident stays at would_* and nothing is done to the tree.
     pipe.flush_all();
     server.abort();
+    // A job cut off mid-way could leave a tree moved or frozen with
+    // nothing recorded. Queued jobs run too, until the cap.
+    if !enforcer.shutdown(ENFORCER_STOP) {
+        eprintln!(
+            "aegisd: enforcer still busy after {} s; stopping without it",
+            ENFORCER_STOP.as_secs()
+        );
+    }
     // Detaches every probe.
     drop(handle);
     // Closes the writer's channel so it drains and exits.
@@ -463,8 +476,11 @@ fn answer(
 }
 
 /// How long a release or kill may wait for the enforcer, which runs one
-/// job at a time and may be mid-way through a quarantine.
-const ENFORCER_WAIT: Duration = Duration::from_secs(30);
+/// job at a time and may be mid-way through a quarantine. It must stay
+/// under aegisctl's reply deadline, which starts earlier: otherwise the
+/// client gives up first and never sees "still queued".
+const ENFORCER_WAIT: Duration = Duration::from_secs(25);
+const _: () = assert!(ENFORCER_WAIT.as_secs() + 5 <= aegis_proto::REPLY_DEADLINE.as_secs());
 
 /// Hands a release or kill to the enforcer and answers when it does.
 /// The wait is in its own task so the event loop never blocks on it. It
@@ -488,6 +504,7 @@ fn enforce_admin_in(
         let _ = reply.send(Response::Error("not an incident id".into()));
         return;
     }
+    let queued = format!("still queued; check `aegisctl incidents show {id}` shortly");
     let (tx, rx) = oneshot::channel();
     let reply_to = Some(tx);
     let job = if kill {
@@ -510,7 +527,9 @@ fn enforce_admin_in(
             Ok(Ok(Ok(done))) => Response::Done(done),
             Ok(Ok(Err(e))) => Response::Error(e),
             Ok(Err(_)) => Response::Error("the enforcer stopped before answering".into()),
-            Err(_) => Response::Error("timed out waiting for the enforcer".into()),
+            // The job still runs once the enforcer gets to it, so the
+            // admin must not be told to send it again.
+            Err(_) => Response::Error(queued),
         };
         let _ = reply.send(r);
     });
@@ -646,9 +665,13 @@ mod tests {
     async fn admin_requests_time_out_and_relay_answers() {
         let (q, rx) = sync_channel(2);
         let r = ask(ID, &q, Duration::from_millis(20)).await;
+        // Not "timed out": the job still runs, so asking again would
+        // queue it twice.
         assert_eq!(
             r,
-            Response::Error("timed out waiting for the enforcer".into())
+            Response::Error(format!(
+                "still queued; check `aegisctl incidents show {ID}` shortly"
+            ))
         );
         // The first job is still queued; answer the second one.
         let _stale = rx.recv().unwrap();

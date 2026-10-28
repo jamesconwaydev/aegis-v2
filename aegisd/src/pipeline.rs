@@ -959,6 +959,25 @@ impl Pipeline {
         }
     }
 
+    /// Incident `g`'s score now and its root process's name, for a
+    /// record about a job that never ran. Before the writer thread has
+    /// recorded the incident, the root is `first`: a job's first process
+    /// is the top of its tree.
+    pub fn about(&self, g: &str, first: Option<ProcKey>) -> (f64, String) {
+        let comm = self
+            .incidents
+            .store
+            .get(&crate::incident::IncidentId(g.into()))
+            .map(|i| i.root.comm)
+            .or_else(|| {
+                first
+                    .and_then(|k| self.table.get(&k))
+                    .map(|p| p.comm.clone())
+            })
+            .unwrap_or_default();
+        (self.incident_score(g, 0), comm)
+    }
+
     /// Sum over kinds of the max decayed component across the live
     /// members of group `g`.
     // Scans every member of every group; index by group if
@@ -1340,6 +1359,25 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].verdict, "would_quarantine");
         assert_eq!((l[0].max_score, l[0].root_tgid), (85.0, 60));
+    }
+
+    #[test]
+    fn about_gives_the_incident_score_and_root_name() {
+        let (mut p, _d) = pipeline("about");
+        runc_self_clone(&mut p, None);
+        let id = p.store().list()[0].id.clone();
+        let (score, comm) = p.about(&id, None);
+        assert!(score >= 85.0, "{score}");
+        let root = p
+            .store()
+            .get(&crate::incident::IncidentId(id))
+            .unwrap()
+            .root;
+        assert_eq!(comm, root.comm);
+        // Not recorded yet: the job's first process names it.
+        let first = p.table.get(&key(60)).unwrap().comm.clone();
+        assert_eq!(p.about("AEG-unrecorded", Some(key(60))).1, first);
+        assert_eq!(p.about("AEG-unrecorded", None), (0.0, String::new()));
     }
 
     #[test]

@@ -19,6 +19,40 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tree's cgroup and delete only that. Kill looks it up before the
   SIGKILL, while nftables can still name the cgroup. If the rule's
   already gone, release still succeeds and says so. (#53)
+- **A quarantine on a busy host gets frozen, not just held.** busctl
+  hands back as soon as systemd queues the scope's start job, so the
+  freeze straight after it could find the scope not yet running. The
+  tree then stayed held but unfrozen, at `would_quarantine`. Now a
+  freeze that fails, on a scope the kernel says isn't frozen, gets one
+  more try 200 ms later.
+- **Stopping aegisd lets the enforcer finish first.** A `SIGTERM` that
+  landed mid-quarantine (a `dnf upgrade` restart, say) could leave a
+  tree moved or frozen with nothing written down, and the next release
+  then said "never enforced". Shutdown now waits up to 5 seconds for the
+  job in hand and anything still queued.
+- **The "queue full" alert names the incident's score and root
+  process.** It used to arrive with a score of 0 and no process name.
+- **An `attach` on the record means something moved.** When every
+  newcomer was already in the quarantine scope, or had already exited,
+  aegisd still wrote an `attach` with `ok: true` and their pids. Now it
+  writes nothing.
+
+### Changed
+
+- **`incidents list` has a `STATE` column.** The verdict is history, so
+  a tree you'd released still showed `quarantined` and nothing said
+  otherwise. `STATE` says what's in place now: `throttled`,
+  `quarantined`, `held` (kernel holds only), `released`, `killed`,
+  `expired`, or `-` when nothing was enforced. `--json` carries it as
+  `state`. Scripts that read the table by column position will
+  find `SCORE` and everything after it one column to the right.
+- **A release or kill that outlasts the enforcer wait says it's still
+  queued.** It used to say "timed out waiting for the enforcer", which
+  sounded like a failure. The job always ran anyway, and running it a
+  second time got you an "is already released" error. Worse, aegisctl's
+  own 30-second deadline usually ran out first, so you saw "no reply
+  from aegisd" instead. aegisd now waits 25 seconds, then tells you to
+  check `aegisctl incidents show <id>` shortly.
 
 ## [0.2.0] - 2026-10-28
 

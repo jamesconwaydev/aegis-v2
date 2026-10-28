@@ -14,6 +14,9 @@ pub const SOCKET: &str = "/run/aegis-v2/aegisd.sock";
 
 /// Longest request line, newline excluded.
 pub const MAX_REQUEST: usize = 64 * 1024;
+/// How long aegisctl waits for a whole reply. A daemon-side wait that
+/// answers the client must finish well inside it.
+pub const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request {
@@ -108,6 +111,11 @@ pub struct IncidentSummary {
     /// Enforcer actions recorded so far; 0 from a pre-v0.2 daemon.
     #[serde(default)]
     pub actions: usize,
+    /// What enforcement left in place now: `held`, `released`, `killed`
+    /// or `expired`. None if nothing was enforced (audit mode), or from
+    /// a pre-v0.2.1 daemon.
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 /// Whether `id` has the shape of an incident id,

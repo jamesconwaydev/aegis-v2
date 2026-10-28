@@ -566,7 +566,7 @@ impl Host {
     pub fn real() -> Self {
         Self {
             lsm_file: "/sys/kernel/security/lsm".into(),
-            nft: vec!["/usr/sbin/nft".into(), "/usr/bin/nft".into()],
+            nft: crate::enforce::nft::NFT_PATHS.map(PathBuf::from).into(),
         }
     }
 }

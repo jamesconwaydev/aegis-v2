@@ -340,6 +340,20 @@ removes its nftables rule, but leaves it in its scope under
 `aegis-quarantine.slice`. Its CPU and memory accounting stays there,
 and the limits of the unit it came from no longer apply to it.
 
+A throttled tree is the same, in `aegis-throttle.slice`, and releasing
+a throttle doesn't move it back either. What that costs you is the
+service's hold on its own workers. Say aegisd throttled an httpd
+worker. That worker now lives in `aegis-incident-<id>.scope`, not in
+`httpd.service`, so `systemctl restart httpd` stops every other worker
+and leaves this one running. Stop the incident's scope to end it:
+
+```sh
+systemctl list-units 'aegis-incident-*'
+systemctl stop aegis-incident-<id>.scope
+```
+
+A quarantined tree's scope ends in `-q.scope`.
+
 ### OTLP
 
 OTLP endpoints that carry credentials in the URL are rejected; put them
