@@ -1,6 +1,6 @@
 name: Detection report
 description: Aegis missed something it should have caught, or you have a new behaviour worth detecting.
-labels: [detection]
+labels: [detection, needs-triage]
 body:
   - type: textarea
     id: what

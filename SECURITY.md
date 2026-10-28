@@ -7,13 +7,13 @@ vulnerability reporting instead:
 
 <https://github.com/jamesconwaydev/aegis-v2/security/advisories/new>
 
-Tell us what you found, which version and Rocky release you saw it on, and how
+Tell me what you found, which version and Rocky release you saw it on, and how
 to reproduce it. A proof of concept helps, but a clear description is enough to
 start.
 
-We'll acknowledge your report within 5 business days. After that we'll work
-with you on a fix and agree a disclosure date together. This is a small
-project, so we can't promise a fix timeline up front, but you'll hear from us
+I'll acknowledge your report within 5 business days. After that I'll work
+with you on a fix and we'll agree a disclosure date together. I maintain Aegis
+on my own, so I can't promise a fix timeline up front, but you'll hear from me
 as things move.
 
 ## Supported versions
@@ -27,7 +27,7 @@ Aegis is pre-1.0. Only the latest release gets security fixes.
 
 ## What counts
 
-Anything that lets an attacker bypass or disable quarantine, escape the
-honeypot, escalate privileges through Aegis, or tamper with its logs and
-incident records. A false positive or a missed detection is not a vulnerability
-on its own; use the matching issue form for those.
+Anything that lets an attacker blind or disable Aegis, slip past detection or
+quarantine by attacking Aegis itself, escalate privileges through it, or tamper
+with its logs and incident records. A false positive or a missed detection is
+not a vulnerability on its own; use the matching issue form for those.

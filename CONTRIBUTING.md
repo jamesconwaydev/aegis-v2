@@ -1,6 +1,6 @@
 # Contributing to Aegis
 
-Thanks for wanting to help. This page covers what we need from a pull request
+Thanks for wanting to help. This page covers what I need from a pull request
 and how to get one merged without a long back-and-forth.
 
 ## Building
@@ -25,14 +25,25 @@ message on `main`.
 
 1. Fork the repo (or branch, if you have access) and make your change.
 2. Open a pull request and fill in the template.
-3. Wait for review. We'll answer as soon as we can.
+3. Wait for review. I'll answer as soon as I can.
 
 Keep PRs small and about one thing. A reviewer can say yes to a 100-line change
 this afternoon; a 1,500-line one sits.
 
+## When a PR goes quiet
+
+Reviews usually come within a few days. If a week passes without one, leave
+a comment on the PR; a nudge is welcome, not rude.
+
+It works the other way too. If I've asked for changes and the PR then sits
+for three weeks, I'll ask whether you're still on it. Another two weeks of
+silence and I'll close it with a thank-you, or finish it myself and credit
+you in the commit. Closing isn't a verdict on the work: reopen it whenever
+you're ready.
+
 ## Commit messages and PR titles
 
-We use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`,
+Aegis uses [Conventional Commits](https://www.conventionalcommits.org/): `feat:`,
 `fix:`, `docs:`, `chore:`, `refactor:`, `test:`, `ci:`, with an optional scope
 such as `fix(ebpf):`. Keep the subject to 72 characters, say what was wrong or
 what is new rather than "update stuff", and wrap the body at 72.
@@ -77,11 +88,11 @@ and for `aegis-ebpf`:
 
 ## Reporting false positives
 
-If Aegis quarantined something legitimate, we want to know. It's the most
+If Aegis quarantined something legitimate, I want to know. It's the most
 useful bug report you can send. Open an issue with the **False positive**
 form and include your Rocky and kernel versions, the Aegis version and mode, the
 `aegisctl preflight` output and the incident JSON. Scrub anything sensitive
-from the JSON first. The form lists everything we ask for.
+from the JSON first. The form lists everything I ask for.
 
 A missed detection goes in the **Detection report** form instead.
 

@@ -1,6 +1,6 @@
 name: Feature request
 description: Suggest something Aegis should do.
-labels: [enhancement]
+labels: [enhancement, needs-triage]
 body:
   - type: textarea
     id: problem

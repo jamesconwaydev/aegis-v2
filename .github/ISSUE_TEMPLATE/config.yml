@@ -3,3 +3,6 @@ contact_links:
   - name: Report a security vulnerability
     url: https://github.com/jamesconwaydev/aegis-v2/security/advisories/new
     about: Please report security problems privately, not as a public issue.
+  - name: Ask a question
+    url: https://github.com/jamesconwaydev/aegis-v2/discussions/categories/q-a
+    about: Questions about setup, scoring and incidents belong in Discussions.

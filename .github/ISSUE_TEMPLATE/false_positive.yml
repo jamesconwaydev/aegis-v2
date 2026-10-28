@@ -1,6 +1,6 @@
 name: False positive
 description: Aegis quarantined or flagged something it shouldn't have.
-labels: [false-positive]
+labels: [false-positive, needs-triage]
 body:
   - type: textarea
     id: what
