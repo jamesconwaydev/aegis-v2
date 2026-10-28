@@ -2,3 +2,5 @@ target
 corpus
 artifacts
 coverage
+# Copied from ../Cargo.lock before each build, so it never drifts.
+Cargo.lock
