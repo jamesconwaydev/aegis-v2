@@ -124,15 +124,22 @@ impl Systemd {
     /// cgroup stops as it lands (cgroup-v2.rst, "Cgroup Freezer"), so
     /// there is no second freeze. A process already in `unit` (a child
     /// forked there after the move) is left out, and if that is all of
-    /// them busctl isn't run at all. Ok(false) when nothing was moved.
+    /// them busctl isn't run at all. So is one in a cgroup below `unit`,
+    /// which a root process may make in the delegated scope. Ok(false)
+    /// when nothing was moved.
     pub fn attach(&self, unit: &str, pids: &[ProcKey]) -> Result<bool> {
         let tail = format!("/{unit}");
+        let below = format!("{tail}/");
         let pids: Vec<ProcKey> = pids
             .iter()
             .copied()
             .filter(|k| {
-                !(self.cgroup)(k.tgid)
-                    .is_some_and(|c| c.lines().any(|l| l.trim_end().ends_with(&tail)))
+                !(self.cgroup)(k.tgid).is_some_and(|c| {
+                    c.lines().any(|l| {
+                        let l = l.trim_end();
+                        l.ends_with(&tail) || l.contains(&below)
+                    })
+                })
             })
             .collect();
         if pids.is_empty() {
@@ -160,7 +167,13 @@ impl Systemd {
             // Every one exited before systemd looked: nothing was left
             // to move, so nothing failed. A short-lived child (the `seq`
             // of a `$(...)`) is often gone before its job runs.
-            Err(_) if pids.iter().all(|k| !(self.alive)(k.tgid, k.start_time_ns)) => Ok(false),
+            // The error is still logged: a refusal that hits every
+            // newcomer must show in the journal even when all were
+            // short-lived.
+            Err(e) if pids.iter().all(|k| !(self.alive)(k.tgid, k.start_time_ns)) => {
+                eprintln!("aegisd: warning: attach to {unit}, all exited first: {e:#}");
+                Ok(false)
+            }
             Err(e) => Err(e),
         }
     }
@@ -224,13 +237,14 @@ impl Systemd {
             a.extend(["MemoryHigh", "t"].map(String::from));
             a.push(l.memory_high_bytes.to_string());
         }
-        // systemd 257 refuses AttachProcessesToUnit on a scope that
-        // isn't delegated ("Process migration not available on
+        // systemd refuses AttachProcessesToUnit on a scope that isn't
+        // delegated (since v238: "Process migration not available on
         // non-delegated units"), and newcomers join by that call.
-        // Delegation changes nothing else here: systemd still applies
-        // the limits, freezes, thaws and kills the scope, and enables no
-        // controllers below it, so its processes stay in the scope's own
-        // cgroup. A root process could leave any cgroup anyway.
+        // systemd still applies the limits, freezes, thaws and kills the
+        // scope. Delegation makes every controller available to it, but
+        // systemd enables none in its subtree_control, so its processes
+        // stay in the scope's own cgroup. With no User= the cgroup stays
+        // root-owned, and a root process could leave any cgroup anyway.
         a.extend(["Delegate", "b", "true"].map(String::from));
         a.extend(["Description", "s"].map(String::from));
         a.push(format!("Aegis incident {id}"));
@@ -478,6 +492,25 @@ mod tests {
         let c = take();
         assert_eq!(c.len(), 1);
         assert_eq!(c[0][c[0].len() - 2..], ["1".to_string(), "10".into()]);
+    }
+
+    #[test]
+    fn attach_skips_what_is_in_a_cgroup_below_the_unit() {
+        fn cg(tgid: u32) -> Option<String> {
+            match tgid {
+                11 => Some("0::/aegis.slice/aegis-throttle.slice/u.scope/w\n".into()),
+                // A different unit whose name only starts the same.
+                12 => Some("0::/aegis.slice/aegis-throttle.slice/u.scope2/w\n".into()),
+                _ => None,
+            }
+        }
+        take();
+        let s = Systemd::with(ok, |_, _| true).with_cgroup(cg);
+        assert!(!s.attach("u.scope", &[k(11)]).unwrap());
+        assert!(take().is_empty());
+        assert!(s.attach("u.scope", &[k(11), k(12)]).unwrap());
+        let c = take();
+        assert_eq!(c[0][c[0].len() - 2..], ["1".to_string(), "12".into()]);
     }
 
     #[test]
