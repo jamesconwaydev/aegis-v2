@@ -85,6 +85,20 @@ impl Nft {
             .collect()
     }
 
+    /// Handles of the rules in `listing` whose cgroup nft shows as a bare
+    /// number: it prints the path only while the cgroup exists.
+    pub fn unresolved(listing: &str) -> Vec<u64> {
+        listing
+            .lines()
+            .filter(|l| {
+                l.split_once("cgroupv2 level ")
+                    .and_then(|(_, r)| r.split_whitespace().nth(1))
+                    .is_some_and(|c| c.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .filter_map(|l| l.rsplit_once("# handle ")?.1.trim().parse().ok())
+            .collect()
+    }
+
     pub fn remove(&self, handle: u64) -> Result<()> {
         self.nft(&[
             "delete",
@@ -130,6 +144,9 @@ mod tests {
                  \t}\n}\n";
         assert_eq!(Nft::handles(l, "a/b.scope"), [4]);
         assert!(Nft::handles(l, "a/c.scope").is_empty());
+        assert!(Nft::unresolved(l).is_empty());
+        let gone = "\t\tsocket cgroupv2 level 3 18342 counter packets 0 bytes 0 drop # handle 9\n";
+        assert_eq!(Nft::unresolved(&format!("{l}{gone}")), [9]);
     }
 
     #[test]

@@ -118,10 +118,10 @@ Better you hear it here than find out during an incident.
   script run directly through its `#!` line is caught.
 - **Writes made before the hold.** The hold lands milliseconds after the
   score crosses 80, and anything written before then is on disk.
-- **The minute after an nftables reload.** `systemctl reload nftables`
-  flushes every quarantined tree's drop rule. aegisd puts them back on
-  its next sweep, so for up to 60 seconds the only thing between the
-  tree and the network is the freeze.
+- **The seconds after an nftables reload.** `systemctl reload nftables`
+  flushes every quarantined tree's drop rule. aegisd puts them back
+  within about 10 seconds. Until then the tree is still frozen and held,
+  but nothing drops its traffic.
 
 The [threat model][wiki-threat] lists every known gap and why it's there.
 

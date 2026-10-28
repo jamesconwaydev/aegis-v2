@@ -130,11 +130,13 @@ release or kill of an incident from an earlier boot runs nothing and
 records `expired`. A hold's `start_times` let release free a pid only
 while it's still the process that was held.
 
-Two actions carry a `detail`. An `nft_drop` that aegisd's sweep put back
-after a ruleset flush says "re-added after the table was removed" (or
-"after the rule was removed", if only the rule went). An `nft_remove`
-that found nothing to delete says "the rule was already gone". Release
-deletes rules by the handle nftables shows for the tree's cgroup at that
+Two actions carry a `detail`. An `nft_drop` that aegisd's 10-second
+check put back after a ruleset flush says "re-added after the table was
+removed" (or "after the rule was removed", if only the rule went). One
+the check added because the quarantine's own attempt failed says
+"added late: the first attempt failed". An `nft_remove` that found
+nothing to delete says "the rule was already gone". Release and kill
+delete rules by the handle nftables shows for the tree's cgroup at that
 moment, not by the recorded `nft_handle`, which a reload may have given
 to another rule.
 

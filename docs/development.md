@@ -265,10 +265,11 @@ Nine run in enforce mode. `quarantine-memfd-enforce` and
 quarantine scope, and the first that an nftables rule drops its traffic;
 `throttle-ptrace-enforce` that a tracer lands in its throttle scope with
 its CPU limit. `release-enforce` and `kill-enforce` check that release
-thaws a tree and kill ends it. `nft-reload-enforce` reloads nftables
-under a quarantined tree, gives its old rule handle to a stranger, and
-checks that the sweep puts the tree's rule back and that release takes
-out that rule and leaves the stranger's. `dnf-install-enforce`,
+thaws a tree, and that kill ends it and removes its rule.
+`nft-reload-enforce` reloads nftables under a quarantined tree, gives
+its old rule handle to a stranger, and checks that the tree's rule is
+back within one 10-second check and that release takes out that rule
+and leaves the stranger's. `dnf-install-enforce`,
 `podman-run-enforce` and `ssh-login-enforce` must still trip nothing.
 
 Adding a scenario means adding a `[[scenario]]` with a `name`, a shell

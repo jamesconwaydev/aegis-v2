@@ -46,6 +46,9 @@ const TICK: Duration = Duration::from_millis(500);
 /// How often counters go out as OTLP metrics.
 const METRICS_EVERY: Duration = Duration::from_secs(60);
 const SWEEP_TICKS: u64 = 120;
+/// Every this many ticks (10 s), check that each quarantined tree still
+/// has its nft drop rule. Cheap with nothing quarantined: no nft call.
+const REASSERT_TICKS: u64 = 20;
 
 /// sysexits.h EX_CONFIG.
 const EX_CONFIG: u8 = 78;
@@ -331,6 +334,8 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                 ticks += 1;
                 if ticks.is_multiple_of(SWEEP_TICKS) {
                     pipe.sweep();
+                }
+                if ticks.is_multiple_of(REASSERT_TICKS) {
                     // Queued, never waited on: nft runs on the enforcer.
                     enforcer.queue(EnforceJob::Reassert);
                 }
