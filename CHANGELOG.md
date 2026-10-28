@@ -13,6 +13,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ones: it dropped them from its process table, treated their
   environments as unreadable, and left them out of a quarantine or
   throttle. The overflow behind it is gone.
+- A `systemctl reload nftables` that landed between two nft calls
+  could make a working enforcement look broken. If it hit while the
+  10-second check was putting a drop rule back, the incident recorded a
+  failed `nft_drop` and your webhook got "enforcement failed", although
+  the next check fixed it. If it hit during a release or kill, you got
+  an error even though the rule was gone and the network was back. Now
+  aegisd looks at the table again when an nft call fails: a missing
+  table is recreated and the rule added once more, and a rule that's
+  already gone is recorded as "the rule was already gone".
 
 ## [0.2.2] - 2026-10-28
 

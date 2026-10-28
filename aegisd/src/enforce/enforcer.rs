@@ -673,10 +673,7 @@ impl Enforcer {
         }
         if moved && !ruled {
             let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &unit);
-            let r = self
-                .nft
-                .ensure_table()
-                .and_then(|()| self.nft.drop_cgroup(&cg));
+            let r = self.nft.ensure_table().and_then(|()| self.drop_rule(&cg));
             acts.push(act("nft_drop", Some(&unit), vec![], r.map(Some)));
         }
         let v = (moved && now_frozen).then_some("quarantined");
@@ -861,17 +858,60 @@ impl Enforcer {
                 return "";
             }
         };
-        if live.is_empty() {
+        let already_gone = || {
             let mut a = act("nft_remove", Some(unit), vec![], Ok(None));
             a.detail = Some("the rule was already gone".into());
-            acts.push(a);
+            a
+        };
+        if live.is_empty() {
+            acts.push(already_gone());
             return "; its drop rule was already gone";
         }
+        let mut all_gone = true;
         for h in live {
-            let r = self.nft.remove(h);
-            acts.push(act("nft_remove", Some(unit), vec![], r.map(|()| Some(h))));
+            let mut a = act(
+                "nft_remove",
+                Some(unit),
+                vec![],
+                self.nft.remove(h).map(|()| Some(h)),
+            );
+            // A ruleset flush since `find_rules` looked: nothing left to
+            // delete, and the tree has its network back either way.
+            if !a.ok && self.rule_gone(h) {
+                a = already_gone();
+            }
+            all_gone &= a.detail.is_some();
+            acts.push(a);
         }
-        ""
+        if all_gone {
+            "; its drop rule was already gone"
+        } else {
+            ""
+        }
+    }
+
+    /// Whether the live table no longer has rule `h`, or no longer
+    /// exists. False if nft can't say.
+    fn rule_gone(&self, h: u64) -> bool {
+        let tail = format!("# handle {h}");
+        match self.nft.list() {
+            Ok(None) => true,
+            Ok(Some(l)) => !l.lines().any(|l| l.trim_end().ends_with(&tail)),
+            Err(_) => false,
+        }
+    }
+
+    /// Adds the drop rule for `cg`. If a ruleset flush took the table
+    /// since it was last seen, recreates it and tries once more, so a
+    /// `systemctl reload nftables` mid-job isn't recorded as a failure.
+    fn drop_rule(&self, cg: &str) -> Result<u64> {
+        self.nft.drop_cgroup(cg).or_else(|e| match self.nft.list() {
+            Ok(None) => self
+                .nft
+                .ensure_table()
+                .and_then(|()| self.nft.drop_cgroup(cg)),
+            _ => Err(e),
+        })
     }
 
     /// Puts back the drop rule of each tree still quarantined in this
@@ -919,7 +959,7 @@ impl Enforcer {
                 .actions(&id)
                 .iter()
                 .any(|a| a.ok && a.kind == "nft_drop");
-            let r = self.nft.drop_cgroup(&cg);
+            let r = self.drop_rule(&cg);
             let mut a = act("nft_drop", Some(&unit), vec![], r.map(Some));
             let why = if had {
                 why
@@ -2762,5 +2802,85 @@ mod tests {
             a.detail.as_deref(),
             Some("added late: the first attempt failed")
         );
+    }
+
+    thread_local! {
+        /// The nft verb `flush_first` flushes the ruleset in front of.
+        static FLUSH_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// `systemctl reload nftables` landing mid-job: the ruleset goes
+    /// just before the first nft call that starts with `FLUSH_AT`.
+    fn flush_first(prog: &str, a: &[String]) -> Result<String> {
+        let hit = FLUSH_AT.with(|f| {
+            let hit = f.get().is_some_and(|w| a.first().is_some_and(|s| s == w));
+            if hit {
+                f.set(None);
+            }
+            hit
+        });
+        if hit {
+            set_rules(None);
+        }
+        ok(prog, a)
+    }
+
+    #[test]
+    fn reassert_survives_a_flush_between_its_list_and_its_add() {
+        let (mut f, cg) = quarantined("re-race");
+        set_rules(Some(vec![]));
+        f.e.nft = Nft::with(flush_first);
+        FLUSH_AT.with(|w| w.set(Some("--echo")));
+        let failed = f.e.failed.load(Ordering::Relaxed);
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(rules(), Some(vec![(7, cg)]));
+        let a = last_act(&f);
+        assert_eq!(
+            (a.kind.as_str(), a.ok, a.nft_handle),
+            ("nft_drop", true, Some(7))
+        );
+        assert_eq!(f.e.failed.load(Ordering::Relaxed), failed);
+        assert!(!f.log().contains("enforcement failed"), "{}", f.log());
+    }
+
+    #[test]
+    fn release_and_kill_succeed_when_a_flush_beats_the_delete() {
+        for kill in [false, true] {
+            let (mut f, _) = quarantined(&format!("re-race-{kill}"));
+            f.e.nft = Nft::with(flush_first);
+            FLUSH_AT.with(|w| w.set(Some("delete")));
+            let id = f.id.clone();
+            let r = run_reply(&mut f.e, |reply| {
+                if kill {
+                    EnforceJob::Kill { id, reply }
+                } else {
+                    EnforceJob::Release { id, reply }
+                }
+            });
+            let r = r.unwrap_or_else(|e| panic!("kill={kill}: {e}"));
+            assert!(r.ends_with("; its drop rule was already gone"), "{r}");
+            let a = last_act(&f);
+            assert_eq!(
+                (a.kind.as_str(), a.ok, a.nft_handle),
+                ("nft_remove", true, None)
+            );
+            assert_eq!(a.detail.as_deref(), Some("the rule was already gone"));
+        }
+    }
+
+    #[test]
+    fn a_delete_that_fails_with_the_rule_still_listed_is_an_error() {
+        fn no_delete(prog: &str, a: &[String]) -> Result<String> {
+            if a.first().is_some_and(|s| s == "delete") {
+                bail!("nft: exit Some(1): Error: Operation not permitted")
+            }
+            ok(prog, a)
+        }
+        let (mut f, _) = quarantined("re-nodelete");
+        f.e.nft = Nft::with(no_delete);
+        let id = f.id.clone();
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply });
+        assert!(r.is_err_and(|e| e.contains("Operation not permitted")));
+        assert!(!last_act(&f).ok);
     }
 }

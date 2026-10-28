@@ -308,6 +308,14 @@ empties nftables shows the rule by a bare cgroup id, not the path.
 Release of a scope that's already gone falls back to the recorded
 handle, but only when that handle's rule shows such a bare id.
 
+A reload can also land in the middle of one of these jobs, in the few
+milliseconds between nft calls. If the check's add fails and the table
+turns out to be gone, aegisd recreates it and adds the rule again
+rather than reporting a failed enforcement. If a release or kill's
+delete fails and the rule is no longer listed, that's recorded as "the
+rule was already gone", because the network is back either way. A
+failure with the rule still in place is still an error.
+
 ### Incident scopes are delegated
 
 Both incident scopes, `aegis-incident-<id>.scope` and
