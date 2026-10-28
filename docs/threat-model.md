@@ -300,9 +300,11 @@ The check also covers a tree that was moved into its quarantine scope
 but never frozen, because both freeze attempts failed. Its incident
 stays `would_quarantine`, yet it got a drop rule, and it gets that rule
 back after a reload for as long as any of its processes are left in
-the scope. While aegisd runs its kernel holds refuse connects anyway.
-The rule is what's left if aegisd restarts, since the holds go with
-it.
+the scope. Its held processes can't connect anyway, but not every
+member is held: a child the walk found is moved into the scope
+unheld, and only its own fork job holds it later. If that job is lost,
+the rule is the one thing stopping it. The rule is also all that's
+left if aegisd restarts, since the holds go with it.
 
 In audit mode the check only puts back a rule that enforce mode added.
 If a quarantine's own rule failed, enforce mode adds it late on a

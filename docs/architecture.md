@@ -291,11 +291,11 @@ them, never pid 1, kthreadd, aegisd, or an ancestor of the tree.
 - **Re-assert:** every 10 seconds the event loop queues a job that
   checks each tree still quarantined in this boot, and still frozen,
   has its rule. So does a tree moved into its -q scope whose freeze
-  failed, while any of it is left in the scope. Any missing after a ruleset flush is added again, with
-  the table and chain if they went too. With nothing quarantined it
-  never runs `nft`. In audit mode it only restores a rule enforce mode
-  added; a rule whose first attempt failed is added late only in
-  enforce mode.
+  failed, while any of it is left in the scope. Any missing after a
+  ruleset flush is added again, with the table and chain if they went
+  too. With nothing quarantined it never runs `nft`. In audit mode it
+  only restores a rule enforce mode added; a rule whose first attempt
+  failed is added late only in enforce mode.
 - **Earlier boot:** release or kill of an incident whose `boot_id`
   isn't this boot's runs nothing and records `expired`.
 

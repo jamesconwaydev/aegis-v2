@@ -24,11 +24,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already gone is recorded as "the rule was already gone".
 - A tree that aegisd moved into its quarantine scope but couldn't
   freeze (verdict `would_quarantine`) had a drop rule, and lost it for
-  good to the first nftables reload. Its kernel holds kept blocking
-  connects while aegisd ran, but they go when aegisd restarts, and then
-  nothing did. The 10-second check now puts its rule back too, while
-  any of the tree is still in the scope. In audit mode, as before, only
-  a rule that enforce mode added comes back.
+  good to the first nftables reload. Its kernel holds still blocked the
+  processes aegisd had held, but not a child it moved without holding
+  yet, and they all go when aegisd restarts. The 10-second check now
+  puts the rule back too, while any of the tree is still in the scope.
+  In enforce mode it also adds one if the first attempt failed, recorded
+  as "added late: the first attempt failed". In audit mode, as before,
+  only a rule that enforce mode added comes back.
 
 ## [0.2.2] - 2026-10-28
 
