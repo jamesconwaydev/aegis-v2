@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "aegis-common"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "aegis-ebpf"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aegis-common",
  "aya-ebpf",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-proto"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-sim"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "libc",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "aegisctl"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aegis-proto",
  "clap",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "aegisd"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aegis-common",
  "aegis-ebpf",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",

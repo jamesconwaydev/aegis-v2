@@ -6,6 +6,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-28
+
+A security fix, nothing else. If you send telemetry over HTTPS (OTLP or
+webhooks), upgrade.
+
 ### Security
 
 - OTLP and webhook TLS used webpki-root-certs 1.0.9, which still trusted
@@ -317,7 +322,8 @@ the host is stopped, moved or rewritten yet; that starts in v0.2.0.
 
 The [threat model](docs/threat-model.md) has the full list.
 
-[Unreleased]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.1.0...v0.1.1
