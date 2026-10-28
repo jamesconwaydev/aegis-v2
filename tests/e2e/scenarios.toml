@@ -9,6 +9,13 @@
 # Incidents are cleared between scenarios, so each is judged alone. A
 # scenario whose command exits non-zero fails.
 #
+# `mode` is "audit" (the default) or "enforce": an enforce scenario runs
+# with the config switched to enforce, and expects "throttled" or
+# "quarantined" where audit expects "would_...". Afterwards the harness
+# kills each quarantined incident and releases each throttled one, puts
+# the config back and removes whatever is left. `check`, if given, runs
+# under `set -e` once the verdict settles and must exit 0.
+#
 # The harness installs aegis-sim at two paths: /usr/local/bin/aegis-sim,
 # for scenarios that test a signal on its own, and /tmp/aegis-sim, so a
 # scenario that should also carry the "exec from a temp directory" signal
@@ -126,5 +133,152 @@ expect = "none"
 name = "ssh-login"
 # The harness runs every scenario over a fresh SSH connection, so this
 # command alone exercises a full sshd login and session.
+run = "true"
+expect = "none"
+
+# --- Enforce mode ----------------------------------------------------------
+#
+# The process under test has to outlive its verdict, so it runs detached
+# (setsid -f) with `--stay`, and writes its pid to /run/aegis-sim.pid.
+#
+# The ptrace steps here attach to a throwaway system service, not sshd:
+# a quarantine freezes the tracer, and sshd's listener would stop at its
+# next syscall waiting on it, taking every new login with it.
+#
+# A check refuses every pid or id it reads before using it: `case $P in
+# ''|*[!0-9]*) exit 1` fails on an empty answer and on more than one,
+# so a missing process can never make a check pass by default.
+
+[[scenario]]
+name = "quarantine-memfd-enforce"
+mode = "enforce"
+run = """
+rm -f /run/aegis-sim.pid
+setsid -f /usr/local/bin/aegis-sim memfd-exec --stay 30 </dev/null >/dev/null 2>&1
+timeout 5 sh -c 'until [ -s /run/aegis-sim.pid ]; do sleep 0.1; done'
+"""
+expect = "quarantined"
+check = """
+P=$(cat /run/aegis-sim.pid)
+case $P in ''|*[!0-9]*) exit 1 ;; esac
+CG=$(sed -n 's/^0:://p' /proc/$P/cgroup)
+case $CG in */aegis-quarantine.slice/aegis-incident-*-q.scope) ;; *) exit 1 ;; esac
+grep -qx 'frozen 1' /sys/fs/cgroup$CG/cgroup.events
+[ "$(nft list table inet aegis | grep -c ' drop$')" = 1 ]
+"""
+
+[[scenario]]
+name = "quarantine-chain-enforce"
+mode = "enforce"
+run = """
+rm -f /run/aegis-sim.pid; S=/tmp/aegis-strace.$$
+systemd-run --quiet --unit=aegis-e2e-target sleep 300 || exit 1
+P=$(systemctl show -p MainPID --value aegis-e2e-target)
+[ "$P" -gt 1 ] && cp /usr/bin/strace $S || exit 1
+setsid -f /tmp/aegis-sim chain --stay 30 timeout 30 $S -e trace=none -p $P </dev/null >/dev/null 2>&1
+timeout 5 sh -c 'until [ -s /run/aegis-sim.pid ]; do sleep 0.1; done'
+"""
+# As `chain`: aegis-sim's 25 + 40 throttles it, then the strace copy's
+# 25 + 45 takes the incident to 110 and the whole tree is quarantined:
+# aegis-sim, timeout under it and the strace under that.
+expect = "quarantined"
+check = """
+cg() { sed -n 's/^0:://p' /proc/$1/cgroup; }
+T=$(pgrep -f '^/tmp/aegis-strace[.]')
+case $T in ''|*[!0-9]*) exit 1 ;; esac
+PP=$(ps -o ppid= -p $T | tr -d ' ')
+case $PP in ''|*[!0-9]*) exit 1 ;; esac
+P=$(cat /run/aegis-sim.pid)
+case $P in ''|*[!0-9]*) exit 1 ;; esac
+CG=$(cg $T)
+case $CG in */aegis-quarantine.slice/aegis-incident-*-q.scope) ;; *) exit 1 ;; esac
+[ "$(cg $PP)" = "$CG" ]
+[ "$(cg $P)" = "$CG" ]
+grep -qx 'frozen 1' /sys/fs/cgroup$CG/cgroup.events
+"""
+
+[[scenario]]
+name = "throttle-ptrace-enforce"
+mode = "enforce"
+run = """
+S=/tmp/aegis-strace.$$
+systemd-run --quiet --unit=aegis-e2e-target sleep 300 || exit 1
+P=$(systemctl show -p MainPID --value aegis-e2e-target)
+[ "$P" -gt 1 ] && cp /usr/bin/strace $S || exit 1
+setsid -f timeout 30 $S -e trace=none -p $P </dev/null >/dev/null 2>&1
+"""
+# As `ptrace-daemon`, 70, with the tracer staying attached. 25% of a CPU
+# is a 25 ms quota in each 100 ms period.
+expect = "throttled"
+check = """
+T=$(pgrep -f '^/tmp/aegis-strace[.]')
+case $T in ''|*[!0-9]*) exit 1 ;; esac
+CG=$(sed -n 's/^0:://p' /proc/$T/cgroup)
+case $CG in */aegis-throttle.slice/aegis-incident-*.scope) ;; *) exit 1 ;; esac
+[ "$(cat /sys/fs/cgroup$CG/cpu.max)" = "25000 100000" ]
+"""
+
+[[scenario]]
+name = "release-enforce"
+mode = "enforce"
+run = """
+rm -f /run/aegis-sim.pid
+setsid -f /usr/local/bin/aegis-sim memfd-exec --stay 60 </dev/null >/dev/null 2>&1
+for i in $(seq 30); do
+  I=$(aegisctl incidents list | awk '$2 == "quarantined" {print $1}')
+  [ -n "$I" ] && break; sleep 0.5
+done
+[ -n "$I" ] && aegisctl incidents release $I
+"""
+# The verdict stays "quarantined"; the release is an action on it.
+expect = "quarantined"
+check = """
+P=$(cat /run/aegis-sim.pid)
+case $P in ''|*[!0-9]*) exit 1 ;; esac
+kill -0 $P
+CG=$(sed -n 's/^0:://p' /proc/$P/cgroup)
+case $CG in */aegis-quarantine.slice/aegis-incident-*-q.scope) ;; *) exit 1 ;; esac
+grep -qx 'frozen 0' /sys/fs/cgroup$CG/cgroup.events
+[ "$(nft list table inet aegis 2>/dev/null | grep -c ' drop$')" = 0 ]
+"""
+
+[[scenario]]
+name = "kill-enforce"
+mode = "enforce"
+run = """
+rm -f /run/aegis-sim.pid
+setsid -f /usr/local/bin/aegis-sim memfd-exec --stay 60 </dev/null >/dev/null 2>&1
+for i in $(seq 30); do
+  I=$(aegisctl incidents list | awk '$2 == "quarantined" {print $1}')
+  [ -n "$I" ] && break; sleep 0.5
+done
+[ -n "$I" ] && aegisctl incidents kill $I
+"""
+expect = "quarantined"
+check = """
+P=$(cat /run/aegis-sim.pid)
+case $P in ''|*[!0-9]*) exit 1 ;; esac
+I=$(aegisctl incidents list | awk '$2 == "quarantined" {print $1}')
+case $I in AEG-*) ;; *) exit 1 ;; esac
+case $I in *[!A-Za-z0-9-]*) exit 1 ;; esac
+U=aegis-incident-$I-q.scope
+timeout 5 sh -c "while kill -0 $P || systemctl is-active -q $U; do sleep 0.1; done" 2>/dev/null
+"""
+
+[[scenario]]
+name = "dnf-install-enforce"
+mode = "enforce"
+run = "dnf -y install tree && dnf -y remove tree"
+expect = "none"
+
+[[scenario]]
+name = "podman-run-enforce"
+mode = "enforce"
+run = "podman run --rm registry.access.redhat.com/ubi10/ubi-micro true"
+expect = "none"
+
+[[scenario]]
+name = "ssh-login-enforce"
+mode = "enforce"
 run = "true"
 expect = "none"

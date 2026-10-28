@@ -37,6 +37,8 @@ enum Cmd {
         /// after its exec, and one already gone reads as tainted.
         #[arg(long, default_value_t = 0)]
         wait_ms: u64,
+        #[command(flatten)]
+        stay: Stay,
     },
     /// Connect to many closed loopback ports fast. Exercises the egress
     /// scan signal (40). Targets are refused to 127.0.0.0/8 or the host.
@@ -48,12 +50,45 @@ enum Cmd {
     /// Run from /tmp with a ptrace step as `cmd`, the incident sums
     /// tmp exec (25) + scan (40) + ptrace (45) past quarantine.
     Chain {
+        #[command(flatten)]
+        stay: Stay,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
     /// Re-exec target for memfd-exec: exits 0, does nothing. Hidden.
     #[command(hide = true, name = "__noop")]
-    Noop,
+    Noop {
+        #[command(flatten)]
+        stay: Stay,
+    },
+}
+
+/// For the enforce-mode scenarios, which need the scoring process alive
+/// after its verdict, to check and then release or kill it.
+#[derive(clap::Args, Clone, Copy)]
+struct Stay {
+    /// Sleep this many seconds before exiting, and write this process's
+    /// pid to /run/aegis-sim.pid first.
+    #[arg(long, default_value_t = 0)]
+    stay: u64,
+}
+
+impl Stay {
+    /// The pid is written before anything scores: once aegisd holds the
+    /// process it may no longer write files.
+    fn announce(self) -> Result<(), i32> {
+        if self.stay > 0 {
+            if let Err(e) = std::fs::write("/run/aegis-sim.pid", std::process::id().to_string()) {
+                eprintln!("aegis-sim: writing /run/aegis-sim.pid: {e}");
+                return Err(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn sleep(self) {
+        std::thread::sleep(std::time::Duration::from_secs(self.stay));
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -65,14 +100,27 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn main() {
     let code = match Cli::parse().cmd {
-        Cmd::Noop => 0,
-        Cmd::TmpDropper => linux::tmp_dropper(),
-        Cmd::MemfdExec { wait_ms } => {
-            std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-            linux::memfd_exec()
+        Cmd::Noop { stay } => {
+            stay.sleep();
+            0
         }
+        Cmd::TmpDropper => linux::tmp_dropper(),
+        Cmd::MemfdExec { wait_ms, stay } => match stay.announce() {
+            Ok(()) => {
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                linux::memfd_exec(stay.stay)
+            }
+            Err(c) => c,
+        },
         Cmd::PortScan { target } => linux::port_scan(&target),
-        Cmd::Chain { cmd } => linux::chain(&cmd),
+        Cmd::Chain { stay, cmd } => match stay.announce() {
+            Ok(()) => {
+                let c = linux::chain(&cmd);
+                stay.sleep();
+                c
+            }
+            Err(c) => c,
+        },
     };
     std::process::exit(code);
 }
@@ -125,8 +173,9 @@ mod linux {
     }
 
     /// Copy this binary into a memfd and execveat it in place. The new
-    /// image runs `__noop` and exits 0, so the caller sees a clean exit.
-    pub fn memfd_exec() -> i32 {
+    /// image runs `__noop` (sleeping `stay` seconds) and exits 0, so the
+    /// caller sees a clean exit.
+    pub fn memfd_exec(stay: u64) -> i32 {
         const MFD_CLOEXEC: libc::c_uint = 0x0001;
         // 0x0008 is MFD_NOEXEC_SEAL (the opposite); MFD_EXEC is 0x0010.
         const MFD_EXEC: libc::c_uint = 0x0010;
@@ -156,7 +205,15 @@ mod linux {
         let empty = CString::new("").unwrap();
         let arg0 = CString::new("aegis-sim").unwrap();
         let arg1 = CString::new("__noop").unwrap();
-        let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
+        let arg2 = CString::new("--stay").unwrap();
+        let arg3 = CString::new(stay.to_string()).unwrap();
+        let argv = [
+            arg0.as_ptr(),
+            arg1.as_ptr(),
+            arg2.as_ptr(),
+            arg3.as_ptr(),
+            std::ptr::null(),
+        ];
         let envp = [std::ptr::null::<libc::c_char>()];
         // SAFETY: fd is a live memfd holding this ELF; argv and envp are
         // NULL-terminated. On success this never returns.

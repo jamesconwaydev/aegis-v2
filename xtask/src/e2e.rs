@@ -5,8 +5,14 @@
 //!
 //! Each scenario is judged alone: incidents are cleared between them. The
 //! harness also checks that no SELinux denial mentioning aegis was
-//! raised and that /etc is byte-for-byte unchanged, since v0.1 only
-//! audits and must never touch the host.
+//! raised and that /etc is byte-for-byte unchanged: aegisd must never
+//! touch it, in audit or enforce mode.
+//!
+//! An enforce-mode scenario switches the config to enforce before the
+//! /etc hash is taken. Afterwards it releases or kills every incident
+//! the scenario left, puts the config back, and sweeps away any scope,
+//! nft table or process still standing, whether the scenario passed or
+//! not.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -61,6 +67,14 @@ struct Scenario {
     name: String,
     run: String,
     expect: String,
+    #[serde(default = "audit")]
+    mode: String,
+    /// Shell run under `set -e` once the verdict settles; must exit 0.
+    check: Option<String>,
+}
+
+fn audit() -> String {
+    "audit".into()
 }
 
 /// An SSH connection to the host. Every command is a fresh connection
@@ -192,10 +206,18 @@ fn summarize(json: &str) -> Result<String> {
 /// (`date '+%x %T'` on the host). Fails closed: an ssh failure, a
 /// missing ausearch or any ausearch failure other than "no matches" is
 /// an error, never a clean result.
+///
+/// Without a terminal ausearch reads stdin, not the audit log, and
+/// answers `<no matches>` to everything; `--input-logs` stops that. As
+/// a guard against any other way it could read nothing, it must first
+/// find some event since the marker: every ssh login in between writes
+/// several, so an empty answer there means the log isn't being read.
 fn avc_since(remote: &Remote, marker: &str) -> Result<bool> {
     let (ok, out, err) = remote.try_run(&format!(
         "command -v ausearch >/dev/null || {{ echo 'ausearch not found' >&2; exit 2; }}; \
-         ausearch -m AVC,USER_AVC,SELINUX_ERR -ts {marker}"
+         ausearch --input-logs -ts {marker} </dev/null >/dev/null 2>&1 \
+           || {{ echo 'ausearch saw no events at all since the marker' >&2; exit 2; }}; \
+         ausearch --input-logs -m AVC,USER_AVC,SELINUX_ERR -ts {marker} </dev/null"
     ))?;
     judge_ausearch(ok, &out, &err)
 }
@@ -217,6 +239,22 @@ fn marker(remote: &Remote) -> Result<String> {
     Ok(remote.check("date '+%x %T'")?.trim().to_string())
 }
 
+const CONFIG: &str = "/etc/aegis-v2/config.toml";
+/// The installed config, kept so an enforce scenario can put it back.
+const CONFIG_ORIG: &str = "/var/tmp/aegis-e2e-config.toml";
+/// What an enforce scenario may leave behind, removed after each one
+/// and again at the end: incident scopes (killed first, since a frozen
+/// one would sit out the stop timeout), the scenarios' ptrace target,
+/// aegisd's nft table, the simulator's pid file and the strace copies.
+const SWEEP: &str = "systemctl kill -s KILL 'aegis-incident-*' 2>/dev/null; \
+     systemctl stop 'aegis-incident-*' 2>/dev/null; \
+     systemctl stop aegis-e2e-target 2>/dev/null; \
+     systemctl reset-failed 'aegis-incident-*' aegis-e2e-target 2>/dev/null; \
+     nft delete table inet aegis 2>/dev/null; \
+     rm -f /run/aegis-sim.pid /tmp/aegis-strace.*; true";
+/// Exits non-zero if the sweep left anything.
+const SWEPT: &str = "! systemctl list-units --all --no-legend 'aegis-incident-*' \
+     aegis-e2e-target.service | grep -q . && ! nft list table inet aegis >/dev/null 2>&1";
 const SHA_ETC: &str = "find /etc -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum";
 const PREREQS: [&str; 4] = ["gdb", "podman", "python3-pip", "strace"];
 const INCIDENTS: &str = "/var/lib/aegis-v2/incidents";
@@ -233,6 +271,11 @@ struct Row {
     avc: bool,
     etc_ok: bool,
     ran: bool,
+    /// The scenario's check passed (true when it has none).
+    check_ok: bool,
+    /// Enforce mode only: every incident left was released or killed,
+    /// and the config and host were put back.
+    ended: bool,
     pass: bool,
 }
 
@@ -300,6 +343,7 @@ pub fn run(args: Args) -> Result<()> {
         remote.try_run("dnf -y remove aegis-v2 aegis-v2-selinux")?;
         remote.check(&format!("dnf -y install {}", shq_all(&remote_rpms)))?;
         remote.check("systemctl enable --now aegisd")?;
+        remote.check(&format!("cp -p {CONFIG} {CONFIG_ORIG}"))?;
 
         let scenarios = load_scenarios()?;
         let mut rows = Vec::new();
@@ -390,9 +434,12 @@ fn load_scenarios() -> Result<Vec<Scenario>> {
     for sc in &s.scenario {
         if !matches!(
             sc.expect.as_str(),
-            "none" | "would_throttle" | "would_quarantine"
+            "none" | "would_throttle" | "would_quarantine" | "throttled" | "quarantined"
         ) {
             bail!("scenario {}: bad expect `{}`", sc.name, sc.expect);
+        }
+        if !matches!(sc.mode.as_str(), "audit" | "enforce") {
+            bail!("scenario {}: bad mode `{}`", sc.name, sc.mode);
         }
     }
     Ok(s.scenario)
@@ -404,6 +451,21 @@ fn run_scenario(remote: &Remote, s: &Scenario) -> Result<Row> {
     remote.check(&format!("rm -rf {INCIDENTS}"))?;
     remote.check("systemctl start aegisd")?;
 
+    if s.mode != "enforce" {
+        return judge(remote, s);
+    }
+    // A run killed part-way may have left a target or scope behind.
+    let _ = remote.try_run(SWEEP);
+    // Whatever happens in the scenario, the host is put back after it.
+    let row = set_mode(remote, "enforce").and_then(|()| judge(remote, s));
+    let ended = end_enforce(remote).map_err(|e| eprintln!("  {}: ending: {e:#}", s.name));
+    let mut row = row?;
+    row.ended = ended.is_ok();
+    row.pass &= row.ended;
+    Ok(row)
+}
+
+fn judge(remote: &Remote, s: &Scenario) -> Result<Row> {
     let etc_before = remote.check(SHA_ETC)?;
     let marker = marker(remote)?;
 
@@ -426,6 +488,18 @@ fn run_scenario(remote: &Remote, s: &Scenario) -> Result<Row> {
         std::thread::sleep(Duration::from_millis(500));
     };
 
+    // Straight after the verdict: a scenario's process stays only so long.
+    let check_ok = match &s.check {
+        None => true,
+        Some(c) => {
+            let (ok, out, err) = remote.try_run(&format!("set -e\n{c}"))?;
+            if !ok {
+                eprintln!("  {}: check failed: {} {}", s.name, out.trim(), err.trim());
+            }
+            ok
+        }
+    };
+
     let avc = avc_since(remote, &marker).unwrap_or_else(|e| {
         eprintln!(
             "  {}: AVC check failed, counting it as a denial: {e:#}",
@@ -438,7 +512,7 @@ fn run_scenario(remote: &Remote, s: &Scenario) -> Result<Row> {
     let etc_ok = etc_before == etc_after;
 
     let verdict_ok = got == s.expect;
-    let pass = ran && verdict_ok && !avc && etc_ok;
+    let pass = ran && verdict_ok && check_ok && !avc && etc_ok;
 
     Ok(Row {
         name: s.name.clone(),
@@ -447,8 +521,98 @@ fn run_scenario(remote: &Remote, s: &Scenario) -> Result<Row> {
         avc,
         etc_ok,
         ran,
+        check_ok,
+        ended: true,
         pass,
     })
+}
+
+/// Writes the installed config with `mode` swapped in, reloads, and
+/// waits for aegisd to report the mode. The file is rewritten in place,
+/// so it keeps its SELinux label.
+fn set_mode(remote: &Remote, mode: &str) -> Result<()> {
+    remote.check(&format!(
+        "sed 's/^mode = .*/mode = \"{mode}\"/' {CONFIG_ORIG} > {CONFIG} \
+         && grep -qx 'mode = \"{mode}\"' {CONFIG} && systemctl reload aegisd"
+    ))?;
+    wait_mode(remote, mode)
+}
+
+fn wait_mode(remote: &Remote, mode: &str) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let st = remote.check("aegisctl status")?;
+        if st
+            .lines()
+            .any(|l| l.split_whitespace().collect::<Vec<_>>() == ["mode", mode])
+        {
+            return Ok(());
+        }
+        if start.elapsed() >= DEADLINE {
+            bail!("aegisd never reported mode {mode} after the reload");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// After an enforce scenario: release or kill every incident still
+/// enforced, put the config back, then sweep. Each step runs even if
+/// an earlier one failed; any failure is returned.
+fn end_enforce(remote: &Remote) -> Result<()> {
+    let mut errs = Vec::new();
+    match remote
+        .check("aegisctl incidents list --json")
+        .and_then(|j| enforced(&j))
+    {
+        Ok(left) => {
+            for (id, verb) in left {
+                match remote.try_run(&format!("aegisctl incidents {verb} {id}")) {
+                    // Ended by the scenario itself (release-enforce, say).
+                    Ok((ok, out, err)) if !ok && !format!("{out}{err}").contains("is already") => {
+                        errs.push(format!("{verb} {id}: {} {}", out.trim(), err.trim()))
+                    }
+                    Ok(_) => {}
+                    Err(e) => errs.push(format!("{verb} {id}: {e:#}")),
+                }
+            }
+        }
+        Err(e) => errs.push(format!("listing incidents: {e:#}")),
+    }
+    if let Err(e) = remote
+        .check(&format!(
+            "cat {CONFIG_ORIG} > {CONFIG} && systemctl reload aegisd"
+        ))
+        .and_then(|_| wait_mode(remote, "audit"))
+    {
+        errs.push(format!("restoring the config: {e:#}"));
+    }
+    let _ = remote.try_run(SWEEP);
+    if !remote.try_run(SWEPT).is_ok_and(|r| r.0) {
+        errs.push("the sweep left a scope, the target or the nft table".into());
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errs.join("; "))
+    }
+}
+
+/// Each incident aegisd acted on, with the command that ends it: a
+/// quarantine is killed, a throttle released.
+fn enforced(json: &str) -> Result<Vec<(String, &'static str)>> {
+    let v: serde_json::Value = serde_json::from_str(json).context("incidents list --json")?;
+    Ok(v.as_array()
+        .context("expected a JSON array")?
+        .iter()
+        .filter_map(|i| {
+            let verb = match i["verdict"].as_str()? {
+                "quarantined" => "kill",
+                "throttled" => "release",
+                _ => return None,
+            };
+            Some((i["id"].as_str()?.to_string(), verb))
+        })
+        .collect())
 }
 
 fn cleanup(
@@ -458,9 +622,18 @@ fn cleanup(
     orig_enforce: &str,
     keep: bool,
 ) {
+    // In case a run stopped part-way through an enforce scenario.
+    let _ = remote.try_run(&format!(
+        "if [ -f {CONFIG_ORIG} ]; then cat {CONFIG_ORIG} > {CONFIG}; \
+         systemctl reload aegisd; rm -f {CONFIG_ORIG}; fi"
+    ));
+    let _ = remote.try_run(SWEEP);
     if !keep {
         let _ = remote.try_run("systemctl stop aegisd");
         let _ = remote.try_run("dnf -y remove aegis-v2 aegis-v2-selinux");
+        // The slices enforce mode created outlive the package, and
+        // systemd still has the removed unit loaded.
+        let _ = remote.try_run("systemctl stop aegis.slice; systemctl daemon-reload");
         // Runtime-created state rpm doesn't own, so erase leaves it behind.
         let _ = remote.try_run("rm -rf /var/lib/aegis-v2");
         if !added.is_empty() {
@@ -479,18 +652,20 @@ fn cleanup(
 
 fn print_table(rows: &[Row]) {
     println!(
-        "\n{:<16} {:<17} {:<17} {:<5} {:<5} {:<4} result",
-        "scenario", "expect", "got", "avc", "etc", "ran"
+        "\n{:<26} {:<17} {:<17} {:<5} {:<5} {:<4} {:<5} {:<5} result",
+        "scenario", "expect", "got", "avc", "etc", "ran", "check", "end"
     );
     for r in rows {
         println!(
-            "{:<16} {:<17} {:<17} {:<5} {:<5} {:<4} {}",
+            "{:<26} {:<17} {:<17} {:<5} {:<5} {:<4} {:<5} {:<5} {}",
             r.name,
             r.expect,
             r.got,
             if r.avc { "DENY" } else { "ok" },
             if r.etc_ok { "ok" } else { "CHG" },
             if r.ran { "ok" } else { "err" },
+            if r.check_ok { "ok" } else { "FAIL" },
+            if r.ended { "ok" } else { "FAIL" },
             if r.pass { "PASS" } else { "FAIL" },
         );
     }
@@ -501,6 +676,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scenarios_file_parses() {
+        let s = load_scenarios().unwrap();
+        assert!(s.iter().any(|s| s.mode == "enforce" && s.check.is_some()));
+    }
+
+    #[test]
+    fn enforced_incidents_and_how_they_end() {
+        let j = r#"[{"id":"AEG-1","verdict":"quarantined"},{"id":"AEG-2","verdict":"throttled"},
+                   {"id":"AEG-3","verdict":"would_quarantine"}]"#;
+        assert_eq!(
+            enforced(j).unwrap(),
+            [("AEG-1".into(), "kill"), ("AEG-2".into(), "release")]
+        );
+        assert!(enforced("{}").is_err());
+    }
+
+    #[test]
     fn ausearch_outcomes() {
         assert!(!judge_ausearch(false, "", "<no matches>\n").unwrap());
         assert!(judge_ausearch(true, "type=AVC ... comm=\"aegisd\"", "").unwrap());
@@ -508,6 +700,12 @@ mod tests {
         // Any other failure fails the check rather than reading clean.
         assert!(judge_ausearch(false, "", "Invalid start time\n").is_err());
         assert!(judge_ausearch(false, "", "ausearch not found\n").is_err());
+        assert!(judge_ausearch(
+            false,
+            "",
+            "ausearch saw no events at all since the marker\n"
+        )
+        .is_err());
         assert!(judge_ausearch(false, "", "").is_err());
     }
 }
