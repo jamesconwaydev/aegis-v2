@@ -18,9 +18,15 @@ pub type Run = fn(&str, &[String]) -> Result<String>;
 pub type Alive = fn(u32, u64) -> bool;
 /// Reads a cgroup's `cgroup.events` file, given its path. Tests pass a fake.
 pub type Events = fn(&str) -> Result<String>;
+/// Reads `/proc/<tgid>/cgroup`. Tests pass a fake.
+pub type Cgroup = fn(u32) -> Option<String>;
 
 fn read_events(path: &str) -> Result<String> {
     Ok(std::fs::read_to_string(path)?)
+}
+
+fn read_cgroup(tgid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{tgid}/cgroup")).ok()
 }
 
 /// Runs `prog args`, returning stdout; errors on spawn failure, timeout
@@ -48,19 +54,31 @@ pub struct Systemd {
     run: Run,
     alive: Alive,
     events: Events,
+    cgroup: Cgroup,
 }
 
 impl Systemd {
     pub fn new() -> Self {
-        Self::with(run_cmd, crate::pipeline::proc_start_matches)
+        Self {
+            cgroup: read_cgroup,
+            ..Self::with(run_cmd, crate::pipeline::proc_start_matches)
+        }
     }
 
+    /// For tests: no process is ever found already in a unit.
     pub fn with(run: Run, alive: Alive) -> Self {
         Self {
             run,
             alive,
             events: read_events,
+            cgroup: |_| None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_cgroup(mut self, cgroup: Cgroup) -> Self {
+        self.cgroup = cgroup;
+        self
     }
 
     #[cfg(test)]
@@ -104,9 +122,23 @@ impl Systemd {
     /// Moves `pids` into `unit`, a scope that already runs: how a
     /// newcomer joins a quarantined tree. A process moved into a frozen
     /// cgroup stops as it lands (cgroup-v2.rst, "Cgroup Freezer"), so
-    /// there is no second freeze.
-    pub fn attach(&self, unit: &str, pids: &[ProcKey]) -> Result<()> {
-        self.with_live(unit, pids, |p| {
+    /// there is no second freeze. A process already in `unit` (a child
+    /// forked there after the move) is left out, and if that is all of
+    /// them busctl isn't run at all. Ok(false) when nothing was moved.
+    pub fn attach(&self, unit: &str, pids: &[ProcKey]) -> Result<bool> {
+        let tail = format!("/{unit}");
+        let pids: Vec<ProcKey> = pids
+            .iter()
+            .copied()
+            .filter(|k| {
+                !(self.cgroup)(k.tgid)
+                    .is_some_and(|c| c.lines().any(|l| l.trim_end().ends_with(&tail)))
+            })
+            .collect();
+        if pids.is_empty() {
+            return Ok(false);
+        }
+        self.with_live(unit, &pids, |p| {
             let mut a: Vec<String> = [
                 "call",
                 "org.freedesktop.systemd1",
@@ -123,6 +155,7 @@ impl Systemd {
             a.extend(p.iter().map(|k| k.tgid.to_string()));
             (self.run)(BUSCTL, &a).map(drop)
         })
+        .map(|()| true)
     }
 
     /// A pid that exits before systemd looks fails the whole call, so on
@@ -408,5 +441,20 @@ mod tests {
             .unwrap_err();
         assert!(format!("{e:#}").contains("already exited"));
         assert_eq!(take().len(), 1);
+    }
+
+    #[test]
+    fn attach_skips_what_is_already_in_the_unit() {
+        fn cg(tgid: u32) -> Option<String> {
+            (tgid == 11).then(|| "0::/aegis.slice/aegis-throttle.slice/u.scope\n".into())
+        }
+        take();
+        let s = Systemd::with(ok, alive_10).with_cgroup(cg);
+        assert!(!s.attach("u.scope", &[k(11)]).unwrap());
+        assert!(take().is_empty());
+        assert!(s.attach("u.scope", &[k(10), k(11)]).unwrap());
+        let c = take();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0][c[0].len() - 2..], ["1".to_string(), "10".into()]);
     }
 }

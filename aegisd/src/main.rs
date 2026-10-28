@@ -14,7 +14,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, TrySendError};
+use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -318,7 +318,8 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                         let _ = reply.send(answer_disk(req, &store));
                     });
                 }
-                Request::IncidentRelease { .. } | Request::IncidentKill { .. } => {
+                Request::IncidentRelease { ref id } | Request::IncidentKill { ref id } => {
+                    pipe.enforcement_ended(id);
                     enforce_admin(req, &enforcer, reply);
                 }
                 _ => {
@@ -375,11 +376,7 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
         // Any arm can score (a verdict or deadline releases a deferred
         // signal), so jobs are handed over after each, never waited on.
         for job in pipe.to_enforce.drain(..) {
-            if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
-                enforcer.tx.try_send(job)
-            {
-                enforcer.dropped.fetch_add(1, Ordering::Relaxed);
-            }
+            enforcer.queue(job);
         }
     }
 
