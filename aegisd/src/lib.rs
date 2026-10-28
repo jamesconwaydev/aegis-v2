@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! The daemon's modules, as a library so the fuzz targets in `fuzz/`
-//! can reach the parsers. `main.rs` is the only real user; nothing here
-//! is a stable API, which is also why `new` needs no `Default` twin.
+//! The daemon's modules as a library, for the fuzz targets in `fuzz/`
+//! only. cargo fuzz builds with `--cfg fuzzing`; every other build gets an
+//! empty library, and the binary declares the same modules itself, so it
+//! keeps its dead-code warnings. Not an API, so `new` needs no `Default`.
+#![cfg(fuzzing)]
 #![allow(clippy::new_without_default)]
 
 pub mod config;

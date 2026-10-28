@@ -36,3 +36,7 @@ aegis-ebpf = { path = "../aegis-ebpf" }
 libc = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# cargo fuzz sets cfg(fuzzing); see src/lib.rs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

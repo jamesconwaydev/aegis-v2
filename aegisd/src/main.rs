@@ -1,4 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+mod config;
+mod ebpf;
+mod enforce;
+mod incident;
+mod ipc;
+mod pipeline;
+mod proctable;
+mod scoring;
+mod telemetry;
+mod verify;
+
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -18,15 +29,14 @@ use serde_json::{json, Value};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
 
-use aegisd::config::{Config, ConfigHandle};
-use aegisd::enforce::enforcer::{spawn_enforcer, EnforceJob, EnforcerHandle};
-use aegisd::enforce::nft::Nft;
-use aegisd::enforce::systemd::{Limits, Systemd};
-use aegisd::incident::{IncidentId, IncidentStore};
-use aegisd::pipeline::{EnvReaders, ExeKey, Incidents, Pipeline};
-use aegisd::telemetry::{mode_str, Sinks};
-use aegisd::verify::{Rpm, Verification, Verifier};
-use aegisd::{ebpf, ipc, pipeline, scoring, telemetry};
+use crate::config::{Config, ConfigHandle};
+use crate::enforce::enforcer::{spawn_enforcer, EnforceJob, EnforcerHandle};
+use crate::enforce::nft::Nft;
+use crate::enforce::systemd::{Limits, Systemd};
+use crate::incident::{IncidentId, IncidentStore};
+use crate::pipeline::{EnvReaders, ExeKey, Incidents, Pipeline};
+use crate::telemetry::{mode_str, Sinks};
+use crate::verify::{Rpm, Verification, Verifier};
 
 /// Incident writes queued to the writer thread at once.
 const INCIDENT_QUEUE: usize = 256;
