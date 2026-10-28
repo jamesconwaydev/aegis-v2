@@ -616,8 +616,7 @@ fn end_enforce(remote: &Remote) -> Result<()> {
         Ok(left) => {
             for (id, verb) in left {
                 match remote.try_run(&format!("aegisctl incidents {verb} {id}")) {
-                    // Ended by the scenario itself (release-enforce, say).
-                    Ok((ok, out, err)) if !ok && !format!("{out}{err}").contains("is already") => {
+                    Ok((false, out, err)) => {
                         errs.push(format!("{verb} {id}: {} {}", out.trim(), err.trim()))
                     }
                     Ok(_) => {}
@@ -646,13 +645,16 @@ fn end_enforce(remote: &Remote) -> Result<()> {
     }
 }
 
-/// Each incident aegisd acted on, with the command that ends it: a
-/// quarantine is killed, a throttle released.
+/// Each incident aegisd acted on and still holds, with the command that
+/// ends it: a quarantine is killed, a throttle released.
 fn enforced(json: &str) -> Result<Vec<(String, &'static str)>> {
     let v: serde_json::Value = serde_json::from_str(json).context("incidents list --json")?;
     Ok(v.as_array()
         .context("expected a JSON array")?
         .iter()
+        // Only what is still in place: one the scenario ended itself
+        // (release-enforce, say) would be refused.
+        .filter(|i| i["state"] == "held")
         .filter_map(|i| {
             let verb = match i["verdict"].as_str()? {
                 "quarantined" => "kill",
@@ -733,8 +735,12 @@ mod tests {
 
     #[test]
     fn enforced_incidents_and_how_they_end() {
-        let j = r#"[{"id":"AEG-1","verdict":"quarantined"},{"id":"AEG-2","verdict":"throttled"},
-                   {"id":"AEG-3","verdict":"would_quarantine"}]"#;
+        let j = r#"[{"id":"AEG-1","verdict":"quarantined","state":"held"},
+                   {"id":"AEG-2","verdict":"throttled","state":"held"},
+                   {"id":"AEG-3","verdict":"would_quarantine","state":"held"},
+                   {"id":"AEG-4","verdict":"quarantined","state":"released"},
+                   {"id":"AEG-5","verdict":"throttled","state":"killed"},
+                   {"id":"AEG-6","verdict":"quarantined"}]"#;
         assert_eq!(
             enforced(j).unwrap(),
             [("AEG-1".into(), "kill"), ("AEG-2".into(), "release")]

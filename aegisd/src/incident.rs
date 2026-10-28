@@ -604,6 +604,7 @@ impl IncidentStore {
                 max_score: i.max_score,
                 root_tgid: i.root.tgid,
                 actions: i.actions.len(),
+                state: crate::enforce::enforcer::summary_state(&i.actions).map(String::from),
             })
             .collect()
     }

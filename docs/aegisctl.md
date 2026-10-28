@@ -115,10 +115,21 @@ aegisctl incidents list
 
 <!-- markdownlint-disable MD013 -->
 ```text
-ID                                    VERDICT           SCORE  ROOT PID  CREATED               UPDATED
-AEG-20261019-093000-0123456789abcdef  would_quarantine  85.0   4242      2026-10-19T09:30:00Z  2026-10-19T09:30:02Z
+ID                                    VERDICT           STATE     SCORE  ROOT PID  CREATED               UPDATED
+AEG-20261019-093000-0123456789abcdef  would_quarantine  -         85.0   4242      2026-10-19T09:30:00Z  2026-10-19T09:30:02Z
+AEG-20261020-141500-fedcba9876543210  quarantined       released  92.5   5150      2026-10-20T14:15:00Z  2026-10-20T14:31:40Z
 ```
 <!-- markdownlint-enable MD013 -->
+
+`VERDICT` is history: what aegisd decided, and it never goes back down.
+`STATE` (from v0.2.1) is what's in place now. `held` means the
+enforcement is still on the tree, whether that's a throttle, a
+quarantine, or only the kernel hold after a failed move. `released` and
+`killed` mean someone ended it with `incidents release` or `kill`, and
+`expired` means it came from an earlier boot. A `-` means nothing was
+ever enforced, which is every incident in audit mode. So the second row
+above was quarantined and then let go. `--json` carries the same value
+as `state`, or `null` for `-`.
 
 `SCORE` is the highest score the incident reached. The list holds
 incidents updated in the last 30 days; older ones are still on disk.

@@ -348,6 +348,21 @@ fn state(acts: &[ActionRecord]) -> Option<&str> {
     last_state(acts).map(|a| a.kind.as_str())
 }
 
+/// What enforcement left in place, for `incidents list`: held (scoped,
+/// frozen or only held), released, killed, or expired (an earlier
+/// boot). None if nothing was ever enforced.
+pub fn summary_state(acts: &[ActionRecord]) -> Option<&'static str> {
+    if !acts.iter().any(|a| a.ok || holding(a)) {
+        return None;
+    }
+    Some(match state(acts) {
+        Some("thaw" | "lift_limits") => "released",
+        Some("kill") => "killed",
+        Some("expired") => "expired",
+        _ => "held",
+    })
+}
+
 /// nft rules added and not yet removed.
 fn live_rules(acts: &[ActionRecord]) -> Vec<u64> {
     let removed: HashSet<u64> = acts
@@ -1629,6 +1644,44 @@ mod tests {
         let (r, mut rx) = reply();
         e.run(job(r));
         rx.try_recv().unwrap()
+    }
+
+    #[test]
+    fn the_incident_list_shows_what_enforcement_left_in_place() {
+        let state = |f: &Fx| f.e.store.list()[0].state.clone();
+        let mut f = fx("state-q", ok);
+        assert_eq!(state(&f), None);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        assert_eq!(state(&f).as_deref(), Some("held"));
+        let id = f.id.clone();
+        run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply }).unwrap();
+        assert_eq!(state(&f).as_deref(), Some("released"));
+
+        let mut f = fx("state-k", ok);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let id = f.id.clone();
+        run_reply(&mut f.e, |reply| EnforceJob::Kill { id, reply }).unwrap();
+        assert_eq!(state(&f).as_deref(), Some("killed"));
+
+        // The move failed, but the tree is held.
+        let mut f = fx("state-h", |p, a| {
+            if a.get(4).is_some_and(|m| m == "StartTransientUnit") {
+                bail!("busctl: refused")
+            }
+            ok(p, a)
+        });
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        assert_eq!(f.incident().verdict, "would_quarantine");
+        assert_eq!(state(&f).as_deref(), Some("held"));
     }
 
     #[test]

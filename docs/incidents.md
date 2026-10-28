@@ -112,6 +112,12 @@ enforce mode can also write `throttled` and `quarantined`, and only
 after the action succeeded. If it failed, the verdict stays at
 `would_*` and the failure is in `actions`. A verdict never moves down.
 
+So a verdict is history. A tree you released still says `quarantined`.
+For what's in place now, `aegisctl incidents list` has a `STATE` column
+from v0.2.1, worked out from `actions`: `held` while the throttle,
+quarantine or bare kernel hold is still on, then `released`, `killed` or
+`expired` once it's ended, and `-` if nothing was ever enforced.
+
 If aegisd can't move a tree into its quarantine scope, it doesn't try
 again. The tree stays held but not frozen, and the incident stays
 `would_quarantine` with the error recorded. Later processes that join

@@ -108,6 +108,11 @@ pub struct IncidentSummary {
     /// Enforcer actions recorded so far; 0 from a pre-v0.2 daemon.
     #[serde(default)]
     pub actions: usize,
+    /// What enforcement left in place now: `held`, `released`, `killed`
+    /// or `expired`. None if nothing was enforced (audit mode), or from
+    /// a pre-v0.2.1 daemon.
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 /// Whether `id` has the shape of an incident id,
