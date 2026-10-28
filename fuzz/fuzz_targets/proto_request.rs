@@ -18,7 +18,11 @@ fuzz_target!(|line: &[u8]| {
     | Request::IncidentRelease { id }
     | Request::IncidentKill { id } = req
     {
-        is_incident_id(&id);
-        clean(&id);
+        // An accepted id becomes a directory name.
+        if is_incident_id(&id) {
+            assert!(!id.contains(['/', '.', '\0']), "{id:?}");
+        }
+        // clean promises one printable line.
+        assert!(!clean(&id).chars().any(char::is_control), "{id:?}");
     }
 });

@@ -10,7 +10,7 @@ use aegisd::config::Config;
 use libfuzzer_sys::fuzz_target;
 
 static DIR: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
-    let d = std::env::temp_dir().join(format!("aegis-fuzz-config-{}", std::process::id()));
+    let d = aegis_fuzz::scratch_dir("config");
     fs::create_dir_all(d.join("allowlist.d")).unwrap();
     d
 });

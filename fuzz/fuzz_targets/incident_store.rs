@@ -13,7 +13,7 @@ use libfuzzer_sys::fuzz_target;
 const ID: &str = "AEG-20261028-120000-0123456789abcdef";
 
 static DIR: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
-    let d = std::env::temp_dir().join(format!("aegis-fuzz-incident-{}", std::process::id()));
+    let d = aegis_fuzz::scratch_dir("incident");
     fs::create_dir_all(d.join(ID)).unwrap();
     d
 });
