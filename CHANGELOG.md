@@ -6,6 +6,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- On a host up for more than about 5.8 years, aegisd worked out every
+  new process's start time wrong, so it took live processes for exited
+  ones: it dropped them from its process table, treated their
+  environments as unreadable, and left them out of a quarantine or
+  throttle. The overflow behind it is gone.
+
 ## [0.2.2] - 2026-10-28
 
 A security fix, nothing else. If you send telemetry over HTTPS (OTLP or
