@@ -87,6 +87,14 @@ install -Dpm 0644 -t %{buildroot}%{_licensedir}/%{name} \
 
 %postun
 %systemd_postun_with_restart aegisd.service
+# On erase, enforce mode's slices outlive the package: stop them, which
+# kills any tree still quarantined, since nothing is left to release it.
+# Drop its nftables table, and have systemd forget the removed unit.
+if [ $1 -eq 0 ]; then
+    systemctl stop aegis.slice 2>/dev/null || :
+    nft delete table inet aegis 2>/dev/null || :
+    systemctl daemon-reload 2>/dev/null || :
+fi
 
 # The selinux-policy macros: install or remove the module, then relabel
 # whatever its file contexts changed.
