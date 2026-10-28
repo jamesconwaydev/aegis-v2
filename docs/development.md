@@ -165,8 +165,8 @@ cargo xtask rpm --arch x86_64
 ```
 
 That's a release build, then rpmbuild, both in the container. You get
-two RPMs in `dist/rpm/`: `aegis-v2-0.2.0-1.el10.x86_64.rpm` and the
-noarch `aegis-v2-selinux-0.2.0-1.el10.noarch.rpm`. The spec is
+two RPMs in `dist/rpm/`: `aegis-v2-0.2.1-1.el10.x86_64.rpm` and the
+noarch `aegis-v2-selinux-0.2.1-1.el10.noarch.rpm`. The spec is
 `packaging/aegis-v2.spec`, the unit is `packaging/aegisd.service`, and
 the policy module lives in `selinux/`.
 

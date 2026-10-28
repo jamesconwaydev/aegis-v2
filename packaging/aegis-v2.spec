@@ -145,6 +145,12 @@ systemctl try-restart aegisd.service 2>/dev/null || :
 %{_datadir}/selinux/packages/%{selinuxtype}/aegis.pp
 
 %changelog
+* Wed Oct 28 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.2.1-1
+- Put a quarantined tree's drop rule back within about 10 seconds when
+  an nftables reload removes it, and find rules by cgroup on release.
+- Add a STATE column to incidents list, retry a freeze that didn't take,
+  and wait for the enforcer on shutdown.
+
 * Wed Oct 28 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.2.0-1
 - Enforce mode: throttle and quarantine a process tree, with release
   and kill through aegisctl.

@@ -36,7 +36,7 @@ aegisctl status
 Shows the daemon's version, mode and health counters, then its probes.
 
 ```text
-version                                0.2.0
+version                                0.2.1
 mode                                   audit
 uptime                                 2h 14m
 events                                 1843920
