@@ -6,6 +6,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- OTLP and webhook TLS used webpki-root-certs 1.0.9, which still trusted
+  intermediates from the distrusted emSign roots
+  ([RUSTSEC-2026-0383](https://rustsec.org/advisories/RUSTSEC-2026-0383)).
+  It's now 1.0.11.
+
 ## [0.2.1] - 2026-10-28
 
 v0.2.0 made Aegis act. This release closes the hole a routine
