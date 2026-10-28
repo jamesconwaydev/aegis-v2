@@ -25,7 +25,9 @@ quarantine caught mid-flight by that restart may still go unrecorded.
   kill also stop trusting the handle they recorded, which a reload
   could hand to another incident's rule: they look the rule up by the
   tree's cgroup and delete only that. Kill looks it up before the
-  SIGKILL, while nftables can still name the cgroup. If the rule's
+  SIGKILL, while nftables can still name the cgroup. If the scope is
+  already gone, release falls back to the recorded handle, but only
+  when nftables shows that rule with a bare cgroup id. If the rule's
   already gone, release still succeeds and says so. (#53)
 - **A quarantine on a busy host gets frozen, not just held.** busctl
   hands back as soon as systemd queues the scope's start job, so the
