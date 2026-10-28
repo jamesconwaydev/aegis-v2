@@ -294,7 +294,7 @@ if ! systemctl is-active -q nftables; then
 fi
 systemctl reload nftables
 nft list table inet aegis >/dev/null 2>&1 && exit 1
-# Another rule takes the freed handle before the sweep runs.
+# Another rule takes the freed handle before the next 10-second check.
 nft add table inet aegis
 nft add chain inet aegis out '{ type filter hook output priority 0; policy accept; }'
 nft add rule inet aegis out meta mark 0x0ae91500 counter

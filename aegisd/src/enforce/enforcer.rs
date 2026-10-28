@@ -68,7 +68,7 @@ pub enum EnforceJob {
         id: String,
         reply: Option<Reply>,
     },
-    /// Sent on the sweep tick: put back any quarantined tree's drop rule
+    /// Sent every 10 seconds: put back any quarantined tree's drop rule
     /// that a ruleset flush removed.
     Reassert,
 }
@@ -819,7 +819,7 @@ impl Enforcer {
                 .is_some_and(|a| !a.ok)
             {
                 // Already on the record as failing: say it again only
-                // in the journal, not once a minute on the incident.
+                // in the journal, not every 10 seconds on the incident.
                 eprintln!("aegisd: {id}: {}", a.error.unwrap_or_default());
                 continue;
             }
@@ -2199,7 +2199,7 @@ mod tests {
             a.detail.as_deref(),
             Some("re-added after the table was removed")
         );
-        // Back in place: the next sweep only looks.
+        // Back in place: the next check only looks.
         let n = f.incident().actions.len();
         f.e.run(EnforceJob::Reassert);
         assert_eq!(take().len(), 1);
@@ -2258,7 +2258,7 @@ mod tests {
     fn release_deletes_the_live_handle_not_a_reused_one() {
         let (mut f, cg) = quarantined("re-reused");
         assert_eq!(f.incident().actions.last().unwrap().nft_handle, Some(7));
-        // A flush, then another rule takes handle 7 before the sweep
+        // A flush, then another rule takes handle 7 before the next check
         // puts this incident's back as 8.
         let other = "aegis.slice/aegis-quarantine.slice/other-q.scope".to_string();
         set_rules(Some(vec![(7, other.clone())]));
