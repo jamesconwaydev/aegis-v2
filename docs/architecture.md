@@ -284,8 +284,14 @@ them, never pid 1, kthreadd, aegisd, or an ancestor of the tree.
   they can't crowd out an escalation. A release or kill request stops
   them for that incident.
 - **Release:** remove the holds while the tree is still frozen, thaw
-  it, then delete its nftables rule. A throttle's limits are lifted
-  instead.
+  it, then delete its nftables rule, found by the scope's cgroup in
+  `nft -a list chain inet aegis out` rather than by the recorded
+  handle. A throttle's limits are lifted instead.
+- **Re-assert:** every sweep (60 seconds) the event loop queues a job
+  that checks each tree still quarantined in this boot, and still
+  frozen, has its rule. Any missing after a ruleset flush is added
+  again, with the table and chain if they went too. With nothing
+  quarantined it never runs `nft`.
 - **Earlier boot:** release or kill of an incident whose `boot_id`
   isn't this boot's runs nothing and records `expired`.
 

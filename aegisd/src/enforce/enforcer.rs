@@ -68,6 +68,9 @@ pub enum EnforceJob {
         id: String,
         reply: Option<Reply>,
     },
+    /// Sent on the sweep tick: put back any quarantined tree's drop rule
+    /// that a ruleset flush removed.
+    Reassert,
 }
 
 pub struct EnforcerHandle {
@@ -139,7 +142,7 @@ impl EnforcerHandle {
             }
             EnforceJob::Throttle { id, pids } => (id, Tier::Throttle, pids.first()),
             EnforceJob::Quarantine { id, pids } => (id, Tier::Quarantine, pids.first()),
-            EnforceJob::Release { .. } | EnforceJob::Kill { .. } => return,
+            EnforceJob::Release { .. } | EnforceJob::Kill { .. } | EnforceJob::Reassert => return,
         };
         let reason = "enforcement failed: queue full, nothing was done".to_string();
         eprintln!("aegisd: {id}: {reason}");
@@ -286,6 +289,7 @@ fn act(kind: &str, unit: Option<&str>, pids: Vec<u32>, r: Result<Option<u64>>) -
         pids,
         start_times: Vec::new(),
         error,
+        detail: None,
         ts: rfc3339(now_ns()),
     }
 }
@@ -373,6 +377,7 @@ impl Enforcer {
                     let _ = tx.send(r);
                 }
             }
+            EnforceJob::Reassert => self.reassert(),
         }
     }
 
@@ -624,8 +629,8 @@ impl Enforcer {
                 }
                 acts.push(a);
             }
-            self.remove_rules(&prior, &unit, &mut acts);
-            done = format!("released {id}: thawed, network restored");
+            let gone = self.remove_rules(&prior, &unit, &mut acts);
+            done = format!("released {id}: thawed, network restored{gone}");
             // The tree stays in its -q scope, so its accounting
             // lives under aegis-quarantine.slice. Moving it back to its
             // original unit is AttachProcessesToUnit, if that's ever wanted.
@@ -656,8 +661,8 @@ impl Enforcer {
         // A frozen cgroup still takes SIGKILL.
         let r = self.sys.kill(&unit);
         let mut acts = vec![act("kill", Some(&unit), vec![], r.map(|_| None))];
-        self.remove_rules(&prior, &unit, &mut acts);
-        self.conclude(id, acts, format!("killed {id}"))
+        let gone = self.remove_rules(&prior, &unit, &mut acts);
+        self.conclude(id, acts, format!("killed {id}{gone}"))
     }
 
     /// Refuses an incident never enforced, or already released or killed.
@@ -677,8 +682,7 @@ impl Enforcer {
     /// that boot, and its tgids and nft handles may name something else
     /// now. Nothing on the host is touched; it is recorded as ended.
     fn expire(&mut self, id: &str) -> Option<Result<String, String>> {
-        let now = self.store.boot_id().unwrap_or_default();
-        if self.store.get(&IncidentId(id.into()))?.boot_id == now {
+        if !self.earlier_boot(id)? {
             return None;
         }
         let a = act("expired", None, vec![], Ok(None));
@@ -689,10 +693,103 @@ impl Enforcer {
         ))
     }
 
-    fn remove_rules(&self, prior: &[ActionRecord], unit: &str, acts: &mut Vec<ActionRecord>) {
-        for h in live_rules(prior) {
+    /// Whether the incident is from an earlier boot; None if unknown.
+    fn earlier_boot(&self, id: &str) -> Option<bool> {
+        let now = self.store.boot_id().unwrap_or_default();
+        Some(self.store.get(&IncidentId(id.into()))?.boot_id != now)
+    }
+
+    /// Deletes the incident's drop rules by the handles the live chain
+    /// shows now, never the recorded ones: after a ruleset flush a
+    /// recorded handle may belong to another incident's rule. Returns
+    /// what the reply should add when there was no rule left to delete.
+    fn remove_rules(
+        &self,
+        prior: &[ActionRecord],
+        unit: &str,
+        acts: &mut Vec<ActionRecord>,
+    ) -> &'static str {
+        if !prior.iter().any(|a| a.ok && a.kind == "nft_drop") {
+            return "";
+        }
+        let cg = Nft::scope_cgroup(QUARANTINE_SLICE, unit);
+        let live = match self.nft.list() {
+            Ok(l) => l.map(|l| Nft::handles(&l, &cg)).unwrap_or_default(),
+            Err(e) => {
+                acts.push(act("nft_remove", Some(unit), vec![], Err(e)));
+                return "";
+            }
+        };
+        if live.is_empty() {
+            let mut a = act("nft_remove", Some(unit), vec![], Ok(None));
+            a.detail = Some("the rule was already gone".into());
+            acts.push(a);
+            return "; its drop rule was already gone";
+        }
+        for h in live {
             let r = self.nft.remove(h);
             acts.push(act("nft_remove", Some(unit), vec![], r.map(|()| Some(h))));
+        }
+        ""
+    }
+
+    /// Puts back the drop rule of each tree still quarantined in this
+    /// boot whose rule a ruleset flush removed, recreating the table if
+    /// it went too. A poll on the sweep tick, so a tree can have its
+    /// network for up to one sweep. Nothing quarantined, no nft call.
+    fn reassert(&mut self) {
+        let ids: Vec<String> = self
+            .store
+            .list()
+            .into_iter()
+            .filter(|s| s.verdict == "quarantined")
+            .map(|s| s.id)
+            .filter(|id| self.earlier_boot(id) == Some(false))
+            .filter(|id| {
+                matches!(
+                    state(&self.actions(id)),
+                    Some("scope" | "attach" | "freeze")
+                )
+            })
+            // A tree no longer frozen has exited, leaving no cgroup for
+            // a rule to match, or was thawed outside aegisctl.
+            .filter(|id| matches!(self.sys.is_frozen(QUARANTINE_SLICE, &q_unit(id)), Ok(true)))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let (listing, why) = match self.nft.list() {
+            Ok(Some(l)) => (l, "re-added after the rule was removed"),
+            Ok(None) => match self.nft.ensure_table() {
+                Ok(()) => (String::new(), "re-added after the table was removed"),
+                Err(e) => return eprintln!("aegisd: recreating the nft table: {e:#}"),
+            },
+            Err(e) => return eprintln!("aegisd: listing the nft table: {e:#}"),
+        };
+        for id in ids {
+            let unit = q_unit(&id);
+            let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &unit);
+            if !Nft::handles(&listing, &cg).is_empty() {
+                continue;
+            }
+            let r = self.nft.drop_cgroup(&cg);
+            let mut a = act("nft_drop", Some(&unit), vec![], r.map(Some));
+            a.detail = Some(why.into());
+            if a.ok {
+                eprintln!("aegisd: {id}: drop rule {why}");
+            } else if self
+                .actions(&id)
+                .iter()
+                .rev()
+                .find(|a| a.kind == "nft_drop")
+                .is_some_and(|a| !a.ok)
+            {
+                // Already on the record as failing: say it again only
+                // in the journal, not once a minute on the incident.
+                eprintln!("aegisd: {id}: {}", a.error.unwrap_or_default());
+                continue;
+            }
+            self.finish(&id, vec![a], None);
         }
     }
 
@@ -847,16 +944,63 @@ mod tests {
 
     thread_local! {
         static CALLS: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+        /// The fake nft's `inet aegis out`: None while there is no table.
+        static TABLE: RefCell<Option<FakeTable>> = const { RefCell::new(None) };
     }
 
-    /// Records `prog args…`; nft's echo carries rule handle 7.
+    /// Records `prog args…`. nft keeps its table in TABLE, where a new
+    /// table's first rule gets handle 7.
     fn ok(prog: &str, a: &[String]) -> Result<String> {
         CALLS.with(|c| c.borrow_mut().push([&[prog.to_string()], a].concat()));
-        Ok(if a.first().is_some_and(|s| s == "--echo") {
-            "add rule inet aegis out ... drop # handle 7\n".into()
-        } else {
-            String::new()
-        })
+        if prog != "/usr/sbin/nft" {
+            return Ok(String::new());
+        }
+        TABLE.with(|t| fake_nft(&mut t.borrow_mut(), a))
+    }
+
+    /// The next handle, and each rule's (handle, cgroup path).
+    type FakeTable = (u64, Vec<(u64, String)>);
+
+    fn fake_nft(t: &mut Option<FakeTable>, a: &[String]) -> Result<String> {
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        let gone = || anyhow::anyhow!("nft: exit Some(1): Error: No such file or directory");
+        match a[..] {
+            ["add", "table", ..] => {
+                t.get_or_insert((7, Vec::new()));
+            }
+            ["--echo", ..] => {
+                let (next, rules) = t.as_mut().ok_or_else(gone)?;
+                rules.push((*next, a[a.len() - 3].into()));
+                *next += 1;
+                return Ok(format!("add rule ... drop # handle {}\n", *next - 1));
+            }
+            ["-a", "list", ..] => {
+                let (_, rules) = t.as_ref().ok_or_else(gone)?;
+                return Ok(rules
+                    .iter()
+                    .map(|(h, cg)| format!("socket cgroupv2 level 3 \"{cg}\" drop # handle {h}\n"))
+                    .collect());
+            }
+            ["delete", "rule", .., h] => {
+                let (_, rules) = t.as_mut().ok_or_else(gone)?;
+                let n = rules.len();
+                rules.retain(|r| r.0.to_string() != h);
+                if rules.len() == n {
+                    bail!("nft: exit Some(1): Error: Could not process rule");
+                }
+            }
+            _ => {}
+        }
+        Ok(String::new())
+    }
+    /// What the fake nft table holds now: (handle, cgroup path).
+    fn rules() -> Option<Vec<(u64, String)>> {
+        TABLE.with(|t| t.borrow().as_ref().map(|t| t.1.clone()))
+    }
+    fn set_rules(r: Option<Vec<(u64, String)>>) {
+        TABLE.with(|t| {
+            *t.borrow_mut() = r.map(|r| (r.iter().map(|x| x.0 + 1).max().unwrap_or(7), r))
+        });
     }
     fn fail_freeze(prog: &str, a: &[String]) -> Result<String> {
         if a.first().is_some_and(|s| s == "freeze") {
@@ -933,6 +1077,7 @@ mod tests {
     /// tgid 10, telemetry going to `<dir>.jsonl`.
     fn fx(name: &str, run: Run) -> Fx {
         take();
+        set_rules(None);
         let dir = std::env::temp_dir().join(format!("aegis-enf-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = IncidentStore::open_at(&dir, Some("boot".into()), 0).unwrap();
@@ -1155,7 +1300,8 @@ mod tests {
         assert_eq!(r, Ok(format!("released {id}: thawed, network restored")));
         let c = take();
         assert_eq!(c[0][1], "thaw");
-        assert_eq!(c[1][1..3], ["delete".to_string(), "rule".into()]);
+        assert_eq!(c[1][1..3], ["-a".to_string(), "list".into()]);
+        assert_eq!(c[2][1..3], ["delete".to_string(), "rule".into()]);
     }
 
     #[test]
@@ -1253,8 +1399,9 @@ mod tests {
                 format!("aegis-incident-{}-q.scope", f.id)
             ]
         );
-        assert_eq!(c[1][1..3], ["delete".to_string(), "rule".into()]);
-        assert_eq!(c[1].last().unwrap(), "7");
+        assert_eq!(c[1][1..3], ["-a".to_string(), "list".into()]);
+        assert_eq!(c[2][1..3], ["delete".to_string(), "rule".into()]);
+        assert_eq!(c[2].last().unwrap(), "7");
         assert_eq!(f.e.holds.held(), 0);
         let kinds = f.kinds();
         assert_eq!(
@@ -1399,8 +1546,9 @@ mod tests {
             c[0][1..3],
             ["thaw".to_string(), format!("aegis-incident-{id}-q.scope")]
         );
-        assert_eq!(c[1][1..3], ["delete".to_string(), "rule".into()]);
-        assert_eq!(c[1].last().unwrap(), "7");
+        assert_eq!(c[1][1..3], ["-a".to_string(), "list".into()]);
+        assert_eq!(c[2][1..3], ["delete".to_string(), "rule".into()]);
+        assert_eq!(c[2].last().unwrap(), "7");
     }
 
     #[test]
@@ -1437,7 +1585,8 @@ mod tests {
         });
         let c = take();
         assert_eq!(c[0][1..3], ["kill".to_string(), "--signal=SIGKILL".into()]);
-        assert_eq!(c[1][1..3], ["delete".to_string(), "rule".into()]);
+        assert_eq!(c[1][1..3], ["-a".to_string(), "list".into()]);
+        assert_eq!(c[2][1..3], ["delete".to_string(), "rule".into()]);
         let kinds = f.kinds();
         assert_eq!(
             kinds[4..],
@@ -1966,5 +2115,141 @@ mod tests {
         assert!(take().is_empty());
         assert_eq!(std::fs::read(&file).unwrap(), before);
         UNIT.with(|u| u.borrow_mut().clear());
+    }
+
+    /// A quarantined fixture whose scope the kernel reports frozen.
+    fn quarantined(name: &str) -> (Fx, String) {
+        let mut f = fx(name, ok);
+        f.e.sys = Systemd::with(ok, alive).with_events(frozen);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        take();
+        let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &q_unit(&f.id));
+        (f, cg)
+    }
+
+    fn last_act(f: &Fx) -> ActionRecord {
+        f.incident().actions.last().unwrap().clone()
+    }
+
+    #[test]
+    fn reassert_recreates_a_flushed_table_and_the_rule() {
+        let (mut f, cg) = quarantined("re-table");
+        set_rules(None);
+        f.e.run(EnforceJob::Reassert);
+        let heads: Vec<String> = take().iter().map(|c| c[1..3].join(" ")).collect();
+        assert_eq!(
+            heads,
+            ["-a list", "add table", "add chain", "--echo --handle"]
+        );
+        assert_eq!(rules(), Some(vec![(7, cg)]));
+        let a = last_act(&f);
+        assert_eq!(
+            (a.kind.as_str(), a.ok, a.nft_handle),
+            ("nft_drop", true, Some(7))
+        );
+        assert_eq!(
+            a.detail.as_deref(),
+            Some("re-added after the table was removed")
+        );
+        // Back in place: the next sweep only looks.
+        let n = f.incident().actions.len();
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(take().len(), 1);
+        assert_eq!(f.incident().actions.len(), n);
+    }
+
+    #[test]
+    fn reassert_readds_a_missing_rule() {
+        let (mut f, cg) = quarantined("re-rule");
+        set_rules(Some(vec![(9, "aegis.slice/other.scope".into())]));
+        f.e.run(EnforceJob::Reassert);
+        let heads: Vec<String> = take().iter().map(|c| c[1..3].join(" ")).collect();
+        assert_eq!(heads, ["-a list", "--echo --handle"]);
+        assert_eq!(
+            rules(),
+            Some(vec![(9, "aegis.slice/other.scope".into()), (10, cg)])
+        );
+        let a = last_act(&f);
+        assert_eq!(
+            a.detail.as_deref(),
+            Some("re-added after the rule was removed")
+        );
+        assert_eq!(a.nft_handle, Some(10));
+    }
+
+    #[test]
+    fn reassert_with_nothing_quarantined_never_runs_nft() {
+        // Recorded, never enforced.
+        let mut f = fx("re-none", ok);
+        f.e.sys = Systemd::with(ok, alive).with_events(frozen);
+        f.e.run(EnforceJob::Reassert);
+        assert!(take().is_empty());
+        // Released: thawed and ended, whatever the table holds.
+        let (mut f, _) = quarantined("re-released");
+        let id = f.id.clone();
+        run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply }).unwrap();
+        set_rules(None);
+        take();
+        f.e.run(EnforceJob::Reassert);
+        assert!(take().is_empty());
+        // From an earlier boot: its scope and rule went with that boot.
+        let (mut f, _) = quarantined("re-oldboot");
+        f.e.store = Arc::new(IncidentStore::open_at(&f.dir, Some("later".into()), 0).unwrap());
+        set_rules(None);
+        f.e.run(EnforceJob::Reassert);
+        assert!(take().is_empty());
+        // Every process gone: no cgroup for a rule to match.
+        let (mut f, _) = quarantined("re-exited");
+        f.e.sys = Systemd::with(ok, alive).with_events(no_cgroup);
+        set_rules(None);
+        f.e.run(EnforceJob::Reassert);
+        assert!(take().is_empty());
+    }
+
+    #[test]
+    fn release_deletes_the_live_handle_not_a_reused_one() {
+        let (mut f, cg) = quarantined("re-reused");
+        assert_eq!(f.incident().actions.last().unwrap().nft_handle, Some(7));
+        // A flush, then another rule takes handle 7 before the sweep
+        // puts this incident's back as 8.
+        let other = "aegis.slice/aegis-quarantine.slice/other-q.scope".to_string();
+        set_rules(Some(vec![(7, other.clone())]));
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(rules(), Some(vec![(7, other.clone()), (8, cg)]));
+        take();
+        let id = f.id.clone();
+        let r = run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply });
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(rules(), Some(vec![(7, other)]));
+        let a = last_act(&f);
+        assert_eq!((a.kind.as_str(), a.nft_handle), ("nft_remove", Some(8)));
+    }
+
+    #[test]
+    fn release_succeeds_when_the_rule_is_already_gone() {
+        for kill in [false, true] {
+            let (mut f, _) = quarantined(&format!("re-gone-{kill}"));
+            set_rules(None);
+            let id = f.id.clone();
+            let r = run_reply(&mut f.e, |reply| {
+                if kill {
+                    EnforceJob::Kill { id, reply }
+                } else {
+                    EnforceJob::Release { id, reply }
+                }
+            })
+            .unwrap();
+            assert!(r.ends_with("; its drop rule was already gone"), "{r}");
+            assert!(!take().iter().any(|c| c[1] == "delete"));
+            let a = last_act(&f);
+            assert_eq!(
+                (a.kind.as_str(), a.ok, a.nft_handle),
+                ("nft_remove", true, None)
+            );
+            assert_eq!(a.detail.as_deref(), Some("the rule was already gone"));
+        }
     }
 }

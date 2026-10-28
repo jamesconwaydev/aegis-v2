@@ -240,15 +240,17 @@ nft list table inet aegis
 ```
 
 If it isn't, something flushed the ruleset: `systemctl reload
-nftables`, a firewall tool, or `nft flush ruleset`. That removes the
-table and every quarantined tree's drop rule with it, and aegisd
-doesn't put it back yet (planned for v0.2.1). The trees are still
-frozen, so they can't use the network until something thaws them.
-Release or kill the affected incidents one at a time, checking the
-table after each. Release then reports the missing rule as an error;
-the tree is still released. See the
-[threat model](threat-model.md#reloading-nftables-frees-quarantined-trees).
-Avoid reloading nftables while a tree is quarantined.
+nftables`, a firewall tool, or `nft flush ruleset`. You don't need to
+do anything. Within a minute aegisd's sweep puts the table back, with a
+drop rule for each tree that's still quarantined, and the trees stay
+frozen in the meantime. `aegisctl incidents show <id>` then lists an
+`nft_drop` re-added after the table was removed.
+
+Still no rule after a minute? Look in the journal
+(`journalctl -u aegisd`) for the `nft` error. A tree that's no longer
+frozen gets no rule back: its processes have all exited, or something
+thawed it outside `aegisctl`. See the
+[threat model](threat-model.md#reloading-nftables-opens-a-gap-of-up-to-a-minute).
 
 ## A tree is still frozen after uninstalling
 

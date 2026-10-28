@@ -64,6 +64,27 @@ impl Nft {
             .context("adding the drop rule")
     }
 
+    /// The live `out` chain with rule handles, or None once a ruleset
+    /// flush (`systemctl reload nftables`) has taken the table with it.
+    pub fn list(&self) -> Result<Option<String>> {
+        match self.nft(&["-a", "list", "chain", "inet", "aegis", "out"]) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if format!("{e:#}").contains("No such file or directory") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Handles of the rules in `listing` that match `cgroup_path`. The
+    /// quotes keep one scope's path from matching a longer one.
+    pub fn handles(listing: &str, cgroup_path: &str) -> Vec<u64> {
+        let q = format!("\"{cgroup_path}\"");
+        listing
+            .lines()
+            .filter(|l| l.contains(&q))
+            .filter_map(|l| l.rsplit_once("# handle ")?.1.trim().parse().ok())
+            .collect()
+    }
+
     pub fn remove(&self, handle: u64) -> Result<()> {
         self.nft(&[
             "delete",
@@ -99,6 +120,30 @@ mod tests {
     fn drop_cgroup_returns_handle() {
         assert_eq!(Nft::with(fake).drop_cgroup("x").unwrap(), 7);
         assert!(Nft::with(junk).drop_cgroup("x").is_err());
+    }
+
+    #[test]
+    fn handles_match_the_quoted_cgroup_path_only() {
+        let l = "table inet aegis {\n\tchain out { # handle 1\n\
+                 \t\tsocket cgroupv2 level 3 \"a/b.scope\" counter packets 0 bytes 0 drop # handle 4\n\
+                 \t\tsocket cgroupv2 level 3 \"a/b.scopex\" counter packets 0 bytes 0 drop # handle 5\n\
+                 \t}\n}\n";
+        assert_eq!(Nft::handles(l, "a/b.scope"), [4]);
+        assert!(Nft::handles(l, "a/c.scope").is_empty());
+    }
+
+    #[test]
+    fn list_is_none_once_the_table_is_gone() {
+        fn gone(_: &str, _: &[String]) -> Result<String> {
+            Err(anyhow!(
+                "nft: exit Some(1): Error: No such file or directory"
+            ))
+        }
+        fn broken(_: &str, _: &[String]) -> Result<String> {
+            Err(anyhow!("nft: failed to run or timed out"))
+        }
+        assert_eq!(Nft::with(gone).list().unwrap(), None);
+        assert!(Nft::with(broken).list().is_err());
     }
 
     #[test]

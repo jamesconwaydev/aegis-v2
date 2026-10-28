@@ -317,6 +317,7 @@ pub fn incident(v: &Value, cur_boot: Option<&str>) -> String {
                     a.get("nft_handle")
                         .and_then(Value::as_u64)
                         .map(|h| format!("nft handle {h}")),
+                    a.get("detail").and_then(Value::as_str).map(String::from),
                     a.get("error")
                         .and_then(Value::as_str)
                         .map(|e| format!("error: {e}")),

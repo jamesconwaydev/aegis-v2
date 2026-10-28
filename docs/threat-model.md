@@ -283,19 +283,20 @@ and the nftables rule went with the old boot. Release or kill of an
 incident from an earlier boot touches nothing on the host and records
 it as ended.
 
-### Reloading nftables frees quarantined trees
+### Reloading nftables opens a gap of up to a minute
 
 Reloading nftables (`systemctl reload nftables`, or any
-`nft flush ruleset`) removes aegisd's `inet aegis` table, and every
-quarantined tree's drop rule with it, silently. A frozen tree can't use
-the network anyway, but one of its locks is gone: anything that thaws
-it finds its network back. Don't reload nftables while a tree is
-quarantined. If you did, release the affected incidents one at a time
-and check `nft list table inet aegis` after each: once the table is
-recreated, rule handles can be reused within the same boot, so a
-release could delete another incident's rule. Release then reports the
-missing rule as an error. The tree is still released. A fix that puts
-the table back is planned for v0.2.1.
+`nft flush ruleset`) takes aegisd's `inet aegis` table with it, and
+every quarantined tree's drop rule too. aegisd checks once a minute,
+on its sweep, and puts back the table and each missing rule, so for up
+to 60 seconds a quarantined tree has no drop rule. It's still frozen
+and held for all of that time, so it can't use the network unless
+something thaws it. Each rule put back is recorded on its incident as
+an `nft_drop` that says why. This is a poll, not a watch on nftables.
+
+Release no longer trusts the handle it recorded, since a reload lets
+nftables hand that number to someone else's rule. It looks the rule up
+by the tree's cgroup in the live table, and deletes that one only.
 
 ### Incident scopes are delegated
 

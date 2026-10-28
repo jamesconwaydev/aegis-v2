@@ -331,6 +331,8 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                 ticks += 1;
                 if ticks.is_multiple_of(SWEEP_TICKS) {
                     pipe.sweep();
+                    // Queued, never waited on: nft runs on the enforcer.
+                    enforcer.queue(EnforceJob::Reassert);
                 }
             }
             _ = metrics_tick.tick() => {

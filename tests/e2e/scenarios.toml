@@ -266,6 +266,44 @@ timeout 5 sh -c "while kill -0 $P || systemctl is-active -q $U; do sleep 0.1; do
 """
 
 [[scenario]]
+name = "nft-reload-enforce"
+mode = "enforce"
+run = """
+set -e
+rm -f /run/aegis-sim.pid
+setsid -f /usr/local/bin/aegis-sim memfd-exec --stay 150 </dev/null >/dev/null 2>&1
+for i in $(seq 30); do
+  I=$(aegisctl incidents list | awk '$2 == "quarantined" {print $1}')
+  [ -n "$I" ] && break; sleep 0.5
+done
+case $I in AEG-*) ;; *) exit 1 ;; esac
+case $I in *[!A-Za-z0-9-]*) exit 1 ;; esac
+S=aegis-incident-$I-q.scope
+h() { nft -a list chain inet aegis out | grep -F -- "$1" | sed -n 's/.*# handle //p'; }
+H=$(h $S)
+case $H in ''|*[!0-9]*) exit 1 ;; esac
+# Started here only if it wasn't running, and then stopped again.
+if ! systemctl is-active -q nftables; then
+  systemctl start nftables; trap 'systemctl stop nftables' EXIT
+fi
+systemctl reload nftables
+nft list table inet aegis >/dev/null 2>&1 && exit 1
+# Another rule takes the freed handle before the sweep runs.
+nft add table inet aegis
+nft add chain inet aegis out '{ type filter hook output priority 0; policy accept; }'
+nft add rule inet aegis out meta mark 0x0ae91500 counter
+[ "$(h 'mark 0x0ae91500')" = "$H" ]
+timeout 75 sh -c "until nft list chain inet aegis out | grep -qF $S; do sleep 1; done"
+aegisctl incidents show $I | grep -qF 're-added after the rule was removed'
+aegisctl incidents release $I
+nft list chain inet aegis out | grep -qF $S && exit 1
+[ "$(h 'mark 0x0ae91500')" = "$H" ]
+"""
+# One sweep (60 s) puts the rule back; release then removes that rule,
+# by its new handle, and leaves the stranger holding the old one.
+expect = "quarantined"
+
+[[scenario]]
 name = "dnf-install-enforce"
 mode = "enforce"
 run = "dnf -y install tree && dnf -y remove tree"
