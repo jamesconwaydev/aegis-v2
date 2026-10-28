@@ -14,6 +14,9 @@ pub const SOCKET: &str = "/run/aegis-v2/aegisd.sock";
 
 /// Longest request line, newline excluded.
 pub const MAX_REQUEST: usize = 64 * 1024;
+/// How long aegisctl waits for a whole reply. A daemon-side wait that
+/// answers the client must finish well inside it.
+pub const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request {

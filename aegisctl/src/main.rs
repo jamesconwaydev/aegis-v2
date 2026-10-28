@@ -56,7 +56,7 @@ enum Inc {
 }
 
 const MAX_REPLY: usize = 16 * 1024 * 1024;
-const DEADLINE: Duration = Duration::from_secs(30);
+const DEADLINE: Duration = aegis_proto::REPLY_DEADLINE;
 
 /// Read one line, at most MAX_REPLY bytes, within DEADLINE overall.
 fn read_reply(s: &mut UnixStream) -> Result<Vec<u8>, String> {

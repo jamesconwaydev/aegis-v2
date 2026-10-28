@@ -474,8 +474,11 @@ fn answer(
 }
 
 /// How long a release or kill may wait for the enforcer, which runs one
-/// job at a time and may be mid-way through a quarantine.
-const ENFORCER_WAIT: Duration = Duration::from_secs(30);
+/// job at a time and may be mid-way through a quarantine. It must stay
+/// under aegisctl's reply deadline, which starts earlier: otherwise the
+/// client gives up first and never sees "still queued".
+const ENFORCER_WAIT: Duration = Duration::from_secs(25);
+const _: () = assert!(ENFORCER_WAIT.as_secs() + 5 <= aegis_proto::REPLY_DEADLINE.as_secs());
 
 /// Hands a release or kill to the enforcer and answers when it does.
 /// The wait is in its own task so the event loop never blocks on it. It

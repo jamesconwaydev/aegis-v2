@@ -46,11 +46,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `expired`, or `-` when nothing was enforced. `--json` carries it as
   `state`. Scripts that read the table by column position will
   find `SCORE` and everything after it one column to the right.
-- **A release or kill that outlasts the 30-second wait says it's still
+- **A release or kill that outlasts the enforcer wait says it's still
   queued.** It used to say "timed out waiting for the enforcer", which
   sounded like a failure. The job always ran anyway, and running it a
-  second time got you an "is already released" error. The message now
-  tells you to check `aegisctl incidents show <id>` shortly.
+  second time got you an "is already released" error. Worse, aegisctl's
+  own 30-second deadline usually ran out first, so you saw "no reply
+  from aegisd" instead. aegisd now waits 25 seconds, then tells you to
+  check `aegisctl incidents show <id>` shortly.
 
 ## [0.2.0] - 2026-10-28
 
