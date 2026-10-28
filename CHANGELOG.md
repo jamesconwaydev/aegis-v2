@@ -6,6 +6,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-28
+
+v0.2.0 made Aegis act. This release closes the hole a routine
+`systemctl reload nftables` opened in that, and tidies what the v0.2.0
+review left behind: a STATE column that says what's in place now, a
+freeze that retries, and a shutdown that finishes its work.
+
 **Upgrading from 0.2.0.** There's nothing to migrate. Incidents 0.2.0
 recorded get their `STATE` the first time you list them. An incident
 that was quarantined and lost its rule to an earlier reload gets the
@@ -303,7 +310,8 @@ the host is stopped, moved or rewritten yet; that starts in v0.2.0.
 
 The [threat model](docs/threat-model.md) has the full list.
 
-[Unreleased]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jamesconwaydev/aegis-v2/releases/tag/v0.1.0
