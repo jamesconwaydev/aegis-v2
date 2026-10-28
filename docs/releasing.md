@@ -88,6 +88,13 @@ Publishing the release also runs the Wiki workflow, which copies
 as of the new tag. The wiki is a copy: edit `docs/`, never the wiki,
 or the next release overwrites the change.
 
+The workflow only runs for the newest release by version, prereleases
+included. A patch to an older line, published after a newer release,
+leaves the wiki alone, so it never rolls back to older docs. A page
+taken out of `docs/` and `PAGES` stays on the wiki until you delete it
+there by hand. `python3 -I .github/wiki.py --check` tests the link
+rewriting; the workflow runs it before every copy.
+
 Install the released x86_64 RPM on a freshly rebuilt test host and run
 the end-to-end scenarios against it. See
 [development](development.md#end-to-end-tests).
