@@ -68,7 +68,8 @@ aarch64 is the emulated one.
 - gcc, clang and llvm, plus the RPM tooling (`rpm-build`,
   `selinux-policy-devel`, `systemd-rpm-macros`)
 - Rust 1.99.1 with `rust-src`, clippy and rustfmt, for userspace
-- Rust `nightly-2026-10-19` with `rust-src`, for the eBPF crate
+- a Rust nightly with `rust-src` (`AEGIS_EBPF_TOOLCHAIN`), for the eBPF
+  crate and the fuzz targets
 - `bpf-linker` v0.12.0 from upstream's release binaries, checked against
   a sha256 committed in the Containerfile
 
@@ -296,17 +297,30 @@ whatever bytes it's handed:
 
 The fuzz crate sits outside the workspace, because cargo-fuzz needs
 nightly. Its `rust-toolchain.toml` pins the same nightly the image
-already carries for the eBPF crate, so all you add is cargo-fuzz. To give
-one target five minutes:
+already carries for the eBPF crate (CI fails if the two drift apart), so
+all you add is cargo-fuzz. It goes into its own volume, so only the first
+run compiles it. To give one target five minutes:
 
 ```sh
+arch=aarch64
 podman run --rm -v "$PWD:/src:z" -w /src/fuzz \
-    -v aegis-cargo-aarch64:/usr/local/cargo/registry \
-    -v aegis-target-aarch64:/target -e CARGO_TARGET_DIR=/target/fuzz \
-    aegis-build:rocky10-aarch64 sh -c '
-        cargo install cargo-fuzz --locked --version 0.13.2 &&
+    -v aegis-cargo-$arch:/usr/local/cargo/registry \
+    -v aegis-target-$arch:/target -e CARGO_TARGET_DIR=/target/fuzz \
+    -v aegis-fuzz-tools-$arch:/tools \
+    aegis-build:rocky10-$arch sh -c '
+        export PATH=/tools/bin:$PATH
+        command -v cargo-fuzz >/dev/null ||
+            cargo install cargo-fuzz --locked --version 0.13.2 --root /tools
+        cp ../Cargo.lock . &&
         cargo fuzz run config corpus/config seeds/config -- -max_total_time=300'
 ```
+
+For x86_64, set `arch=x86_64`. On a Mac, swap `podman run` for
+`docker run --platform linux/amd64`, for the reason in
+[x86_64 on Apple Silicon](#x86_64-on-apple-silicon).
+
+The `cp` gives the fuzz crate the workspace's own lockfile, so it fuzzes
+the dependency versions that ship. It isn't committed in `fuzz/`.
 
 `cargo fuzz list` names the rest. `seeds/<target>` holds a handful of
 real inputs to start from; what the fuzzer learns piles up in
