@@ -276,6 +276,8 @@ struct Row {
     /// Enforce mode only: every incident left was released or killed,
     /// and the config and host were put back.
     ended: bool,
+    /// Enforce mode only: no incident recorded a failed action.
+    acts_ok: bool,
     pass: bool,
 }
 
@@ -461,8 +463,54 @@ fn run_scenario(remote: &Remote, s: &Scenario) -> Result<Row> {
     let ended = end_enforce(remote).map_err(|e| eprintln!("  {}: ending: {e:#}", s.name));
     let mut row = row?;
     row.ended = ended.is_ok();
-    row.pass &= row.ended;
+    // Read after the ending, so a failed release or kill counts too.
+    // Fails closed: anything that can't be read is a failure.
+    row.acts_ok = match remote
+        .check(&format!(
+            "for f in {INCIDENTS}/*/incident.json; do [ -e \"$f\" ] || continue; \
+             cat \"$f\" || exit 1; done"
+        ))
+        .and_then(|t| failed_actions(&t))
+    {
+        Ok(f) if f.is_empty() => true,
+        Ok(f) => {
+            for a in f {
+                eprintln!("  {}: failed action: {a}", s.name);
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!("  {}: reading the actions: {e:#}", s.name);
+            false
+        }
+    };
+    row.pass &= row.ended && row.acts_ok;
     Ok(row)
+}
+
+/// Each failed action in `text`, one or more `incident.json` documents
+/// back to back. Enforce mode records every step it takes, and a step
+/// that failed means the scenario didn't do what its verdict says, even
+/// when the check's own pids look right.
+fn failed_actions(text: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for inc in serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>() {
+        let inc = inc.context("incident.json")?;
+        let acts = inc["actions"]
+            .as_array()
+            .with_context(|| format!("{}: no actions array", inc["id"]))?;
+        for a in acts {
+            if a["ok"] != true {
+                out.push(format!(
+                    "{} {}: {}",
+                    inc["id"].as_str().unwrap_or("?"),
+                    a["kind"].as_str().unwrap_or("?"),
+                    a["error"].as_str().unwrap_or("")
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn judge(remote: &Remote, s: &Scenario) -> Result<Row> {
@@ -523,6 +571,7 @@ fn judge(remote: &Remote, s: &Scenario) -> Result<Row> {
         ran,
         check_ok,
         ended: true,
+        acts_ok: true,
         pass,
     })
 }
@@ -652,12 +701,12 @@ fn cleanup(
 
 fn print_table(rows: &[Row]) {
     println!(
-        "\n{:<26} {:<17} {:<17} {:<5} {:<5} {:<4} {:<5} {:<5} result",
-        "scenario", "expect", "got", "avc", "etc", "ran", "check", "end"
+        "\n{:<26} {:<17} {:<17} {:<5} {:<5} {:<4} {:<5} {:<5} {:<5} result",
+        "scenario", "expect", "got", "avc", "etc", "ran", "check", "end", "acts"
     );
     for r in rows {
         println!(
-            "{:<26} {:<17} {:<17} {:<5} {:<5} {:<4} {:<5} {:<5} {}",
+            "{:<26} {:<17} {:<17} {:<5} {:<5} {:<4} {:<5} {:<5} {:<5} {}",
             r.name,
             r.expect,
             r.got,
@@ -666,6 +715,7 @@ fn print_table(rows: &[Row]) {
             if r.ran { "ok" } else { "err" },
             if r.check_ok { "ok" } else { "FAIL" },
             if r.ended { "ok" } else { "FAIL" },
+            if r.acts_ok { "ok" } else { "FAIL" },
             if r.pass { "PASS" } else { "FAIL" },
         );
     }
@@ -690,6 +740,20 @@ mod tests {
             [("AEG-1".into(), "kill"), ("AEG-2".into(), "release")]
         );
         assert!(enforced("{}").is_err());
+    }
+
+    #[test]
+    fn any_failed_action_fails_the_scenario() {
+        let ok = r#"{"id":"AEG-1","actions":[{"kind":"scope","ok":true}]}"#;
+        let bad = r#"{"id":"AEG-2","actions":[{"kind":"attach","ok":false,
+            "error":"Process migration not available on non-delegated units."}]}"#;
+        assert!(failed_actions(ok).unwrap().is_empty());
+        assert!(failed_actions("").unwrap().is_empty());
+        let f = failed_actions(&format!("{ok}\n{bad}")).unwrap();
+        assert_eq!(f.len(), 1);
+        assert!(f[0].starts_with("AEG-2 attach: Process migration"), "{f:?}");
+        assert!(failed_actions("{").is_err());
+        assert!(failed_actions(r#"{"id":"AEG-3"}"#).is_err());
     }
 
     #[test]
