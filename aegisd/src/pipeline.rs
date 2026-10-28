@@ -1170,7 +1170,14 @@ fn proc_start_ns(tgid: u32) -> Option<u64> {
 
 /// Fields 4 (ppid) and 22 (starttime, in ns) of `/proc/<tgid>/stat`.
 fn read_stat(tgid: u32) -> Option<(u32, u64)> {
-    let stat = std::fs::read_to_string(format!("/proc/{tgid}/stat")).ok()?;
+    parse_stat(
+        &std::fs::read_to_string(format!("/proc/{tgid}/stat")).ok()?,
+        clk_tck(),
+    )
+}
+
+/// `read_stat` on the file's text, with `hz` clock ticks a second.
+pub fn parse_stat(stat: &str, hz: u64) -> Option<(u32, u64)> {
     // comm (field 2) is parenthesised and may hold spaces or ')': the
     // fields after it start at the last ')'.
     let rest: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
@@ -1178,13 +1185,36 @@ fn read_stat(tgid: u32) -> Option<(u32, u64)> {
     // (field 22) the 20th.
     let ppid = rest.get(1)?.parse().ok()?;
     let ticks: u64 = rest.get(19)?.parse().ok()?;
-    Some((ppid, ticks * 1_000_000_000 / clk_tck()))
+    // In u128: at 100 ticks a second, ticks * 10^9 passes u64::MAX once
+    // a host has been up 5.8 years.
+    let ns = (u128::from(ticks) * 1_000_000_000).checked_div(u128::from(hz))?;
+    Some((ppid, u64::try_from(ns).ok()?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use aegis_common::{ENV_LOADER_VAR, ENV_TRUNCATED, ENV_UNREADABLE, EXEC_FROM_TMP};
+
+    #[test]
+    fn stat_start_time_survives_years_of_uptime() {
+        // Started 6.3 years after boot, at 100 ticks a second.
+        let line = "7 (a b) c) S 1 7 7 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 \
+                    20000000000 0 0";
+        assert_eq!(parse_stat(line, 100), Some((1, 200_000_000_000_000_000)));
+        // The input the proc_parsers fuzz target found: field 22 is
+        // u64::MAX, which no u64 of nanoseconds can hold.
+        let fuzzed = b"1234 (bash) S 1 1234 1234 34816 1234 4194-60 1043 0 0 0 1 0 0 0  \
+                       \0\0\0\0\0\0\0 51278 8355840 1172 18446744073709551615 1 1 0 0 0 0 \
+                       65536 3670020 LD_AUDIT=1 1 0 0 17 3 0 0 0 0 0 0 0 0 0 0$0 0\xff0 ";
+        assert_eq!(parse_stat(&String::from_utf8_lossy(fuzzed), 49), None);
+    }
+
+    #[test]
+    fn stat_with_no_tick_rate_is_unknown() {
+        let line = "7 (a) S 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0";
+        assert_eq!(parse_stat(line, 0), None);
+    }
 
     struct Pid1;
     impl DaemonClassifier for Pid1 {

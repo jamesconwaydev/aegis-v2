@@ -1,0 +1,45 @@
+name: ClusterFuzzLite
+
+# Fuzzes every PR that touches Rust code, the fuzz crate or this setup,
+# for five minutes shared between the targets. Crashes fail the check
+# and come back as an artifact with the input that caused them.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "fuzz/**"
+      - ".clusterfuzzlite/**"
+      - ".github/workflows/cflite_pr.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      # Code-change mode lists earlier runs' artifacts through the API.
+      actions: read
+    steps:
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: address
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run fuzzers
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          mode: code-change
+          sanitizer: address
+          fuzz-seconds: 300
+          github-token: ${{ secrets.GITHUB_TOKEN }}

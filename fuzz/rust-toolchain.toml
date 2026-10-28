@@ -1,0 +1,6 @@
+# cargo fuzz needs nightly. This is the same one build/Containerfile pins
+# as AEGIS_EBPF_TOOLCHAIN, so the image already has it, and
+# .clusterfuzzlite/build.sh installs it from here. CI fails if the two
+# pins differ.
+[toolchain]
+channel = "nightly-2026-10-19"

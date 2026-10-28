@@ -57,6 +57,17 @@ pub struct Systemd {
     cgroup: Cgroup,
 }
 
+/// Whether `/proc/<pid>/cgroup` text puts the process in `unit` or in a
+/// cgroup below it.
+pub fn in_unit(cgroup: &str, unit: &str) -> bool {
+    let tail = format!("/{unit}");
+    let below = format!("{tail}/");
+    cgroup.lines().any(|l| {
+        let l = l.trim_end();
+        l.ends_with(&tail) || l.contains(&below)
+    })
+}
+
 impl Systemd {
     pub fn new() -> Self {
         Self {
@@ -128,19 +139,10 @@ impl Systemd {
     /// which a root process may make in the delegated scope. Ok(false)
     /// when nothing was moved.
     pub fn attach(&self, unit: &str, pids: &[ProcKey]) -> Result<bool> {
-        let tail = format!("/{unit}");
-        let below = format!("{tail}/");
         let pids: Vec<ProcKey> = pids
             .iter()
             .copied()
-            .filter(|k| {
-                !(self.cgroup)(k.tgid).is_some_and(|c| {
-                    c.lines().any(|l| {
-                        let l = l.trim_end();
-                        l.ends_with(&tail) || l.contains(&below)
-                    })
-                })
-            })
+            .filter(|k| !(self.cgroup)(k.tgid).is_some_and(|c| in_unit(&c, unit)))
             .collect();
         if pids.is_empty() {
             return Ok(false);

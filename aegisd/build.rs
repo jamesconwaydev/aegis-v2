@@ -3,6 +3,14 @@ use anyhow::{anyhow, Context as _};
 use aya_build::Toolchain;
 
 fn main() -> anyhow::Result<()> {
+    // A fuzz build (cargo fuzz passes `--cfg fuzzing`) only exercises the
+    // parsers and never loads the probes, so it gets an empty object in
+    // their place and needs no BPF toolchain.
+    if std::env::var_os("CARGO_CFG_FUZZING").is_some() {
+        let out = std::env::var("OUT_DIR").context("OUT_DIR is unset")?;
+        std::fs::write(format!("{out}/aegis"), b"").context("writing the empty probe object")?;
+        return Ok(());
+    }
     // The pinned nightly for the eBPF crate; build/Containerfile sets it.
     println!("cargo:rerun-if-env-changed=AEGIS_EBPF_TOOLCHAIN");
     let toolchain = std::env::var("AEGIS_EBPF_TOOLCHAIN")

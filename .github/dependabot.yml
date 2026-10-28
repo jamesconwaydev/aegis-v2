@@ -15,3 +15,8 @@ updates:
     groups:
       actions-minor-patch:
         update-types: [minor, patch]
+  - package-ecosystem: docker
+    # The ClusterFuzzLite builder image, pinned by digest.
+    directory: /.clusterfuzzlite
+    schedule:
+      interval: weekly

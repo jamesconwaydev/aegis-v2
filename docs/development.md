@@ -68,7 +68,8 @@ aarch64 is the emulated one.
 - gcc, clang and llvm, plus the RPM tooling (`rpm-build`,
   `selinux-policy-devel`, `systemd-rpm-macros`)
 - Rust 1.99.1 with `rust-src`, clippy and rustfmt, for userspace
-- Rust `nightly-2026-10-19` with `rust-src`, for the eBPF crate
+- a Rust nightly with `rust-src` (`AEGIS_EBPF_TOOLCHAIN`), for the eBPF
+  crate and the fuzz targets
 - `bpf-linker` v0.12.0 from upstream's release binaries, checked against
   a sha256 committed in the Containerfile
 
@@ -277,6 +278,65 @@ Adding a scenario means adding a `[[scenario]]` with a `name`, a shell
 (a shell snippet run under `set -e`) when it needs them.
 `aegis-sim --help` lists the simulators.
 
+## Fuzzing
+
+Some of what aegisd reads, it doesn't control. The config is hand-edited.
+Any root process can write to the control socket. A crash or a full disk
+can leave an incident file half-written, and a watched process gets a say
+in what its own `/proc` files contain. Each of those parsers has a fuzz
+target in `fuzz/`, and none of them may panic, hang or eat memory,
+whatever bytes it's handed:
+
+| Target | What it feeds |
+| --- | --- |
+| `config` | `Config::load_checked`: `config.toml` plus one drop-in |
+| `proto_request` | a socket line into `Request`; `is_incident_id`, `clean` |
+| `incident_store` | `incident.json` and `timeline.jsonl` into `IncidentStore` |
+| `proc_parsers` | `parse_stat`, `env_taint`, `is_service_cgroup`, `in_unit` |
+| `nft_listing` | `Nft::echoed_handle`, `Nft::unresolved`, `Nft::handles` |
+
+The fuzz crate sits outside the workspace, because cargo-fuzz needs
+nightly. Its `rust-toolchain.toml` pins the same nightly the image
+already carries for the eBPF crate (CI fails if the two drift apart), so
+all you add is cargo-fuzz. It goes into its own volume, so only the first
+run compiles it. To give one target five minutes:
+
+```sh
+arch=aarch64
+podman run --rm -v "$PWD:/src:z" -w /src/fuzz \
+    -v aegis-cargo-$arch:/usr/local/cargo/registry \
+    -v aegis-target-$arch:/target -e CARGO_TARGET_DIR=/target/fuzz \
+    -v aegis-fuzz-tools-$arch:/tools \
+    aegis-build:rocky10-$arch sh -c '
+        export PATH=/tools/bin:$PATH
+        command -v cargo-fuzz >/dev/null ||
+            cargo install cargo-fuzz --locked --version 0.13.2 --root /tools
+        cp ../Cargo.lock . &&
+        cargo fuzz run config corpus/config seeds/config -- -max_total_time=300'
+```
+
+For x86_64, set `arch=x86_64`. On a Mac, swap `podman run` for
+`docker run --platform linux/amd64`, for the reason in
+[x86_64 on Apple Silicon](#x86_64-on-apple-silicon).
+
+The `cp` gives the fuzz crate the workspace's own lockfile, so it fuzzes
+the dependency versions that ship. It isn't committed in `fuzz/`.
+
+`cargo fuzz list` names the rest. `seeds/<target>` holds a handful of
+real inputs to start from; what the fuzzer learns piles up in
+`corpus/<target>`, which git ignores.
+
+When it finds a crash, it saves the input under `artifacts/<target>/` and
+prints the command that replays it. That crash is a bug. Fix it, and add
+the input to a unit test beside the code it broke, one that fails
+without your fix.
+
+On a pull request that touches Rust, ClusterFuzzLite builds the same
+targets and fuzzes them for five minutes between them
+(`.github/workflows/cflite_pr.yml`). Under `--cfg fuzzing`,
+`aegisd/build.rs` skips the probes, so that build needs no BPF
+toolchain.
+
 ## Licences and CI
 
 `deny.toml` says which licences a dependency may carry, and the list is
@@ -292,6 +352,10 @@ the Rust jobs, and a skipped job counts as passing. If the step that
 decides breaks, every job runs. Pushing again
 cancels the run it replaces, and every job has a timeout, so nothing
 runs on after it's useful.
+
+A PR that touches Rust also gets fuzzed (see [Fuzzing](#fuzzing)). That
+check isn't required for a merge, but a crash it reports is a bug to fix
+before one.
 
 Pushing a `v*.*.*` tag builds the x86_64 and aarch64 RPMs and publishes
 a GitHub release with a `SHA256SUMS` file. The notes come from that
