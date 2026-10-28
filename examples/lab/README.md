@@ -20,6 +20,8 @@ run Rocky Linux 10 with Aegis installed and running in audit mode (see
 
 It takes about 15 seconds. `PACE=0` drops the pauses between steps. The
 script reads like a shell script because it is one, so read it first.
+To watch enforce mode do it for real, see
+[in enforce mode](#in-enforce-mode).
 
 ## What it does
 
@@ -46,8 +48,31 @@ On exit, including Ctrl-C, it stops the service and deletes the temp
 directory. The incident stays in `/var/lib/aegis-v2/incidents/`.
 
 In audit mode nothing is throttled or quarantined. The verdicts say what
-enforce mode would do once it exists; see the
-[roadmap](../../docs/roadmap.md).
+enforce mode would do.
+
+## In enforce mode
+
+Put aegisd in enforce mode first (`mode = "enforce"` in
+`/etc/aegis-v2/config.toml`, then `systemctl reload aegisd`), and tell
+the script:
+
+```console
+# MODE=enforce examples/lab/run.sh
+```
+
+It refuses to run if aegisd's mode doesn't match `MODE`, so you can't
+freeze something by accident. This time the scan at 65 throttles the
+bash copy, and the attach at 110 quarantines the tree: the copies of
+bash and strace, and the `timeout` between them, are held, moved into
+`aegis-incident-<id>-q.scope`, frozen, and cut off by an nftables
+rule. The incident's verdict reads `quarantined`. The script prints
+the scope's `FreezerState`, the processes in it, and the `inet aegis`
+table, then the incident as before.
+
+The bash copy never prints its last line, because it's frozen before
+it gets there. On exit the script runs `aegisctl incidents kill` on the
+incident, so nothing is left frozen. Put the mode back to `"audit"`
+when you're done.
 
 ## A captured run
 
