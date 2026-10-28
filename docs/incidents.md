@@ -118,6 +118,14 @@ from v0.2.1, worked out from `actions`: `held` while the throttle,
 quarantine or bare kernel hold is still on, then `released`, `killed` or
 `expired` once it's ended, and `-` if nothing was ever enforced.
 
+Released doesn't mean back where it was, though. A released or throttled
+process stays in its incident scope (`aegis-incident-<id>.scope`, or
+`-q.scope` for a quarantine) until it exits. It's no longer part of the
+service it came from, so restarting that service won't stop it. Stop
+the scope with `systemctl stop` instead. The
+[threat model](threat-model.md#a-released-process-stays-in-the-quarantine-slice)
+has the details.
+
 If aegisd can't move a tree into its quarantine scope, it doesn't try
 again. The tree stays held but not frozen, and the incident stays
 `would_quarantine` with the error recorded. Later processes that join
