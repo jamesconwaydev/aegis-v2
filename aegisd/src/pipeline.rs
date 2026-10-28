@@ -149,6 +149,23 @@ fn bit(k: SignalKind) -> u8 {
     1 << k as u8
 }
 
+/// How long after a throttle or quarantine is asked for a forked child
+/// still gets a job of its own. A job can wait up to `INCIDENT_WAIT` for
+/// its record, then behind others in the queue; aegisd already gives a
+/// release or kill 30 s to come back. By then the tree has been moved
+/// and walked, and a child forked inside the scope is born there.
+const FORK_WINDOW: Duration = Duration::from_secs(30);
+
+struct Enforced {
+    tier: Tier,
+    /// Live processes the jobs covered.
+    covered: HashSet<ProcKey>,
+    /// When the tier was asked for.
+    at: Instant,
+    /// An admin asked for a release or kill.
+    ended: bool,
+}
+
 pub struct Pipeline {
     pub table: ProcTable,
     scorer: Scorer,
@@ -189,11 +206,12 @@ pub struct Pipeline {
     // One entry per incident for the daemon's life, like the
     // store's own map; evict both together if that ever matters.
     spoken: HashMap<String, Spoken>,
-    /// Per incident id, the tier enforcement was last asked for and the
-    /// processes it covered: each kind is sent once, and after that only
-    /// a newcomer to a quarantined tree gets a job of its own.
-    // Kept for the daemon's life, like `spoken`.
-    enforced: HashMap<String, (Tier, HashSet<ProcKey>)>,
+    /// Per incident id, what enforcement was last asked for: each kind
+    /// is sent once, and after that only a newcomer gets a job of its
+    /// own.
+    // Kept for the daemon's life, like `spoken`; the covered sets lose
+    // each process as it exits.
+    enforced: HashMap<String, Enforced>,
     /// Enforcement for the caller to queue (enforce mode only).
     pub to_enforce: Vec<EnforceJob>,
     /// Incident membership on the loop, by a local group number: the
@@ -699,6 +717,17 @@ impl Pipeline {
                 s.seen.remove(key);
             }
         }
+        for e in self.enforced.values_mut() {
+            e.covered.remove(key);
+        }
+    }
+
+    /// An admin asked to release or kill incident `id`: its forks get no
+    /// more jobs.
+    pub fn enforcement_ended(&mut self, id: &str) {
+        if let Some(e) = self.enforced.get_mut(id) {
+            e.ended = true;
+        }
     }
 
     /// Finishes forgetting exited processes once nothing of theirs is
@@ -820,7 +849,12 @@ impl Pipeline {
     /// once quarantined, any process the quarantine didn't cover.
     fn enforce(&mut self, g: &str, key: ProcKey, tier: Tier) {
         let me = std::process::id();
-        if let Some((Tier::Quarantine, covered)) = self.enforced.get_mut(g) {
+        if let Some(Enforced {
+            tier: Tier::Quarantine,
+            covered,
+            ..
+        }) = self.enforced.get_mut(g)
+        {
             if covered.contains(&key) {
                 return;
             }
@@ -837,7 +871,7 @@ impl Pipeline {
             }
             return;
         }
-        if tier == Tier::Log || self.enforced.get(g).is_some_and(|e| e.0 >= tier) {
+        if tier == Tier::Log || self.enforced.get(g).is_some_and(|e| e.tier >= tier) {
             return;
         }
         let members: Vec<ProcKey> = self
@@ -850,8 +884,15 @@ impl Pipeline {
         if pids.is_empty() {
             return;
         }
-        self.enforced
-            .insert(g.into(), (tier, pids.iter().copied().collect()));
+        self.enforced.insert(
+            g.into(),
+            Enforced {
+                tier,
+                covered: pids.iter().copied().collect(),
+                at: Instant::now(),
+                ended: false,
+            },
+        );
         let id = g.into();
         self.to_enforce.push(match tier {
             Tier::Quarantine => EnforceJob::Quarantine { id, pids },
@@ -861,7 +902,8 @@ impl Pipeline {
 
     /// A child of a process already throttled or quarantined joins it at
     /// once, scored or not: a quiet worker forked before the hold must
-    /// not stay behind in the old cgroup.
+    /// not stay behind in the old cgroup. Only within `FORK_WINDOW` of
+    /// the decision, and never once an admin ended the incident.
     // Scans `enforced` per fork in enforce mode; index covered keys
     // by incident if that ever shows up in a profile.
     fn enforce_fork(&mut self, parent: ProcKey, child: ProcKey) {
@@ -871,13 +913,13 @@ impl Pipeline {
         {
             return;
         }
-        for (g, (tier, covered)) in &mut self.enforced {
-            if covered.contains(&parent) {
-                if covered.insert(child) {
-                    let (id, pids) = (g.clone(), vec![child]);
-                    self.to_enforce.push(match tier {
-                        Tier::Quarantine => EnforceJob::Quarantine { id, pids },
-                        _ => EnforceJob::Throttle { id, pids },
+        for (g, e) in &mut self.enforced {
+            if e.covered.contains(&parent) {
+                if !e.ended && e.at.elapsed() < FORK_WINDOW && e.covered.insert(child) {
+                    self.to_enforce.push(EnforceJob::Fork {
+                        id: g.clone(),
+                        tier: e.tier,
+                        pid: child,
                     });
                 }
                 return;
@@ -1067,11 +1109,13 @@ pub fn proc_start_matches(tgid: u32, start_time_ns: u64) -> bool {
     got.abs_diff(want) <= tick
 }
 
-/// A process's start time from /proc, in the probe's clock. Good to the
-/// clock tick, which `proc_start_matches` allows for; a hold, which the
-/// kernel matches to the nanosecond, needs the probe's own value.
-pub fn proc_start_time(tgid: u32) -> Option<u64> {
-    Some(proc_start_ns(tgid)?.saturating_sub(boottime_offset_ns()))
+/// A process's parent tgid and start time, in the probe's clock, from
+/// one read of /proc. The start time is good to the clock tick, which
+/// `proc_start_matches` allows for; a hold, which the kernel matches to
+/// the nanosecond, needs the probe's own value.
+pub fn proc_stat(tgid: u32) -> Option<(u32, u64)> {
+    let (ppid, start) = read_stat(tgid)?;
+    Some((ppid, start.saturating_sub(boottime_offset_ns())))
 }
 
 /// CLOCK_BOOTTIME minus CLOCK_MONOTONIC, now: the time spent suspended
@@ -1102,13 +1146,20 @@ fn clk_tck() -> u64 {
 
 /// Process start time from `/proc/<tgid>/stat` field 22, in ns.
 fn proc_start_ns(tgid: u32) -> Option<u64> {
+    read_stat(tgid).map(|s| s.1)
+}
+
+/// Fields 4 (ppid) and 22 (starttime, in ns) of `/proc/<tgid>/stat`.
+fn read_stat(tgid: u32) -> Option<(u32, u64)> {
     let stat = std::fs::read_to_string(format!("/proc/{tgid}/stat")).ok()?;
     // comm (field 2) is parenthesised and may hold spaces or ')': the
     // fields after it start at the last ')'.
-    let rest = &stat[stat.rfind(')')? + 1..];
-    // After comm: state is field 3, so starttime (field 22) is the 20th.
-    let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
-    Some(ticks * 1_000_000_000 / clk_tck())
+    let rest: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+    // After comm: state is field 3, so ppid is the 2nd and starttime
+    // (field 22) the 20th.
+    let ppid = rest.get(1)?.parse().ok()?;
+    let ticks: u64 = rest.get(19)?.parse().ok()?;
+    Some((ppid, ticks * 1_000_000_000 / clk_tck()))
 }
 
 #[cfg(test)]
@@ -1883,7 +1934,11 @@ mod tests {
         // Already covered: a member scoring again sends nothing.
         p.handle(&ptrace_pid1(81));
         assert!(p.to_enforce.is_empty());
+        // Past the fork window, so the fork alone sends nothing.
+        let at = Instant::now() - FORK_WINDOW;
+        p.enforced.values_mut().for_each(|e| e.at = at);
         p.handle(&fork(80, 90));
+        assert!(p.to_enforce.is_empty());
         p.handle(&exec(90, "/tmp/z", EXEC_FROM_TMP));
         p.verified(&exe_key("/tmp/z"), Verification::Unverified);
         match &p.to_enforce[..] {
@@ -1905,23 +1960,69 @@ mod tests {
         p.handle(&fork(79, 93));
         p.handle(&fork(81, 91));
         match &p.to_enforce[..] {
-            [EnforceJob::Quarantine { pids: a, .. }, EnforceJob::Quarantine { pids: b, .. }] => {
-                assert_eq!((tgids(a), tgids(b)), (vec![91], vec![92]));
+            [EnforceJob::Fork {
+                tier: Tier::Quarantine,
+                pid: a,
+                ..
+            }, EnforceJob::Fork {
+                tier: Tier::Quarantine,
+                pid: b,
+                ..
+            }] => {
+                assert_eq!((a.tgid, b.tgid), (91, 92));
             }
             j => panic!("{j:?}"),
         }
+    }
+
+    fn throttled(p: &mut Pipeline, id: &str, tgid: u32) {
+        p.enforced.insert(
+            id.into(),
+            Enforced {
+                tier: Tier::Throttle,
+                covered: [key(tgid)].into(),
+                at: Instant::now(),
+                ended: false,
+            },
+        );
+    }
+
+    #[test]
+    fn a_forking_throttled_tree_stays_bounded() {
+        let (mut p, _d) = pipeline("enf-fork-many");
+        p.mode = Mode::Enforce;
+        throttled(&mut p, "AEG-t", 80);
+        for c in 1000..2000 {
+            p.handle(&fork(80, c));
+            p.handle(&ev(EventKind::Exit, c));
+        }
+        // Each child had its job; the exited ones are no longer kept.
+        assert_eq!(p.to_enforce.len(), 1000);
+        assert_eq!(p.enforced["AEG-t"].covered.len(), 1);
+        // Past the window, or once an admin ended it: no more jobs.
+        p.to_enforce.clear();
+        p.enforced.get_mut("AEG-t").unwrap().at = Instant::now() - FORK_WINDOW;
+        p.handle(&fork(80, 2000));
+        throttled(&mut p, "AEG-u", 81);
+        p.enforcement_ended("AEG-u");
+        p.handle(&fork(81, 2001));
+        assert!(p.to_enforce.is_empty());
+        assert_eq!(p.enforced["AEG-t"].covered.len(), 1);
     }
 
     #[test]
     fn a_child_of_a_throttled_tree_is_throttled_too() {
         let (mut p, _d) = pipeline("enf-fork-t");
         p.mode = Mode::Enforce;
-        p.enforced
-            .insert("AEG-t".into(), (Tier::Throttle, [key(80)].into()));
+        throttled(&mut p, "AEG-t", 80);
         p.handle(&fork(80, 90));
         match &p.to_enforce[..] {
-            [EnforceJob::Throttle { id, pids }] => {
-                assert_eq!((id.as_str(), tgids(pids)), ("AEG-t", vec![90]));
+            [EnforceJob::Fork {
+                id,
+                tier: Tier::Throttle,
+                pid,
+            }] => {
+                assert_eq!((id.as_str(), pid.tgid), ("AEG-t", 90));
             }
             j => panic!("{j:?}"),
         }

@@ -5,8 +5,8 @@
 //! a slow systemd never holds up detection.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use super::systemd::{Limits, Systemd};
 use crate::config::Mode;
 use crate::ebpf::Holds;
 use crate::incident::{verdict_rank, ActionRecord, IncidentId, IncidentStore};
-use crate::pipeline::{proc_start_matches, proc_start_time};
+use crate::pipeline::{proc_start_matches, proc_stat};
 use crate::proctable::{ProcKey, ProcTable};
 use crate::scoring::Tier;
 use crate::telemetry::{now_ns, rfc3339, Sinks, TelemetryRecord};
@@ -34,17 +34,40 @@ const INCIDENT_WAIT: Duration = Duration::from_secs(5);
 /// Most processes the `/proc` children walk adds to one quarantine: a
 /// tree that forks faster than it can be read is cut off, not chased.
 const MAX_FOUND: usize = 1024;
+/// Fork jobs may fill only this much of the queue. The rest is kept for
+/// escalations, scored newcomers, releases and kills, so a tree forking
+/// in a loop can never crowd those out.
+const FORK_SLOTS: usize = QUEUE / 2;
 
 /// Where a release or kill answers: Ok with a message, or Err with why.
 pub type Reply = tokio::sync::oneshot::Sender<Result<String, String>>;
 
 #[derive(Debug)]
 pub enum EnforceJob {
-    Throttle { id: String, pids: Vec<ProcKey> },
-    Quarantine { id: String, pids: Vec<ProcKey> },
+    Throttle {
+        id: String,
+        pids: Vec<ProcKey>,
+    },
+    Quarantine {
+        id: String,
+        pids: Vec<ProcKey>,
+    },
+    /// A child forked by a process the incident's throttle or
+    /// quarantine already covers; it joins at the same tier.
+    Fork {
+        id: String,
+        tier: Tier,
+        pid: ProcKey,
+    },
     // Sent by `aegisctl incidents release|kill`.
-    Release { id: String, reply: Option<Reply> },
-    Kill { id: String, reply: Option<Reply> },
+    Release {
+        id: String,
+        reply: Option<Reply>,
+    },
+    Kill {
+        id: String,
+        reply: Option<Reply>,
+    },
 }
 
 pub struct EnforcerHandle {
@@ -54,6 +77,86 @@ pub struct EnforcerHandle {
     pub dropped: Arc<AtomicU64>,
     pub actions_ok: Arc<AtomicU64>,
     pub actions_failed: Arc<AtomicU64>,
+    /// Fork jobs in the queue now; the enforcer counts them down.
+    forks: Arc<AtomicUsize>,
+    sinks: Arc<Sinks>,
+    /// Fork jobs are being dropped and that has been logged.
+    fork_drops_logged: AtomicBool,
+}
+
+impl EnforcerHandle {
+    fn new(tx: SyncSender<EnforceJob>, sinks: Arc<Sinks>) -> Self {
+        Self {
+            tx,
+            dropped: Arc::default(),
+            actions_ok: Arc::default(),
+            actions_failed: Arc::default(),
+            forks: Arc::default(),
+            sinks,
+            fork_drops_logged: AtomicBool::new(false),
+        }
+    }
+
+    /// Queues a job without waiting. Fork jobs take at most
+    /// `FORK_SLOTS`. A dropped job is counted (`aegisctl status`) and
+    /// logged; a dropped throttle or quarantine also goes to telemetry,
+    /// so a webhook says the tree was left alone.
+    pub fn queue(&self, job: EnforceJob) {
+        let fork = matches!(job, EnforceJob::Fork { .. });
+        if fork {
+            if self.forks.load(Ordering::Relaxed) >= FORK_SLOTS {
+                return self.drop_job(&job);
+            }
+            self.forks.fetch_add(1, Ordering::Relaxed);
+        }
+        match self.tx.try_send(job) {
+            Ok(()) => {
+                if fork {
+                    self.fork_drops_logged.store(false, Ordering::Relaxed);
+                }
+            }
+            Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
+                if fork {
+                    self.forks.fetch_sub(1, Ordering::Relaxed);
+                }
+                self.drop_job(&job);
+            }
+        }
+    }
+
+    fn drop_job(&self, job: &EnforceJob) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        let (id, tier, pid) = match job {
+            EnforceJob::Fork { id, .. } => {
+                // A forking tree can drop thousands: log the first.
+                if !self.fork_drops_logged.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "aegisd: {id}: enforcer busy, dropping jobs for forked children \
+                         (counted in aegisctl status)"
+                    );
+                }
+                return;
+            }
+            EnforceJob::Throttle { id, pids } => (id, Tier::Throttle, pids.first()),
+            EnforceJob::Quarantine { id, pids } => (id, Tier::Quarantine, pids.first()),
+            EnforceJob::Release { .. } | EnforceJob::Kill { .. } => return,
+        };
+        let reason = "enforcement failed: queue full, nothing was done".to_string();
+        eprintln!("aegisd: {id}: {reason}");
+        self.sinks.emit(&TelemetryRecord {
+            ts_unix_ns: now_ns(),
+            incident: id.clone(),
+            tier,
+            verdict: crate::incident::verdict(tier).unwrap_or("would_throttle"),
+            score: 0.0,
+            mode: Mode::Enforce,
+            tgid: pid.map_or(0, |k| k.tgid),
+            comm: String::new(),
+            exe: None,
+            target: None,
+            reasons: vec![reason],
+        });
+    }
 }
 
 pub fn spawn_enforcer(
@@ -66,12 +169,7 @@ pub fn spawn_enforcer(
     enforcing: Arc<AtomicBool>,
 ) -> EnforcerHandle {
     let (tx, rx) = sync_channel(QUEUE);
-    let h = EnforcerHandle {
-        tx,
-        dropped: Arc::default(),
-        actions_ok: Arc::default(),
-        actions_failed: Arc::default(),
-    };
+    let h = EnforcerHandle::new(tx, sinks.clone());
     let mut e = Enforcer {
         store,
         holds,
@@ -86,6 +184,7 @@ pub fn spawn_enforcer(
         wait: INCIDENT_WAIT,
         unsaved: HashMap::new(),
         children: proc_children,
+        forks: h.forks.clone(),
     };
     std::thread::Builder::new()
         .name("aegis-enforce".into())
@@ -125,8 +224,8 @@ pub fn target_set(table: &ProcTable, members: &[ProcKey], me: u32) -> Vec<ProcKe
     out
 }
 
-/// Children of `k` from `/proc/<tgid>/task/*/children`, each keyed by its
-/// `/proc` start time; nothing once `k` is no longer that process.
+/// Children of `k` from `/proc/<tgid>/task/*/children`; nothing once
+/// `k` is no longer that process.
 fn proc_children(k: ProcKey) -> Vec<ProcKey> {
     if !proc_start_matches(k.tgid, k.start_time_ns) {
         return Vec::new();
@@ -134,7 +233,7 @@ fn proc_children(k: ProcKey) -> Vec<ProcKey> {
     let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", k.tgid)) else {
         return Vec::new();
     };
-    tasks
+    let listed = tasks
         .flatten()
         .filter_map(|t| std::fs::read_to_string(t.path().join("children")).ok())
         .flat_map(|s| {
@@ -142,10 +241,25 @@ fn proc_children(k: ProcKey) -> Vec<ProcKey> {
                 .filter_map(|c| c.parse().ok())
                 .collect::<Vec<u32>>()
         })
+        .collect();
+    still_children(k.tgid, listed, proc_stat)
+}
+
+/// The listed pids `stat` still shows as children of `parent`, keyed by
+/// the start time from the same read. A child that exited after it was
+/// listed, its pid taken by a stranger, is left out.
+fn still_children(
+    parent: u32,
+    listed: Vec<u32>,
+    stat: fn(u32) -> Option<(u32, u64)>,
+) -> Vec<ProcKey> {
+    listed
+        .into_iter()
         .filter_map(|tgid| {
-            Some(ProcKey {
+            let (ppid, start_time_ns) = stat(tgid)?;
+            (ppid == parent).then_some(ProcKey {
                 tgid,
-                start_time_ns: proc_start_time(tgid)?,
+                start_time_ns,
             })
         })
         .collect()
@@ -226,11 +340,23 @@ pub struct Enforcer {
     unsaved: HashMap<String, (Vec<ActionRecord>, Option<&'static str>)>,
     /// Lists a process's children; tests pass a fake.
     children: fn(ProcKey) -> Vec<ProcKey>,
+    /// Shared with the handle: fork jobs still queued.
+    forks: Arc<AtomicUsize>,
 }
 
 impl Enforcer {
     pub fn run(&mut self, job: EnforceJob) {
         match job {
+            EnforceJob::Fork { id, tier, pid } => {
+                let _ = self
+                    .forks
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+                let pids = vec![pid];
+                self.run(match tier {
+                    Tier::Quarantine => EnforceJob::Quarantine { id, pids },
+                    _ => EnforceJob::Throttle { id, pids },
+                });
+            }
             EnforceJob::Throttle { id, .. } | EnforceJob::Quarantine { id, .. }
                 if !self.ready(&id) => {}
             EnforceJob::Throttle { id, pids } => self.throttle(&id, &pids),
@@ -423,6 +549,16 @@ impl Enforcer {
             }
             now_frozen = a.ok;
             acts.push(a);
+        }
+        if moved && now_frozen {
+            // Once more: a child the walk found but couldn't hold may
+            // have forked before the move, leaving its own child outside.
+            // Joining the frozen scope stops it.
+            let late = self.with_children(pids).split_off(pids.len());
+            if !late.is_empty() {
+                let r = self.sys.attach(&unit, &late);
+                acts.push(act("attach", Some(&unit), tgids(&late), r.map(|_| None)));
+            }
         }
         if moved && !ruled {
             let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &unit);
@@ -667,7 +803,9 @@ fn done(verdict: &str, acts: &[ActionRecord]) -> String {
         .iter()
         .filter(|a| a.ok)
         .filter_map(|a| match a.kind.as_str() {
-            "hold" => Some("held"),
+            // Only the job's own processes are held; walked children
+            // are moved and frozen.
+            "hold" => Some("members held"),
             "scope" | "attach" => Some("moved"),
             "freeze" => Some("frozen"),
             "nft_drop" => Some("egress dropped"),
@@ -823,6 +961,7 @@ mod tests {
             wait: Duration::ZERO,
             unsaved: HashMap::new(),
             children: |_| Vec::new(),
+            forks: Arc::default(),
         };
         Fx { e, id, dir }
     }
@@ -1243,6 +1382,7 @@ mod tests {
             wait: Duration::ZERO,
             unsaved: HashMap::new(),
             children: |_| Vec::new(),
+            forks: Arc::default(),
         };
         let r = run_reply(&mut e2, |reply| EnforceJob::Release {
             id: id.clone(),
@@ -1615,7 +1755,7 @@ mod tests {
         assert_eq!(done[0]["verdict"], "quarantined");
         assert_eq!(
             done[0]["reasons"][0],
-            "enforcement done: held, moved, frozen, egress dropped"
+            "enforcement done: members held, moved, frozen, egress dropped"
         );
     }
 
@@ -1691,5 +1831,104 @@ mod tests {
         let r = run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply });
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(f.e.holds.held(), 1);
+    }
+
+    #[test]
+    fn a_flood_of_fork_jobs_never_crowds_out_an_escalation() {
+        let path =
+            std::env::temp_dir().join(format!("aegis-enf-{}-flood.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (tx, rx) = sync_channel(QUEUE);
+        let h = EnforcerHandle::new(tx, Arc::new(Sinks::jsonl_at(&path)));
+        for c in 0..1000 {
+            h.queue(EnforceJob::Fork {
+                id: "AEG-f".into(),
+                tier: Tier::Throttle,
+                pid: k(1000 + c),
+            });
+        }
+        assert_eq!(h.dropped.load(Ordering::Relaxed), 1000 - FORK_SLOTS as u64);
+        // The escalation still gets a slot.
+        h.queue(EnforceJob::Quarantine {
+            id: "AEG-f".into(),
+            pids: vec![k(10)],
+        });
+        let jobs: Vec<EnforceJob> = rx.try_iter().collect();
+        assert_eq!(jobs.len(), FORK_SLOTS + 1);
+        assert!(matches!(jobs.last(), Some(EnforceJob::Quarantine { .. })));
+        // No fork drop reached telemetry; a dropped escalation does.
+        assert!(std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .is_empty());
+        for _ in 0..QUEUE + 1 {
+            h.queue(EnforceJob::Quarantine {
+                id: "AEG-g".into(),
+                pids: vec![k(11)],
+            });
+        }
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(log.contains("enforcement failed: queue full") && log.contains("AEG-g"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_enforcer_counts_fork_jobs_down() {
+        let mut f = fx("forkjob", ok);
+        f.e.forks.store(1, Ordering::Relaxed);
+        f.e.run(EnforceJob::Fork {
+            id: f.id.clone(),
+            tier: Tier::Quarantine,
+            pid: k(10),
+        });
+        assert_eq!(f.e.forks.load(Ordering::Relaxed), 0);
+        assert_eq!(f.incident().verdict, "quarantined");
+    }
+
+    #[test]
+    fn a_walked_child_whose_pid_was_reused_is_left_out() {
+        fn stat(tgid: u32) -> Option<(u32, u64)> {
+            match tgid {
+                20 => Some((10, 120)),
+                // Listed under 10, but now someone else's.
+                21 => Some((77, 121)),
+                _ => None,
+            }
+        }
+        assert_eq!(still_children(10, vec![20, 21, 22], stat), [k(20)]);
+    }
+
+    #[test]
+    fn a_second_walk_after_the_freeze_catches_a_late_grandchild() {
+        thread_local! { static WALKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+        fn kids(p: ProcKey) -> Vec<ProcKey> {
+            match p.tgid {
+                10 => vec![k(20)],
+                // 20 isn't held; by the second walk it has forked 22.
+                20 => {
+                    let n = WALKS.with(|w| {
+                        w.set(w.get() + 1);
+                        w.get()
+                    });
+                    if n > 1 {
+                        vec![k(22)]
+                    } else {
+                        vec![]
+                    }
+                }
+                _ => vec![],
+            }
+        }
+        let mut f = fx("latewalk", ok);
+        f.e.children = kids;
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let inc = f.incident();
+        let kinds: Vec<&str> = inc.actions.iter().map(|a| a.kind.as_str()).collect();
+        assert_eq!(kinds, ["hold", "scope", "freeze", "attach", "nft_drop"]);
+        assert_eq!(inc.actions[1].pids, [10, 20]);
+        assert_eq!(inc.actions[3].pids, [22]);
     }
 }
