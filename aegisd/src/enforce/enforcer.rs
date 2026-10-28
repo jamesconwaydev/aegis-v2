@@ -540,9 +540,7 @@ impl Enforcer {
             .iter()
             .any(|a| a.kind == "scope" && a.unit.as_deref() == Some(unit.as_str()));
         let moved = if scoped {
-            let r = self.sys.attach(&unit, pids);
-            acts.push(act("attach", Some(&unit), tgids(pids), r.map(|_| None)));
-            acts.last().unwrap().ok
+            self.attach(&unit, pids, &mut acts)
         } else if tried {
             false
         } else {
@@ -575,8 +573,7 @@ impl Enforcer {
             // Joining the frozen scope stops it.
             let late = self.with_children(pids).split_off(pids.len());
             if !late.is_empty() {
-                let r = self.sys.attach(&unit, &late);
-                acts.push(act("attach", Some(&unit), tgids(&late), r.map(|_| None)));
+                self.attach(&unit, &late, &mut acts);
             }
         }
         if moved && !ruled {
@@ -589,6 +586,22 @@ impl Enforcer {
         }
         let v = (moved && now_frozen).then_some("quarantined");
         self.finish(id, acts, v);
+    }
+
+    /// Moves `pids` into the running quarantine scope and records it.
+    /// Ok(false) moved nothing (all already in it, or exited), so it isn't
+    /// recorded: an attach on the record names pids that were moved.
+    /// True if the tree is in the scope.
+    fn attach(&self, unit: &str, pids: &[ProcKey], acts: &mut Vec<ActionRecord>) -> bool {
+        match self.sys.attach(unit, pids) {
+            Ok(false) => true,
+            r => {
+                let a = act("attach", Some(unit), tgids(pids), r.map(|_| None));
+                let ok = a.ok;
+                acts.push(a);
+                ok
+            }
+        }
     }
 
     fn release(&mut self, id: &str) -> Result<String, String> {
@@ -1422,6 +1435,35 @@ mod tests {
         assert_eq!(f.e.holds.held(), 2);
         let kinds = f.kinds();
         assert_eq!(kinds[4..], [("hold".into(), true), ("attach".into(), true)]);
+    }
+
+    #[test]
+    fn a_newcomer_already_in_the_quarantine_scope_records_no_attach() {
+        thread_local! { static UNIT: RefCell<String> = const { RefCell::new(String::new()) }; }
+        fn cg(_: u32) -> Option<String> {
+            UNIT.with(|u| {
+                let u = u.borrow();
+                (!u.is_empty()).then(|| format!("0::/aegis.slice/aegis-quarantine.slice/{u}\n"))
+            })
+        }
+        let mut f = fx("q-born", ok);
+        f.e.sys = Systemd::with(ok, alive).with_cgroup(cg);
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        UNIT.with(|u| *u.borrow_mut() = q_unit(&f.id));
+        take();
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(12)],
+        });
+        UNIT.with(|u| u.borrow_mut().clear());
+        assert!(take().is_empty());
+        // Held, but nothing moved: no attach claiming pid 12 was.
+        let kinds = f.kinds();
+        assert_eq!(kinds[4..], [("hold".into(), true)]);
+        assert_eq!(f.incident().verdict, "quarantined");
     }
 
     #[test]
