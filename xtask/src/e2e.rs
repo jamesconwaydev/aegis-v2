@@ -467,7 +467,8 @@ fn run_scenario(remote: &Remote, s: &Scenario) -> Result<Row> {
     // Fails closed: anything that can't be read is a failure.
     row.acts_ok = match remote
         .check(&format!(
-            "for f in {INCIDENTS}/*/incident.json; do [ -f \"$f\" ] && cat \"$f\"; done; true"
+            "for f in {INCIDENTS}/*/incident.json; do [ -e \"$f\" ] || continue; \
+             cat \"$f\" || exit 1; done"
         ))
         .and_then(|t| failed_actions(&t))
     {
@@ -495,7 +496,10 @@ fn failed_actions(text: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for inc in serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>() {
         let inc = inc.context("incident.json")?;
-        for a in inc["actions"].as_array().into_iter().flatten() {
+        let acts = inc["actions"]
+            .as_array()
+            .with_context(|| format!("{}: no actions array", inc["id"]))?;
+        for a in acts {
             if a["ok"] != true {
                 out.push(format!(
                     "{} {}: {}",
@@ -749,6 +753,7 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert!(f[0].starts_with("AEG-2 attach: Process migration"), "{f:?}");
         assert!(failed_actions("{").is_err());
+        assert!(failed_actions(r#"{"id":"AEG-3"}"#).is_err());
     }
 
     #[test]
