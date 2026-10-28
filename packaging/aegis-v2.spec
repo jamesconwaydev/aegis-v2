@@ -86,11 +86,11 @@ install -Dpm 0644 -t %{buildroot}%{_licensedir}/%{name} \
 %{_bindir}/aegisctl preflight || :
 
 %preun
-# On erase, warn while aegisctl is still here to release what enforce
-# mode holds. Removal goes ahead either way.
+# On erase, say up front that trees enforce mode moved will be left in
+# place. dnf doesn't pause, so this is for next time, not a prompt.
 if [ $1 -eq 0 ] && [ -n "$(systemctl list-units --all --plain --no-legend 'aegis-incident-*' 2>/dev/null)" ]; then
-    echo "aegis-v2: process trees are still throttled or quarantined." >&2
-    echo "aegis-v2: run 'aegisctl incidents list', then release or kill each one." >&2
+    echo "aegis-v2: aegis-incident-* scopes exist; removal will leave them in place." >&2
+    echo "aegis-v2: next time, kill or release them with aegisctl before removing." >&2
 fi
 %systemd_preun aegisd.service
 
@@ -106,7 +106,8 @@ if [ $1 -eq 0 ]; then
         nft delete table inet aegis 2>/dev/null || :
     else
         echo "aegis-v2: left aegis-incident-* scopes, aegis.slice and the inet aegis table in place." >&2
-        echo "aegis-v2: see 'Uninstall' in docs/installation.md to thaw, end and clean them up." >&2
+        echo "aegis-v2: to thaw, end or clean them up, see" >&2
+        echo "aegis-v2: https://github.com/jamesconwaydev/aegis-v2/blob/v%{version}/docs/installation.md#uninstall" >&2
     fi
     systemctl daemon-reload 2>/dev/null || :
 fi
@@ -153,8 +154,8 @@ systemctl try-restart aegisd.service 2>/dev/null || :
 - Webhooks, and OTLP metrics beside the logs.
 - SELinux policy 0.2.0: aegisd may run busctl, systemctl and nft.
 - On erase, stop the aegis slices, remove the nftables table and
-  reload systemd, unless a throttled or quarantined tree is left, which
-  is kept and warned about.
+  reload systemd, unless an aegis-incident-* scope is left, released
+  ones included, which is kept and warned about.
 
 * Wed Oct 21 2026 James Conway <148910373+jamesconwaydev@users.noreply.github.com> - 0.1.1-1
 - List a member that joined at an exec under the image it runs.
