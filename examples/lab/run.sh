@@ -58,8 +58,8 @@ cleanup() {
 	[ "$MODE" = enforce ] && [ -n "$ID" ] && aegisctl incidents kill "$ID"
 	# Whatever of the payload is still running, if the script stopped early.
 	pkill -KILL -f "^$WORK/"
-	systemctl stop "$TARGET" 2>/dev/null
-	systemctl reset-failed "$TARGET" 2>/dev/null
+	systemctl --no-pager stop "$TARGET" 2>/dev/null
+	systemctl --no-pager reset-failed "$TARGET" 2>/dev/null
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -94,7 +94,7 @@ before=$(incident_ids)
 
 say "a stand-in for a system daemon: sleep, as $TARGET"
 systemd-run --quiet --unit="$TARGET" sleep 300
-PID=$(systemctl show -p MainPID --value "$TARGET")
+PID=$(systemctl --no-pager show -p MainPID --value "$TARGET")
 echo "pid $PID in system.slice/$TARGET"
 
 say "the 'payload': copies of bash and strace in $WORK"
@@ -106,6 +106,7 @@ say "run it: exec from /tmp, scan 30 closed loopback ports, then attach to pid $
 # connects without forking. The attach runs as its child, so both land
 # in one process tree and one incident. It runs in the background: in
 # enforce mode it's frozen part-way and never finishes on its own.
+# shellcheck disable=SC2016 # expanded by the payload shell, not this one
 "$WORK/bash" -c '
 for port in $(seq 47000 47029); do
 	{ : <>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null || true
@@ -115,6 +116,9 @@ timeout 2 "$1" -e trace=none -p "$2" 2>/dev/null
 echo "attached to $2 for 2 s, then detached"
 ' lab "$WORK/strace" "$PID" &
 PAYLOAD=$!
+# Not a job of this shell any more: when the kill on exit takes it,
+# bash would report it "Killed" with the whole payload quoted.
+disown "$PAYLOAD"
 
 ID=$(new_incident) || {
 	# Whatever it reached, the newest new incident is ours: cleanup
@@ -123,11 +127,11 @@ ID=$(new_incident) || {
 	die "no new $WANT incident${ID:+ ($ID stopped short)}; check journalctl -u aegisd"
 }
 if [ "$MODE" = audit ]; then
-	wait "$PAYLOAD" || true
+	while kill -0 "$PAYLOAD" 2>/dev/null; do sleep 0.2; done
 else
 	SCOPE=aegis-incident-$ID-q.scope
 	say "quarantined: the tree is frozen in $SCOPE"
-	systemctl show -p FreezerState "$SCOPE"
+	systemctl --no-pager show -p FreezerState "$SCOPE"
 	ps -o pid,args -p "$(paste -sd, "/sys/fs/cgroup/aegis.slice/aegis-quarantine.slice/$SCOPE/cgroup.procs")"
 
 	say "and cut off from the network"
