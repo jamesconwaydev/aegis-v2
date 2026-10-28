@@ -254,7 +254,8 @@ One JSON object per line, one line per recorded decision:
 | `evidence`      | the one evidence entry this decision added |
 
 A line for actions has `ts`, `actions` (the entries added) and
-`verdict`, and no `tgid` or `evidence`.
+`verdict`, and no `tgid` or `evidence`. `aegisctl incidents timeline`
+prints it as an `enforcement` row.
 
 Earlier evidence is on earlier lines. A timeline stops at 10,000 lines.
 One marker line follows (shown wrapped here), and then nothing more is

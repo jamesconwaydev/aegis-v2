@@ -183,6 +183,14 @@ added, score, and tier.
 2026-10-19T09:30:02Z  aegis-sim (4242)  MemfdExec  85.0  quarantine
 ```
 
+In enforce mode, each batch of actions gets a row too: `enforcement`,
+the steps in order (a failed one marked `(failed)`), `-` where the score
+goes, and the verdict after them.
+
+```text
+2026-10-19T09:30:03Z  enforcement  hold, scope, freeze, nft drop  -  quarantined
+```
+
 A timeline that reached its 10,000-line cap ends with a row saying
 `timeline truncated at 10000 lines`.
 
