@@ -87,6 +87,7 @@ pub struct EnforcerHandle {
     sinks: Arc<Sinks>,
     /// Fork jobs are being dropped and that has been logged.
     fork_drops_logged: AtomicBool,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl EnforcerHandle {
@@ -99,7 +100,25 @@ impl EnforcerHandle {
             forks: Arc::default(),
             sinks,
             fork_drops_logged: AtomicBool::new(false),
+            thread: None,
         }
+    }
+
+    /// Closes the queue and waits up to `cap` for the enforcer to finish
+    /// the job in hand and those still queued. False if it hadn't.
+    pub fn shutdown(self, cap: Duration) -> bool {
+        let Self { tx, thread, .. } = self;
+        drop(tx);
+        let Some(t) = thread else { return true };
+        let until = std::time::Instant::now() + cap;
+        while !t.is_finished() {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = t.join();
+        true
     }
 
     /// Queues a job without waiting. Fork jobs take at most
@@ -174,7 +193,7 @@ pub fn spawn_enforcer(
     enforcing: Arc<AtomicBool>,
 ) -> EnforcerHandle {
     let (tx, rx) = sync_channel(QUEUE);
-    let h = EnforcerHandle::new(tx, sinks.clone());
+    let mut h = EnforcerHandle::new(tx, sinks.clone());
     let mut e = Enforcer {
         store,
         holds,
@@ -191,7 +210,7 @@ pub fn spawn_enforcer(
         children: proc_children,
         forks: h.forks.clone(),
     };
-    std::thread::Builder::new()
+    let t = std::thread::Builder::new()
         .name("aegis-enforce".into())
         .spawn(move || {
             for job in rx {
@@ -199,6 +218,7 @@ pub fn spawn_enforcer(
             }
         })
         .expect("spawning the enforcer thread");
+    h.thread = Some(t);
     h
 }
 
@@ -1213,6 +1233,49 @@ mod tests {
             t.apply(&e);
         }
         t
+    }
+
+    fn slow(_: &str, _: &[String]) -> Result<String> {
+        std::thread::sleep(Duration::from_millis(300));
+        Ok(String::new())
+    }
+
+    fn spawn_slow(f: &Fx) -> EnforcerHandle {
+        spawn_enforcer(
+            f.e.store.clone(),
+            Holds::default(),
+            Systemd::with(slow, alive),
+            Nft::with(slow),
+            f.e.limits,
+            f.e.sinks.clone(),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    #[test]
+    fn shutdown_waits_for_the_job_in_hand() {
+        let f = fx("stop", ok);
+        let h = spawn_slow(&f);
+        h.queue(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        assert!(h.shutdown(Duration::from_secs(10)));
+        // Moved and frozen, and on the record before shutdown returned.
+        assert_eq!(f.incident().verdict, "quarantined");
+    }
+
+    #[test]
+    fn shutdown_gives_up_at_the_cap() {
+        let f = fx("stop-cap", ok);
+        let h = spawn_slow(&f);
+        h.queue(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(10)],
+        });
+        let t = std::time::Instant::now();
+        assert!(!h.shutdown(Duration::from_millis(100)));
+        assert!(t.elapsed() < Duration::from_millis(250));
     }
 
     #[test]

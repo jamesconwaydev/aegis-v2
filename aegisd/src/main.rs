@@ -50,6 +50,9 @@ const SWEEP_TICKS: u64 = 120;
 /// has its nft drop rule. Cheap with nothing quarantined: no nft call.
 const REASSERT_TICKS: u64 = 20;
 
+/// How long shutdown waits for the enforcer to finish its jobs.
+const ENFORCER_STOP: Duration = Duration::from_secs(5);
+
 /// sysexits.h EX_CONFIG.
 const EX_CONFIG: u8 = 78;
 /// Verifications run on at most this many threads; the rest queue.
@@ -393,6 +396,14 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     // and reaches the writer before its channel closes.
     pipe.flush_all();
     server.abort();
+    // A job cut off mid-way could leave a tree moved or frozen with
+    // nothing recorded. Queued jobs run too, until the cap.
+    if !enforcer.shutdown(ENFORCER_STOP) {
+        eprintln!(
+            "aegisd: enforcer still busy after {} s; stopping without it",
+            ENFORCER_STOP.as_secs()
+        );
+    }
     // Detaches every probe.
     drop(handle);
     // Closes the writer's channel so it drains and exits.
