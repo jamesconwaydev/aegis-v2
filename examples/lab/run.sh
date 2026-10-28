@@ -56,7 +56,7 @@ cleanup() {
 	set +e
 	# A quarantined tree stays frozen until someone ends it.
 	[ "$MODE" = enforce ] && [ -n "$ID" ] && aegisctl incidents kill "$ID"
-	# Whatever of the payload is still running, if we stopped early.
+	# Whatever of the payload is still running, if the script stopped early.
 	pkill -KILL -f "^$WORK/"
 	systemctl stop "$TARGET" 2>/dev/null
 	systemctl reset-failed "$TARGET" 2>/dev/null
@@ -116,7 +116,12 @@ echo "attached to $2 for 2 s, then detached"
 ' lab "$WORK/strace" "$PID" &
 PAYLOAD=$!
 
-ID=$(new_incident) || die "no new $WANT incident; check journalctl -u aegisd"
+ID=$(new_incident) || {
+	# Whatever it reached, the newest new incident is ours: cleanup
+	# kills it if it got as far as a quarantine scope.
+	ID=$(comm -13 <(echo "$before") <(incident_ids) | tail -1)
+	die "no new $WANT incident${ID:+ ($ID stopped short)}; check journalctl -u aegisd"
+}
 if [ "$MODE" = audit ]; then
 	wait "$PAYLOAD" || true
 else

@@ -83,9 +83,9 @@ release it or kill it.
 - **Uninstalling left systemd holding on.** After `dnf remove`,
   `aegis.slice` stayed active and the removed unit stayed loaded. On
   erase the package now reloads systemd, and stops the aegis slices and
-  deletes the `inet aegis` table when no incident scope is left. If a
-  throttled or quarantined tree is still there, it keeps all of that,
-  warns you, and the
+  deletes the `inet aegis` table when no incident scope is left. If any
+  tree aegisd moved is still there, released ones included, it keeps
+  all of that, warns you, and the
   [uninstall steps](https://github.com/jamesconwaydev/aegis-v2/blob/v0.2.0/docs/installation.md#uninstall)
   say how to end it.
 - **The end-to-end SELinux check never looked.** Over ssh, `ausearch`

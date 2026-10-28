@@ -138,16 +138,17 @@ changed.
 
 ## Uninstall
 
-If aegisd ever ran in enforce mode, end what it's holding first, while
-`aegisctl` is still installed:
+If aegisd ever ran in enforce mode, deal with what it moved first,
+while `aegisctl` is still installed:
 
 ```sh
 aegisctl incidents list
-aegisctl incidents release <id>   # or kill <id>
+aegisctl incidents kill <id>      # a quarantined tree you want gone
+aegisctl incidents release <id>   # a tree you want to keep running
 ```
 
 Do that for every incident whose verdict is `throttled` or
-`quarantined`.
+`quarantined`. A throttled one can only be released.
 
 Then remove it:
 
@@ -162,10 +163,15 @@ them at run time and the RPM doesn't own them. When no incident scope is
 left, it also stops `aegis.slice`, deletes the `inet aegis` nftables
 table and reloads systemd.
 
-If an `aegis-incident-*` scope is still there, removal leaves the
-scopes, the slice and the table alone and prints a warning. Stopping
-the slice would kill those trees, and deleting the table would give a
-quarantined one its network back without anyone deciding to.
+A released tree doesn't leave its scope. It stays in its
+`aegis-incident-*` scope until its last process exits, and while any
+such scope exists, removal leaves the scopes, `aegis.slice` and the
+`inet aegis` table alone and prints a warning. After a release that's
+expected and harmless: release already removed that tree's nftables
+rule, and the empty table and the slice are gone at the next boot.
+Stopping the slice instead would kill every tree still in it, and
+deleting the table would give a quarantined one its network back
+without anyone deciding to.
 
 ### If you already removed it
 
@@ -191,12 +197,19 @@ systemctl thaw aegis-incident-<id>-q.scope
 systemctl set-property --runtime aegis-incident-<id>.scope CPUQuota= MemoryHigh=infinity
 ```
 
-Once nothing frozen is left that should stay cut off, remove the rules
-and the slice:
+Once nothing frozen is left that should stay cut off, remove the
+nftables rules:
 
 ```sh
 nft delete table inet aegis
-systemctl stop aegis.slice   # kills anything still running under it
+```
+
+Leave `aegis.slice` alone if any scope you kept is still listed: it's
+harmless, and gone at the next boot. Only if every scope left is one you
+want ended, stop the slice, which kills everything under it:
+
+```sh
+systemctl stop aegis.slice
 ```
 
 ## Where to go next
