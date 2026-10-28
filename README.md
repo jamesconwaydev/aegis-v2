@@ -36,12 +36,13 @@ for you to decide.
 I built it for my own Rocky Linux servers. It's Rust, it ships as an RPM
 with its own SELinux policy, and it starts out only watching.
 
-![Aegis v2 running its lab on a Rocky Linux 10 test VM: a copy of bash in /tmp scans loopback, its child attaches strace to a throwaway service, and one incident climbs to 110.](assets/lab.gif)
+![Aegis v2 running its lab on a Rocky Linux 10 test VM: a copy of bash in /tmp scans loopback, its child attaches strace to a throwaway service, and at a score of 110 enforce mode freezes the tree and cuts it off.](assets/lab.gif)
 
 That's a real run of [`examples/lab/run.sh`](examples/lab) on a Rocky
 10.2 VM. It uses copies of the host's own bash and strace, never leaves
 the box, and cleans up after itself, so you can run it on a test VM and
-watch the same thing happen.
+watch the same thing happen. This run is in enforce mode; in audit mode
+you get the same incident, and nothing is touched.
 
 ## Install
 
