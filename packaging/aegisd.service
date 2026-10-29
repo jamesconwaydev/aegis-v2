@@ -12,6 +12,10 @@ Restart=on-failure
 RestartSec=5
 # A bad config exits 78 (EX_CONFIG). Restarting won't fix it.
 RestartPreventExitStatus=78
+# On every stop, crashes included: freeze any tree aegisd was observing
+# in honeypot mode, whose holds end with aegisd. aegisd closes those
+# observations when it starts again.
+ExecStopPost=/usr/libexec/aegis-v2/freeze-quarantine
 
 # Root, holding only what it uses:
 #   CAP_BPF, CAP_PERFMON  load the probes, open the tracepoints

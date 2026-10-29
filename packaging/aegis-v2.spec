@@ -68,6 +68,8 @@ install -Dpm 0755 %{aegis_bindir}/aegisd %{buildroot}%{_sbindir}/aegisd
 install -Dpm 0755 %{aegis_bindir}/aegisctl %{buildroot}%{_bindir}/aegisctl
 install -Dpm 0644 %{_sourcedir}/packaging/aegisd.service \
     %{buildroot}%{_unitdir}/aegisd.service
+install -Dpm 0755 %{_sourcedir}/packaging/freeze-quarantine \
+    %{buildroot}%{_libexecdir}/aegis-v2/freeze-quarantine
 install -Dpm 0644 %{_sourcedir}/packaging/config.toml \
     %{buildroot}%{_sysconfdir}/aegis-v2/config.toml
 install -Dpm 0644 %{_sourcedir}/packaging/allowlist.d/00-default.toml \
@@ -133,6 +135,8 @@ systemctl try-restart aegisd.service 2>/dev/null || :
 %{_sbindir}/aegisd
 %{_bindir}/aegisctl
 %{_unitdir}/aegisd.service
+%dir %{_libexecdir}/aegis-v2
+%{_libexecdir}/aegis-v2/freeze-quarantine
 # config.toml may hold an OTLP bearer token.
 %dir %attr(0750,root,root) %{_sysconfdir}/aegis-v2
 %dir %{_sysconfdir}/aegis-v2/allowlist.d
