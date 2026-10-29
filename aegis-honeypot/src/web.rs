@@ -11,6 +11,9 @@ use rustls::{ServerConfig, ServerConnection};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use aegis_proto::honeypot::Protocol;
+
+use crate::dispatch::{by_bytes, partial_method};
 use crate::hello::{self, Parsed as HelloParsed};
 use crate::http::{self, Body, Head, Parsed};
 use crate::serve::Handler;
@@ -30,8 +33,9 @@ const BAD_PAGE: &[u8] = b"<html>\r\n<head><title>400 Bad Request</title></head>\
 
 fn answer(status: &str, kind: &str, body: &[u8], close: bool, head_only: bool) -> Vec<u8> {
     let mut out = format!(
-        "HTTP/1.1 {status}\r\nServer: nginx\r\nContent-Type: {kind}\r\n\
+        "HTTP/1.1 {status}\r\nServer: nginx\r\nDate: {}\r\nContent-Type: {kind}\r\n\
          Content-Length: {}\r\nConnection: {}\r\n\r\n",
+        http_date(time::OffsetDateTime::now_utc()),
         body.len(),
         if close { "close" } else { "keep-alive" },
     )
@@ -41,6 +45,60 @@ fn answer(status: &str, kind: &str, body: &[u8], close: bool, head_only: bool) -
     }
     out
 }
+
+/// The most of one body held in memory, and so kept as its payload.
+const MAX_HELD: usize = 256 * 1024;
+
+/// The start of a body, up to its limit; never more in memory.
+struct Held {
+    data: Vec<u8>,
+    limit: usize,
+    /// More came than was kept.
+    cut: bool,
+}
+
+impl Held {
+    fn new(limit: usize) -> Self {
+        Self {
+            data: Vec::new(),
+            limit,
+            cut: false,
+        }
+    }
+
+    fn keep(&mut self, b: &[u8]) {
+        let len = self.data.len();
+        let n = b.len().min(self.limit - len);
+        // Double, as Vec would, so a drip doesn't reallocate per byte,
+        // but never past the limit.
+        if self.data.capacity() - len < n {
+            self.data
+                .reserve_exact((len + n).max(len * 2).min(self.limit) - len);
+        }
+        self.data.extend_from_slice(&b[..n]);
+        self.cut |= n < b.len();
+    }
+}
+
+/// `t` as an HTTP Date (RFC 9110 5.6.7).
+fn http_date(t: time::OffsetDateTime) -> String {
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        &t.weekday().to_string()[..3],
+        t.day(),
+        &t.month().to_string()[..3],
+        t.year(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+    )
+}
+
+const PLAIN_PAGE: &[u8] =
+    b"<html>\r\n<head><title>400 The plain HTTP request was sent to HTTPS port</title></head>\r\n\
+    <body>\r\n<center><h1>400 Bad Request</h1></center>\r\n\
+    <center>The plain HTTP request was sent to HTTPS port</center>\r\n\
+    <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
 
 /// How a request body ended.
 enum End {
@@ -171,25 +229,15 @@ impl Wire {
         }
     }
 
-    /// Reads `n` body bytes into `body` while it stays within `limit`;
-    /// past that `body` is dropped and the rest only read. False when
+    /// Reads `n` body bytes, keeping what `body` will hold. False when
     /// the client went first.
-    async fn take(
-        &mut self,
-        s: &mut Session,
-        mut n: u64,
-        body: &mut Option<Vec<u8>>,
-        limit: usize,
-    ) -> Result<bool> {
+    async fn take(&mut self, s: &mut Session, mut n: u64, body: &mut Held) -> Result<bool> {
         while n > 0 {
             if self.buf.is_empty() && !self.fill(s).await? {
                 return Ok(false);
             }
             let k = self.buf.len().min(usize::try_from(n).unwrap_or(usize::MAX));
-            *body = body.take().filter(|b| b.len() + k <= limit).map(|mut b| {
-                b.extend_from_slice(&self.buf[..k]);
-                b
-            });
+            body.keep(&self.buf[..k]);
             self.buf.drain(..k);
             n -= k as u64;
         }
@@ -197,12 +245,7 @@ impl Wire {
     }
 
     /// A chunked body (RFC 9112 7.1), trailers read and dropped.
-    async fn chunked(
-        &mut self,
-        s: &mut Session,
-        body: &mut Option<Vec<u8>>,
-        limit: usize,
-    ) -> Result<End> {
+    async fn chunked(&mut self, s: &mut Session, body: &mut Held) -> Result<End> {
         loop {
             let Some(line) = self.line(s).await? else {
                 return Ok(End::Gone);
@@ -213,7 +256,7 @@ impl Wire {
             if size == 0 {
                 break;
             }
-            if !self.take(s, size, body, limit).await? {
+            if !self.take(s, size, body).await? {
                 return Ok(End::Gone);
             }
             match self.line(s).await? {
@@ -233,12 +276,16 @@ impl Wire {
 }
 
 /// Requests and answers until the client is done, or a cap is.
-async fn exchange(s: &mut Session, mut w: Wire) -> Result<()> {
+/// `tls_port`: plain HTTP sent where TLS was expected, which nginx reads
+/// and then refuses.
+async fn exchange(s: &mut Session, mut w: Wire, tls_port: bool) -> Result<()> {
     loop {
+        let mut from = 0;
         let head = loop {
-            match http::head(&w.buf) {
+            match http::head(&w.buf, from) {
                 Parsed::Done(h) => break h,
                 Parsed::More => {
+                    from = w.buf.len().saturating_sub(3);
                     if !w.fill(s).await? {
                         return Ok(());
                     }
@@ -260,25 +307,24 @@ async fn exchange(s: &mut Session, mut w: Wire) -> Result<()> {
             len,
         } = head;
         w.buf.drain(..len);
-        // A body that can't be kept within the cap isn't held in memory
-        // either.
-        let limit = usize::try_from(s.room()).unwrap_or(usize::MAX);
-        let mut body = Some(Vec::new());
+        // No more is held than could be kept, and never more than
+        // MAX_HELD; the pcap still has the rest.
+        let room = usize::try_from(s.room()).unwrap_or(usize::MAX);
+        let mut body = Held::new(room.min(MAX_HELD));
         let end = match framing {
             Body::Length(n) => {
-                if w.take(s, n, &mut body, limit).await? {
+                if w.take(s, n, &mut body).await? {
                     End::Done
                 } else {
                     End::Gone
                 }
             }
-            Body::Chunked => w.chunked(s, &mut body, limit).await?,
+            Body::Chunked => w.chunked(s, &mut body).await?,
         };
-        match body {
-            Some(b) if !b.is_empty() => request.body = s.payload(&b)?,
-            Some(_) => {}
-            None => s.rec.truncated = true,
+        if !body.data.is_empty() {
+            request.body = s.payload(&body.data)?;
         }
+        s.rec.truncated |= body.cut;
         let head_only = request.method == "HEAD";
         let (kind, page) = if http::image(&request.path) {
             ("image/gif", GIF)
@@ -287,6 +333,14 @@ async fn exchange(s: &mut Session, mut w: Wire) -> Result<()> {
         };
         s.request(request);
         match end {
+            End::Done if tls_port => {
+                return w
+                    .write(
+                        s,
+                        &answer("400 Bad Request", "text/html", PLAIN_PAGE, true, false),
+                    )
+                    .await
+            }
             End::Done => {}
             End::Gone => return Ok(()),
             End::Bad => {
@@ -310,7 +364,7 @@ pub struct Http;
 
 impl Handler for Http {
     async fn serve(&self, s: &mut Session, io: TcpStream) -> Result<()> {
-        exchange(s, Wire::new(io, None, Vec::new())).await
+        exchange(s, Wire::new(io, None, Vec::new()), false).await
     }
 }
 
@@ -323,15 +377,13 @@ impl Handler for Https<'_> {
         // sees it, so a handshake that fails still leaves both.
         let mut raw = Vec::new();
         let mut buf = vec![0u8; CHUNK];
-        loop {
+        let hello = loop {
             match hello::parse(&raw) {
                 HelloParsed::More if raw.len() < hello::MAX => {}
-                HelloParsed::Hello(h) => {
-                    s.rec.sni = h.sni;
-                    s.rec.ja4 = Some(h.ja4);
-                    break;
-                }
-                _ => break,
+                HelloParsed::Hello(h) => break Some(h),
+                // "DELET": not TLS, and not yet a method either.
+                HelloParsed::Bad if partial_method(&raw) => {}
+                _ => break None,
             }
             let n = io.read(&mut buf).await?;
             if n == 0 {
@@ -341,9 +393,20 @@ impl Handler for Https<'_> {
             if !s.record(true, &buf[..n])? {
                 return Ok(());
             }
+        };
+        match hello {
+            Some(h) => {
+                s.rec.sni = h.sni;
+                s.rec.truncated |= h.cut;
+                s.rec.ja4 = Some(h.ja4);
+            }
+            None if by_bytes(&raw) == Protocol::Http => {
+                return exchange(s, Wire::new(io, None, raw), true).await
+            }
+            None => {}
         }
         let tls = ServerConnection::new(self.0.clone())?;
-        exchange(s, Wire::new(io, Some(tls), raw)).await
+        exchange(s, Wire::new(io, Some(tls), raw), false).await
     }
 }
 
@@ -428,6 +491,7 @@ mod tests {
             let (head, body) = response(&mut c).await;
             assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
             assert!(head.contains("\r\nServer: nginx\r\n"), "{head}");
+            assert!(head.contains("\r\nDate: ") && head.contains(" GMT\r\n"), "{head}");
             assert!(head.contains("\r\nContent-Type: text/html\r\n"), "{head}");
             assert!(head.contains("\r\nConnection: keep-alive\r\n"), "{head}");
             assert_eq!(body, PAGE);
@@ -591,9 +655,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_body_too_big_to_keep_is_read_past_and_flagged() {
+    async fn a_body_past_the_cap_keeps_what_fits_and_is_flagged() {
         let srv = server("wbig", 4000, Duration::from_secs(5));
-        let (rec, _) = session(&srv, Protocol::Http, |mut c| async move {
+        let (rec, dir) = session(&srv, Protocol::Http, |mut c| async move {
             c.write_all(b"POST / HTTP/1.1\r\nContent-Length: 3000\r\n\r\n")
                 .await
                 .unwrap();
@@ -602,34 +666,21 @@ mod tests {
         })
         .await;
         assert_eq!(rec.requests.len(), 1);
-        assert_eq!(rec.requests[0].body, None);
-        assert!(rec.payloads.is_empty());
+        // The pcap takes its share of the cap first; the body keeps
+        // what's left, from its start.
+        let kept = std::fs::read(dir.join(rec.requests[0].body.as_ref().unwrap())).unwrap();
+        assert!(!kept.is_empty() && kept.len() < 3000, "{}", kept.len());
+        assert!(kept.iter().all(|&b| b == b'x'));
         assert!(rec.truncated);
         cleanup(&srv.spool);
     }
 
-    /// A blocking rustls client trusting `ca`, asking for `name`: sends
-    /// `req`, returns all it gets back, or the error that stopped it.
-    fn tls_client(
-        c: std::net::TcpStream,
-        ca: &[u8],
-        name: ServerName<'static>,
-        req: &'static [u8],
-    ) -> std::io::Result<Vec<u8>> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(CertificateDer::from_pem_slice(ca).unwrap())
-            .unwrap();
-        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let conn = rustls::ClientConnection::new(Arc::new(cfg), name).unwrap();
-        let mut s = rustls::StreamOwned::new(conn, c);
-        s.write_all(req)?;
+    type Tls = rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>;
+
+    /// Sends one request that asks for a close, and returns all that
+    /// comes back.
+    fn get(s: &mut Tls) -> std::io::Result<Vec<u8>> {
+        s.write_all(b"GET /x HTTP/1.1\r\nHost: c2.example\r\nConnection: close\r\n\r\n")?;
         let mut out = Vec::new();
         // The honeypot closes without close_notify, as plenty of servers
         // do; what came before the close is the answer.
@@ -637,24 +688,242 @@ mod tests {
         Ok(out)
     }
 
-    async fn blocking_client(
+    /// A blocking rustls client trusting `ca`, asking for `name`, on its
+    /// own thread, doing `talk`.
+    async fn blocking_client<T: Send + 'static>(
         c: TcpStream,
         name: &'static str,
         ca: Vec<u8>,
-    ) -> std::io::Result<Vec<u8>> {
+        talk: fn(&mut Tls) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
         let c = c.into_std().unwrap();
         c.set_nonblocking(false).unwrap();
         let name = ServerName::try_from(name).unwrap();
         tokio::task::spawn_blocking(move || {
-            tls_client(
-                c,
-                &ca,
-                name,
-                b"GET /x HTTP/1.1\r\nHost: c2.example\r\nConnection: close\r\n\r\n",
-            )
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(CertificateDer::from_pem_slice(&ca).unwrap())
+                .unwrap();
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            let conn = rustls::ClientConnection::new(Arc::new(cfg), name).unwrap();
+            talk(&mut rustls::StreamOwned::new(conn, c))
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn https_keep_alive_ends_at_the_byte_cap() {
+        let (srv, ca) =
+            crate::serve::tests::server_with_ca("wtlscap", 8000, Duration::from_secs(5));
+        let (rec, _) = session(&srv, Protocol::Https, |c| async move {
+            let cut = blocking_client(c, "c2.example", ca, |s| {
+                for _ in 0..1000 {
+                    s.write_all(b"GET / HTTP/1.1\r\n\r\n")?;
+                    let mut b = [0u8; 4096];
+                    if s.read(&mut b)? == 0 {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+            .await;
+            assert!(cut.unwrap_or(true), "never cut off");
+        })
+        .await;
+        assert!(rec.truncated && !rec.timed_out);
+        assert!(!rec.requests.is_empty());
+        cleanup(&srv.spool);
+    }
+
+    #[tokio::test]
+    async fn https_keep_alive_ends_at_the_time_cap() {
+        let (srv, ca) =
+            crate::serve::tests::server_with_ca("wtlstime", 100_000, Duration::from_secs(1));
+        let (rec, _) = session(&srv, Protocol::Https, |c| async move {
+            // Kept alive, then silent: only the time cap ends it.
+            blocking_client(c, "c2.example", ca, |s| {
+                s.write_all(b"GET / HTTP/1.1\r\n\r\n")?;
+                let mut out = Vec::new();
+                let _ = s.read_to_end(&mut out);
+                Ok(out)
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+        assert!(rec.timed_out);
+        assert_eq!(rec.requests.len(), 1);
+        cleanup(&srv.spool);
+    }
+
+    #[tokio::test]
+    async fn a_slow_plain_request_on_a_tls_port_still_gets_the_400() {
+        let srv = server("wdrip", 100_000, Duration::from_secs(5));
+        let (rec, _) = session(&srv, Protocol::Https, |mut c| async move {
+            c.set_nodelay(true).unwrap();
+            // A byte at a time: "DELET" alone is neither TLS nor yet a
+            // method.
+            for b in b"DELETE /x HTTP/1.1\r\n\r\n" {
+                c.write_all(&[*b]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let mut rest = Vec::new();
+            let _ = c.read_to_end(&mut rest).await;
+            let rest = String::from_utf8_lossy(&rest);
+            assert!(
+                rest.contains("The plain HTTP request was sent to HTTPS port"),
+                "{rest}"
+            );
+        })
+        .await;
+        assert_eq!(rec.requests.len(), 1);
+        assert_eq!(rec.requests[0].method, "DELETE");
+        cleanup(&srv.spool);
+    }
+
+    #[tokio::test]
+    async fn plain_http_on_a_tls_port_gets_nginxs_own_400() {
+        let srv = server("wplain", 100_000, Duration::from_secs(5));
+        let (rec, _) = session(&srv, Protocol::Https, |mut c| async move {
+            c.write_all(b"GET /x HTTP/1.1\r\nHost: c2.example\r\n\r\n")
+                .await
+                .unwrap();
+            let mut rest = Vec::new();
+            c.read_to_end(&mut rest).await.unwrap();
+            let rest = String::from_utf8(rest).unwrap();
+            assert!(rest.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{rest}");
+            assert!(
+                rest.contains("The plain HTTP request was sent to HTTPS port"),
+                "{rest}"
+            );
+            assert!(rest.contains("\r\nConnection: close\r\n"), "{rest}");
+        })
+        .await;
+        assert_eq!(rec.ja4, None);
+        assert_eq!(rec.requests.len(), 1);
+        assert_eq!(rec.requests[0].path, "/x");
+        cleanup(&srv.spool);
+    }
+
+    #[tokio::test]
+    async fn a_huge_server_name_is_cut_and_the_session_still_files() {
+        let srv = server("wsni", 1_000_000, Duration::from_secs(5));
+        let hello = crate::hello::tests::build(Some(&[crate::hello::tests::sni(&[0xff; 30_000])]));
+        let (rec, dir) = session(&srv, Protocol::Https, |mut c| async move {
+            c.write_all(&hello).await.unwrap();
+            c.shutdown().await.unwrap();
+        })
+        .await;
+        assert_eq!(rec.sni.unwrap().chars().count(), crate::hello::MAX_SNI);
+        assert!(rec.truncated);
+        assert!(rec.ja4.is_some());
+        let json = std::fs::metadata(dir.join("session.json")).unwrap().len();
+        assert!(json < 64 * 1024, "{json}");
+        cleanup(&srv.spool);
+    }
+
+    #[tokio::test]
+    async fn pipelined_requests_are_each_answered() {
+        let srv = server("wpipe", 100_000, Duration::from_secs(5));
+        let (rec, dir) = session(&srv, Protocol::Http, |mut c| async move {
+            // A chunked POST and two GETs in one write, the last asking
+            // for a close.
+            c.write_all(
+                b"POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n\
+                  GET /b HTTP/1.1\r\n\r\nGET /c.gif HTTP/1.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            assert_eq!(response(&mut c).await.1, PAGE);
+            assert_eq!(response(&mut c).await.1, PAGE);
+            assert_eq!(response(&mut c).await.1, GIF);
+            let mut rest = Vec::new();
+            c.read_to_end(&mut rest).await.unwrap();
+            assert!(rest.is_empty());
+        })
+        .await;
+        let paths: Vec<_> = rec.requests.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, ["/a", "/b", "/c.gif"]);
+        assert_eq!(std::fs::read(dir.join(sha(b"abc"))).unwrap(), b"abc");
+        cleanup(&srv.spool);
+    }
+
+    #[tokio::test]
+    async fn a_big_body_keeps_its_first_256_kib() {
+        let srv = server("wheld", 4 << 20, Duration::from_secs(5));
+        let body: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+        let sent = body.clone();
+        let (rec, dir) = session(&srv, Protocol::Http, |mut c| async move {
+            c.write_all(
+                format!(
+                    "PUT /big HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                    sent.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            c.write_all(&sent).await.unwrap();
+            response(&mut c).await;
+        })
+        .await;
+        let kept = &body[..MAX_HELD];
+        assert_eq!(rec.requests[0].body, Some(sha(kept)));
+        assert_eq!(std::fs::read(dir.join(sha(kept))).unwrap(), kept);
+        assert!(rec.truncated);
+        // The pcap still has all of it.
+        assert!(rec.bytes_in > body.len() as u64);
+        cleanup(&srv.spool);
+    }
+
+    #[test]
+    fn a_held_body_never_grows_past_its_limit() {
+        let mut h = Held::new(100);
+        for _ in 0..3 {
+            h.keep(&[7; 60]);
+        }
+        assert_eq!(h.data, [7; 100]);
+        assert!(h.cut);
+        assert!(h.data.capacity() <= 100, "{}", h.data.capacity());
+        let mut h = Held::new(100);
+        h.keep(&[1; 100]);
+        assert!(!h.cut);
+    }
+
+    #[test]
+    fn a_dripped_body_grows_by_doubling_up_to_its_limit() {
+        let limit = 5000;
+        let mut h = Held::new(limit);
+        let (mut cap, mut grew) = (0, 0);
+        for _ in 0..4096 {
+            h.keep(&[1]);
+            assert!(h.data.capacity() <= limit, "{}", h.data.capacity());
+            if h.data.capacity() != cap {
+                (cap, grew) = (h.data.capacity(), grew + 1);
+            }
+        }
+        assert!(grew <= 14, "{grew} reallocations for 4096 bytes");
+        h.keep(&[1; 2000]);
+        assert_eq!(h.data.len(), limit);
+        assert_eq!(h.data.capacity(), limit);
+        assert!(h.cut);
+    }
+
+    #[test]
+    fn dates_are_written_as_http_has_them() {
+        let at = |t| time::OffsetDateTime::from_unix_timestamp(t).unwrap();
+        assert_eq!(
+            http_date(at(1_793_316_313)),
+            "Thu, 29 Oct 2026 23:25:13 GMT"
+        );
+        assert_eq!(http_date(at(951_782_400)), "Tue, 29 Feb 2000 00:00:00 GMT");
     }
 
     #[tokio::test]
@@ -664,7 +933,7 @@ mod tests {
         let (rec, _) = session(&srv, Protocol::Https, |c| async move {
             // The client checks the leaf is for c2.example and chains to
             // ca.pem.
-            let got = blocking_client(c, "c2.example", ca).await.unwrap();
+            let got = blocking_client(c, "c2.example", ca, get).await.unwrap();
             let got = String::from_utf8(got).unwrap();
             assert!(got.starts_with("HTTP/1.1 200 OK\r\n"), "{got}");
         })
@@ -687,7 +956,7 @@ mod tests {
             // No SNI for an address: the leaf is for the default name,
             // which this client then refuses. Without a cert at all it
             // would have been sent an alert instead.
-            let e = blocking_client(c, "127.77.0.1", ca).await.unwrap_err();
+            let e = blocking_client(c, "127.77.0.1", ca, get).await.unwrap_err();
             assert!(e.to_string().contains("not valid for name"), "{e}");
         })
         .await;

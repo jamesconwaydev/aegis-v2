@@ -32,6 +32,13 @@ pub fn by_port(port: u16) -> Option<Protocol> {
     })
 }
 
+/// Whether `first` could still become an HTTP method and its space.
+pub fn partial_method(first: &[u8]) -> bool {
+    METHODS
+        .iter()
+        .any(|m| m.len() > first.len() && m.starts_with(first))
+}
+
 /// For any other port: the protocol the client's opening bytes look
 /// like (empty when it waits to be spoken to), else raw.
 pub fn by_bytes(first: &[u8]) -> Protocol {

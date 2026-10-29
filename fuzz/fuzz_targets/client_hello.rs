@@ -8,15 +8,16 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     if let Parsed::Hello(h) = parse(data) {
-        // Always the same shape: t, version, d/i, two counts, ALPN, then
-        // two 12-digit hashes.
-        let parts: Vec<&str> = h.ja4.split('_').collect();
-        assert_eq!(parts.len(), 3, "{}", h.ja4);
-        assert_eq!(parts[0].len(), 10, "{}", h.ja4);
-        assert!(parts[0].bytes().all(|b| b.is_ascii_alphanumeric()), "{}", h.ja4);
-        for p in &parts[1..] {
-            assert_eq!(p.len(), 12, "{}", h.ja4);
-            assert!(p.bytes().all(|b| b.is_ascii_hexdigit()), "{}", h.ja4);
+        // Always the same shape: t, version, d/i and two counts, two
+        // ALPN characters (any ASCII, as FoxIO's code writes them, even
+        // an underscore), then two 12-digit hashes.
+        let j = h.ja4.as_bytes();
+        assert_eq!(j.len(), 36, "{}", h.ja4);
+        assert!(j[..8].iter().all(u8::is_ascii_alphanumeric), "{}", h.ja4);
+        assert!(j[8..10].iter().all(u8::is_ascii), "{}", h.ja4);
+        assert_eq!((j[10], j[23]), (b'_', b'_'), "{}", h.ja4);
+        for p in [&j[11..23], &j[24..]] {
+            assert!(p.iter().all(u8::is_ascii_hexdigit), "{}", h.ja4);
         }
         if let Some(sni) = h.sni {
             assert!(!sni.chars().any(char::is_control), "{sni:?}");

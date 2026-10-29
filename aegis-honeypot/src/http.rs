@@ -36,11 +36,13 @@ pub enum Parsed {
     Done(Head),
 }
 
-/// The request head at the start of `buf`.
-pub fn head(buf: &[u8]) -> Parsed {
+/// The request head at the start of `buf`, looking for its end from
+/// `from` on: a caller that got `More` for the first n bytes passes
+/// n - 3, so no byte is scanned twice.
+pub fn head(buf: &[u8], from: usize) -> Parsed {
     let b = &buf[..buf.len().min(MAX_HEAD)];
     // The blank line: LF, then LF or CR LF.
-    let end = (0..b.len()).find_map(|i| match b[i..] {
+    let end = (from.min(b.len())..b.len()).find_map(|i| match b[i..] {
         [b'\n', b'\n', ..] => Some(i + 2),
         [b'\n', b'\r', b'\n', ..] => Some(i + 3),
         _ => None,
@@ -157,7 +159,7 @@ mod tests {
     use super::*;
 
     fn done(b: &[u8]) -> Head {
-        match head(b) {
+        match head(b, 0) {
             Parsed::Done(h) => h,
             p => panic!("{p:?} for {:?}", String::from_utf8_lossy(b)),
         }
@@ -218,7 +220,7 @@ mod tests {
             "A: b\r\n".repeat(MAX_HEADERS + 1)
         );
         let most = format!("GET / HTTP/1.1\r\n{}\r\n", "A: b\r\n".repeat(MAX_HEADERS));
-        assert!(matches!(head(most.as_bytes()), Parsed::Done(_)));
+        assert!(matches!(head(most.as_bytes(), 0), Parsed::Done(_)));
         for bad in [
             &b"GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"[..],
             b"GET / HTTP/1.1\r\nContent-Length: +1\r\n\r\n",
@@ -237,22 +239,37 @@ mod tests {
             b"\r\n\r\n",
             many.as_bytes(),
         ] {
-            assert_eq!(head(bad), Parsed::Bad, "{:?}", String::from_utf8_lossy(bad));
+            assert_eq!(
+                head(bad, 0),
+                Parsed::Bad,
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
         }
     }
 
     #[test]
     fn a_head_is_awaited_up_to_its_cap() {
-        assert_eq!(head(b""), Parsed::More);
-        assert_eq!(head(b"GET / HTTP/1.1\r\nHost: x\r\n"), Parsed::More);
+        assert_eq!(head(b"", 0), Parsed::More);
+        assert_eq!(head(b"GET / HTTP/1.1\r\nHost: x\r\n", 0), Parsed::More);
         let mut long = b"GET /".to_vec();
         long.resize(MAX_HEAD - 1, b'a');
-        assert_eq!(head(&long), Parsed::More);
+        assert_eq!(head(&long, 0), Parsed::More);
         long.push(b'a');
-        assert_eq!(head(&long), Parsed::Bad);
+        assert_eq!(head(&long, 0), Parsed::Bad);
         // A blank line past the cap doesn't count either.
         long.extend(b" HTTP/1.1\r\n\r\n");
-        assert_eq!(head(&long), Parsed::Bad);
+        assert_eq!(head(&long, 0), Parsed::Bad);
+    }
+
+    #[test]
+    fn the_scan_starts_where_the_last_one_could_not_have_ended() {
+        let req = b"GET / HTTP/1.1\r\nA: b\r\n\r\n";
+        // The blank line begins 3 bytes from the end; a scan from there
+        // finds it, a scan from past it can't.
+        assert!(matches!(head(req, req.len() - 3), Parsed::Done(_)));
+        assert_eq!(head(req, req.len() - 2), Parsed::More);
+        assert_eq!(head(req, req.len() + 5), Parsed::More);
     }
 
     #[test]

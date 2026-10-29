@@ -22,8 +22,13 @@ pub enum Parsed {
 #[derive(Debug, PartialEq)]
 pub struct Hello {
     pub sni: Option<String>,
+    /// The name was longer than `MAX_SNI` and is cut there.
+    pub cut: bool,
     pub ja4: String,
 }
+
+/// The most of a server name kept: as long as a DNS name can be.
+pub const MAX_SNI: usize = 255;
 
 /// Printable text from client bytes, for the record: invalid UTF-8 and
 /// control characters become U+FFFD, so nothing can forge a line break
@@ -118,11 +123,12 @@ fn alpn(v: Option<&[u8]>) -> String {
     let Some((&f, &l)) = v.and_then(|v| v.first().zip(v.last())) else {
         return "00".into();
     };
-    if f.is_ascii_alphanumeric() && l.is_ascii_alphanumeric() {
-        format!("{}{}", f as char, l as char)
-    } else {
-        format!("{:x}{:x}", f >> 4, l & 0xf)
-    }
+    // Exactly as FoxIO's code (`first_last` in rust/ja4/src/tls.rs),
+    // which ja4db's fingerprints come from: ASCII as it is, a 9 for
+    // anything else. Neither their Rust nor Python has the spec text's
+    // hex rule.
+    let end = |b: u8| if b.is_ascii() { b as char } else { '9' };
+    format!("{}{}", end(f), end(l))
 }
 
 /// A whole ClientHello handshake message (RFC 8446 4.1.2), to JA4 as
@@ -135,7 +141,7 @@ fn hello(msg: &[u8]) -> Option<Hello> {
     r.vec8()?;
     let ciphers = r.vec16()?.u16s()?;
     r.vec8()?;
-    let (mut exts, mut sni, mut proto, mut versions, mut sigs) =
+    let (mut exts, mut name, mut proto, mut versions, mut sigs) =
         (Vec::new(), None, None, Vec::new(), Vec::new());
     // Hellos from before extensions end here.
     if !r.0.is_empty() {
@@ -144,18 +150,23 @@ fn hello(msg: &[u8]) -> Option<Hello> {
             let t = e.u16()?;
             let mut d = e.vec16()?;
             exts.push(t);
-            match t {
-                0x0000 => {
-                    let mut names = d.vec16()?;
-                    if names.take(1)? == [0] {
-                        sni = Some(text(names.vec16()?.0));
+            // A broken body costs only its own detail: the type still
+            // counts, so a client can't shed its fingerprint this way.
+            let _: Option<()> = (|| {
+                match t {
+                    0x0000 => {
+                        let mut names = d.vec16()?;
+                        if names.take(1)? == [0] {
+                            name = Some(names.vec16()?.0);
+                        }
                     }
+                    0x0010 => proto = d.vec16()?.vec8().map(|p| p.0),
+                    0x000d => sigs = d.vec16()?.u16s()?,
+                    0x002b => versions = d.vec8()?.u16s()?,
+                    _ => {}
                 }
-                0x0010 => proto = d.vec16()?.vec8().map(|p| p.0),
-                0x000d => sigs = d.vec16()?.u16s()?,
-                0x002b => versions = d.vec8()?.u16s()?,
-                _ => {}
-            }
+                Some(())
+            })();
         }
     }
     let keep = |v: Vec<u16>| -> Vec<u16> { v.into_iter().filter(|&x| !grease(x)).collect() };
@@ -191,13 +202,14 @@ fn hello(msg: &[u8]) -> Option<Hello> {
         (false, false) => hash12(&format!("{}_{}", list(&exts), list(&sigs))),
     };
     Some(Hello {
-        sni,
+        sni: name.map(|n| text(&n[..n.len().min(MAX_SNI)])),
+        cut: name.is_some_and(|n| n.len() > MAX_SNI),
         ja4: format!("{a}_{b}_{c}"),
     })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn hello(records: &[u8]) -> Hello {
@@ -226,14 +238,11 @@ mod tests {
                 "www.cloudflare.com",
                 "t12d4605h2_85626a9a5f7f_aaf95bb78ec9",
             ),
-            // The first ALPN is 0xba 0xad. The spec's rule makes that
-            // "bd"; FoxIO's Rust and Python implementations print "99"
-            // here (a 9 for each non-ASCII character of tshark's string),
-            // and their snapshot says t13d151699. Everything else agrees.
+            // The first ALPN is 0xba 0xad, which FoxIO's code makes "99".
             (
                 include_bytes!("testdata/ja4/tls-non-ascii-alpn.bin"),
                 "clientservices.googleapis.com",
-                "t13d1516bd_8daaf6152771_e5627efa2ab1",
+                "t13d151699_8daaf6152771_e5627efa2ab1",
             ),
             // GREASE among the signature algorithms too.
             (
@@ -251,24 +260,39 @@ mod tests {
     /// The examples in FoxIO's JA4 spec, "ALPN Extension Value"
     /// (technical_details/JA4.md).
     #[test]
-    fn alpn_goes_in_as_its_ends_or_their_hex() {
+    fn alpn_goes_in_as_foxio_writes_it() {
+        // `test_first_last` and `test_first_last_non_ascii` in FoxIO's
+        // rust/ja4/src/tls.rs, with each U+FFFD there a byte that isn't
+        // ASCII here; None there is "00" here.
         for (v, want) in [
-            (&b"h2"[..], "h2"),
-            (b"http/1.1", "h1"),
-            (b"h", "hh"),
-            (b"", "00"),
-            (&[0xab], "ab"),
-            (&[0x20], "20"),
-            (&[0xab, 0xcd], "ad"),
-            (&[0x20, 0x61], "21"),
-            (&[0x30, 0xab], "3b"),
-            (&[0x61, 0x20], "60"),
-            (&[0x30, 0x31, 0xab, 0xcd], "3d"),
-            (&[0x30, 0xab, 0xcd, 0x31], "01"),
+            (&b""[..], "00"),
+            (b"a", "aa"),
+            (b"x", "xx"),
+            (b"7", "77"),
+            (b"ab", "ab"),
+            (b"abc", "ac"),
+            (&[0xff], "99"),
+            (&[0xff, 0xff], "99"),
+            (&[0xff, b'x', 0xff], "99"),
+            (b"x\xff", "x9"),
+            (b"\xffx", "9x"),
         ] {
             assert_eq!(alpn(Some(v)), want, "{v:?}");
         }
         assert_eq!(alpn(None), "00");
+        // Their code has no hex path: ASCII goes in as it is, punctuation
+        // included, where the spec text would write hex ("20", "21").
+        for (v, want) in [
+            (&b"h2"[..], "h2"),
+            (b"http/1.1", "h1"),
+            (b" ", "  "),
+            (b" a", " a"),
+            (b"a/", "a/"),
+            (&[0x30, 0xab], "09"),
+            (&[b' ', 0xab], " 9"),
+        ] {
+            assert_eq!(alpn(Some(v)), want, "{v:?}");
+        }
     }
 
     /// `records`' one handshake message split across two records.
@@ -314,20 +338,71 @@ mod tests {
 
     #[test]
     fn a_bare_hello_has_an_ip_fingerprint_and_zero_hashes() {
-        // TLS 1.2, one cipher, no compression, no extensions at all.
-        let mut m = vec![1, 0, 0, 0, 3, 3];
-        m.extend([0; 32]);
-        m.extend([0, 0, 2, 0x00, 0x2f, 1, 0]);
-        let len = (m.len() - 4) as u32;
-        m[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
-        let rec = [&[22, 3, 1][..], &(m.len() as u16).to_be_bytes(), &m].concat();
-        let h = hello(&rec);
+        let h = hello(&build(None));
         assert_eq!(h.sni, None);
         let b: String = Sha256::digest(b"002f")[..6]
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(h.ja4, format!("t12i010000_{b}_000000000000"));
+    }
+
+    /// A TLS 1.2 hello with one cipher and these extensions (none at all
+    /// for None), in one record.
+    pub fn build(exts: Option<&[(u16, Vec<u8>)]>) -> Vec<u8> {
+        let mut m = vec![1, 0, 0, 0, 3, 3];
+        m.extend([0; 32]);
+        m.extend([0, 0, 2, 0x00, 0x2f, 1, 0]);
+        if let Some(exts) = exts {
+            let mut e = Vec::new();
+            for (t, d) in exts {
+                e.extend(t.to_be_bytes());
+                e.extend((d.len() as u16).to_be_bytes());
+                e.extend(d);
+            }
+            m.extend((e.len() as u16).to_be_bytes());
+            m.extend(e);
+        }
+        let len = (m.len() - 4) as u32;
+        m[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
+        [&[22, 3, 1][..], &(m.len() as u16).to_be_bytes(), &m].concat()
+    }
+
+    pub fn sni(name: &[u8]) -> (u16, Vec<u8>) {
+        let mut d = ((name.len() + 3) as u16).to_be_bytes().to_vec();
+        d.push(0);
+        d.extend((name.len() as u16).to_be_bytes());
+        d.extend(name);
+        (0, d)
+    }
+
+    #[test]
+    fn a_long_server_name_is_cut_and_says_so() {
+        let h = hello(&build(Some(&[sni(&[0xff; 30_000])])));
+        assert!(h.cut);
+        assert_eq!(h.sni.unwrap(), "\u{fffd}".repeat(MAX_SNI));
+        assert!(h.ja4.starts_with("t12d0101"), "{}", h.ja4);
+        let h = hello(&build(Some(&[sni(&[b'a'; MAX_SNI])])));
+        assert!(!h.cut);
+        assert_eq!(h.sni.unwrap().len(), MAX_SNI);
+    }
+
+    #[test]
+    fn a_broken_extension_loses_only_its_own_detail() {
+        let (_, good) = sni(b"c2.example");
+        let whole = hello(&build(Some(&[(0, good.clone()), (0x0d, vec![0, 2, 4, 3])])));
+        let broken = [
+            // An empty SNI, an odd-length supported_versions, and a
+            // signature algorithm list with a byte too many.
+            (0, vec![]),
+            (0x2b, vec![3, 3, 4, 3]),
+            (0x0d, vec![0, 3, 4, 3, 1]),
+        ];
+        let h = hello(&build(Some(&broken)));
+        assert_eq!(h.sni, None);
+        // Still a domain, three extensions, and the legacy version.
+        assert!(h.ja4.starts_with("t12d010300_"), "{}", h.ja4);
+        assert!(whole.ja4.starts_with("t12d010200_"), "{}", whole.ja4);
     }
 
     #[test]
