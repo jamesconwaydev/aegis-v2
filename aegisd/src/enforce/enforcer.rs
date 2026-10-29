@@ -26,7 +26,7 @@ use crate::telemetry::{now_ns, rfc3339, Sinks, TelemetryRecord};
 
 mod honeypot;
 use honeypot::Observed;
-pub use honeypot::{Guard, Honeypot, HoneypotParts};
+pub use honeypot::{freeze_marked, Guard, Honeypot, HoneypotParts, MARKS};
 
 /// Jobs waiting for the enforcer; past this the loop drops and counts.
 const QUEUE: usize = 256;
@@ -682,10 +682,17 @@ impl Enforcer {
         // What only the walk found has no hold of ours, and an observed
         // tree isn't frozen: it may run there only if the kernel already
         // holds it (forked from an open hold).
-        let unheld = all[pids.len()..]
-            .iter()
-            .any(|k| !matches!(self.holds.start_time(k.tgid), Ok(Some(_))));
+        // A walk cut short at MAX_FOUND may have missed some: unheld too.
+        let unheld = all.len() >= pids.len() + MAX_FOUND
+            || all[pids.len()..]
+                .iter()
+                .any(|k| !matches!(self.holds.start_time(k.tgid), Ok(Some(_))));
         let pids = &all[..];
+        if watched.is_some() && (unheld || !all_held) {
+            // A newcomer that isn't held is about to join a scope that
+            // isn't frozen: the observation ends, frozen, before it joins.
+            acts.extend(self.close_observation(id, "a process in the tree could not be held"));
+        }
 
         // A newcomer joins the scope the tree is already in. If the
         // tree's own move failed it is only held, like the tree: a scope
@@ -721,11 +728,6 @@ impl Enforcer {
         if let (true, Some((hp, addr))) = (moved, plan) {
             (observed, opened_to) = self.observe(id, &unit, &held, hp, addr, &mut acts);
         }
-        if watched.is_some() && moved && unheld {
-            // A newcomer brought processes that can't be held into a
-            // scope that isn't frozen: the observation ends now.
-            acts.extend(self.close_observation(id, "a process in the tree could not be held"));
-        }
         let observing = observed || self.observing.contains_key(id);
         let mut now_frozen = frozen || acts.iter().any(|a| a.ok && a.kind == "freeze");
         if moved && !now_frozen && !observing {
@@ -736,6 +738,11 @@ impl Enforcer {
             // the frozen tree.
             if let Some(c) = opened_to {
                 acts.extend(self.close_holds(&unit, c, now_frozen));
+            }
+            // A marker written before the failure stays until the tree is
+            // frozen: until then ExecStopPost must still freeze it.
+            if plan.is_some() && now_frozen {
+                self.unmark(&unit);
             }
         }
         if moved && now_frozen {
@@ -852,7 +859,7 @@ impl Enforcer {
             }
             let found = self.find_rules(&prior, &unit);
             let gone = self.remove_rules(found, &unit, &mut acts);
-            acts.extend(self.unobserve(id, "released"));
+            acts.extend(self.unobserve(id, "released", false));
             done = format!("released {id}: thawed, network restored{gone}");
             // The tree stays in its -q scope, so its accounting
             // lives under aegis-quarantine.slice. Moving it back to its
@@ -889,7 +896,7 @@ impl Enforcer {
         let r = self.sys.kill(&unit);
         acts.push(act("kill", Some(&unit), vec![], r.map(|_| None)));
         let gone = self.remove_rules(found, &unit, &mut acts);
-        acts.extend(self.unobserve(id, "killed"));
+        acts.extend(self.unobserve(id, "killed", false));
         self.conclude(id, acts, format!("killed {id}{gone}"))
     }
 
@@ -3687,7 +3694,20 @@ mod tests {
         TABLE.with(|t| t.borrow_mut().as_mut().unwrap().1.retain(|r| r.0 != nat));
         let n = f.kinds().len();
         f.e.run(EnforceJob::Reassert);
-        assert_eq!(f.kinds().len(), n + 4);
+        // The three left are removed, on the record, then all four added.
+        let k: Vec<String> = f.kinds()[n..].iter().map(|k| k.0.clone()).collect();
+        assert_eq!(
+            k,
+            [
+                "nft_remove",
+                "nft_remove",
+                "nft_remove",
+                "nft_accept",
+                "nft_accept",
+                "nft_dnat",
+                "nft_dnat"
+            ]
+        );
         let mut again = shaped();
         norm(&mut again);
         assert_eq!(again, b);
@@ -3769,10 +3789,195 @@ mod tests {
             pids: vec![k(20)],
         });
         assert_eq!(summary(&f).as_deref(), Some("quarantined"));
+        assert!(f
+            .incident()
+            .actions
+            .iter()
+            .any(|a| a.kind == "honeypot_close"
+                && a.detail.as_deref() == Some("a process in the tree could not be held")));
+        assert!(f.e.holds.close_scope(99).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_newcomer_whose_hold_fails_is_frozen_before_it_joins() {
+        let mut f = hp("hp-nohold", ok);
+        observe(&mut f, &[10]);
+        let n = f.kinds().len();
+        take();
+        // No start time: hold() refuses it.
+        let bad = ProcKey {
+            tgid: 20,
+            start_time_ns: 0,
+        };
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![bad],
+        });
+        let kinds: Vec<String> = f.kinds()[n..].iter().map(|k| k.0.clone()).collect();
+        let at = |k: &str| kinds.iter().position(|x| x == k);
+        let (fz, hc, att) = (at("freeze"), at("honeypot_close"), at("attach"));
+        assert!(fz.is_some() && hc.is_some() && att.is_some(), "{kinds:?}");
+        assert!(att > fz, "{kinds:?}");
+        // The scope was frozen before anything joined it.
+        let c: Vec<String> = take().iter().map(|a| a.join(" ")).collect();
+        let freeze = c.iter().position(|x| x.contains(" freeze "));
+        let join = c.iter().position(|x| x.contains("AttachProcessesToUnit"));
+        assert!(freeze.is_some() && join.is_some(), "{c:?}");
+        assert!(join > freeze, "{c:?}");
+        assert!(f.e.observing.is_empty());
+        assert_eq!(summary(&f).as_deref(), Some("quarantined"));
+        assert!(f.e.holds.close_scope(99).unwrap().is_empty());
+    }
+
+    #[test]
+    fn observing_stops_before_the_held_map_runs_short() {
+        let mut f = hp("hp-budget", ok);
+        let other = Observed {
+            addr: "127.77.0.1".parse().unwrap(),
+            cgroup_id: 55,
+            opened: std::time::Instant::now(),
+            tcp: 2580,
+            dns: 2553,
+        };
+        f.e.observing.insert("AEG-other".into(), other);
+        let set = |f: &mut Fx, t: u32| {
+            if let Some(h) = f.e.honeypot.lock().unwrap().as_mut() {
+                h.max_tasks = t;
+            }
+        };
+        set(&mut f, 4096);
+        assert!(f.e.plan(&f.id).is_some(), "2 x 4096 fits in 8192");
+        set(&mut f, 4097);
+        assert!(f.e.plan(&f.id).is_none());
+        observe(&mut f, &[10]);
+        assert!(!f.kinds().iter().any(|k| k.0 == "honeypot_open"));
+        assert_eq!(summary(&f).as_deref(), Some("quarantined"));
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_written_opens_nothing() {
+        let mut f = hp("hp-nomark", ok);
+        // A file where the directory should be.
+        let file = f.dir.join("not-a-dir");
+        std::fs::write(&file, "").unwrap();
+        f.e.marks = Some(file.join("observing"));
+        observe(&mut f, &[10]);
+        let kinds = f.kinds();
+        assert!(kinds.contains(&("observe".into(), false)), "{kinds:?}");
+        assert!(kinds.contains(&("freeze".into(), true)), "{kinds:?}");
+        assert!(!kinds
+            .iter()
+            .any(|k| k.0 == "honeypot_open" || k.0 == "close"));
+        assert!(f.e.holds.close_scope(99).unwrap().is_empty());
+        assert!(f.e.observing.is_empty());
+        assert_eq!(f.incident().verdict, "quarantined");
+    }
+
+    #[test]
+    fn a_guard_that_fails_to_attach_leaves_a_drop_quarantine() {
+        struct NoGuard;
+        impl Guard for NoGuard {
+            fn attach(&mut self, _: &str, _: u16, _: u16) -> Result<()> {
+                bail!("bpf_link_create: permission denied")
+            }
+            fn detach(&mut self, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut f = hp("hp-noguard", ok);
+        f.e.guard = Box::new(NoGuard);
+        observe(&mut f, &[10]);
         assert_eq!(
-            last_act(&f).detail.as_deref(),
-            Some("a process in the tree could not be held")
+            f.kinds()[2..],
+            [
+                ("observe".into(), false),
+                ("freeze".into(), true),
+                ("nft_drop".into(), true),
+            ]
         );
         assert!(f.e.holds.close_scope(99).unwrap().is_empty());
+        assert_eq!(f.incident().verdict, "quarantined");
+    }
+
+    #[test]
+    fn new_honeypot_ports_end_live_observations() {
+        let mut f = hp("hp-ports", ok);
+        observe(&mut f, &[10]);
+        if let Some(h) = f.e.honeypot.lock().unwrap().as_mut() {
+            h.tcp_port = 2581;
+        }
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(
+            last_act(&f).detail.as_deref(),
+            Some("the honeypot ports changed")
+        );
+        assert!(f.e.observing.is_empty());
+        assert_eq!(summary(&f).as_deref(), Some("quarantined"));
+    }
+
+    #[test]
+    fn a_tree_that_cannot_be_frozen_keeps_its_guard_and_marker() {
+        let mut f = hp("hp-nofreeze", fail_freeze);
+        observe(&mut f, &[10]);
+        let unit = q_unit(&f.id);
+        assert!(f.dir.join("observing").join(&unit).exists());
+        if let Some(h) = f.e.honeypot.lock().unwrap().as_mut() {
+            h.window = Duration::ZERO;
+        }
+        take();
+        f.e.run(EnforceJob::Reassert);
+        assert!(!take().iter().any(|c| c[0] == "unguard"));
+        assert!(f.dir.join("observing").join(&unit).exists());
+        assert_eq!(
+            last_act(&f).detail.as_deref(),
+            Some("observation window ended")
+        );
+        // A release afterwards takes the marker too: the next stop must
+        // not freeze a tree the admin let go.
+        let _ = f.e.release(&f.id);
+        assert!(!f.dir.join("observing").join(&unit).exists());
+    }
+
+    #[test]
+    fn a_failed_observe_that_could_not_freeze_loses_its_marker_on_release() {
+        fn no_listener(_: u16, _: u16) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        let mut f = hp("hp-nofreeze-obs", fail_freeze);
+        f.e.listening = no_listener;
+        // Fails after the marker step only if the marker comes first: write
+        // it by hand, as a partial open would have.
+        let unit = q_unit(&f.id);
+        std::fs::create_dir_all(f.dir.join("observing")).unwrap();
+        std::fs::write(f.dir.join("observing").join(&unit), "").unwrap();
+        observe(&mut f, &[10]);
+        assert!(
+            f.dir.join("observing").join(&unit).exists(),
+            "kept: not frozen"
+        );
+        let _ = f.e.release(&f.id);
+        assert!(!f.dir.join("observing").join(&unit).exists());
+    }
+
+    #[test]
+    fn a_walk_cut_short_counts_as_unheld() {
+        let mut f = hp("hp-many", ok);
+        // Every child is already held, but there are more than the walk
+        // takes.
+        for t in 100_000..(100_000 + MAX_FOUND as u32 + 10) {
+            f.e.holds.hold(k(t)).unwrap();
+        }
+        f.e.children = |p| {
+            if p.tgid == 10 {
+                (100_000..(100_000 + MAX_FOUND as u32 + 10))
+                    .map(k)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        observe(&mut f, &[10]);
+        assert!(!f.kinds().iter().any(|k| k.0 == "honeypot_open"));
+        assert_eq!(summary(&f).as_deref(), Some("quarantined"));
     }
 }

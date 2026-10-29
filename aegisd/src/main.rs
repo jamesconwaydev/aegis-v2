@@ -31,7 +31,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{Config, ConfigHandle};
 use crate::enforce::enforcer::{
-    spawn_enforcer, Backends, EnforceJob, EnforcerHandle, Honeypot, HoneypotParts,
+    freeze_marked, spawn_enforcer, Backends, EnforceJob, EnforcerHandle, Honeypot, HoneypotParts,
+    MARKS,
 };
 use crate::enforce::nft::Nft;
 use crate::enforce::systemd::{Limits, Systemd};
@@ -417,6 +418,11 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
             "aegisd: enforcer still busy after {} s; stopping without it",
             ENFORCER_STOP.as_secs()
         );
+    }
+    // An observed tree runs on holds that end with the probes: freeze it
+    // first. The HELD map lives as long as the probes using it.
+    for e in freeze_marked(Path::new(MARKS), &Systemd::new()) {
+        eprintln!("aegisd: could not freeze {e}; ExecStopPost tries again");
     }
     // Detaches every probe.
     drop(handle);

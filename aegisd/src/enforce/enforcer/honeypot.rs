@@ -16,6 +16,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use super::{act, q_unit, Enforcer, QUARANTINE_SLICE};
 use crate::config::{Config, NetworkMode};
 use crate::enforce::nft::{Nft, NAT};
+use crate::enforce::systemd::Systemd;
 use crate::incident::ActionRecord;
 use crate::proctable::ProcKey;
 
@@ -26,6 +27,9 @@ pub const MARKS: &str = "/var/lib/aegis-v2/observing";
 /// How long `observe` waits for the scope's cgroup: busctl returns once
 /// the start job is queued.
 const CGROUP_WAIT: Duration = Duration::from_secs(2);
+/// Most `HELD` entries observed trees may fill between them: half of its
+/// 16384, so a fork copy never fails for room and drop mode keeps the rest.
+const HELD_BUDGET: usize = 8192;
 
 /// What a quarantined tree may reach in honeypot mode: the egress guard
 /// on its scope. The eBPF one is in `ebpf::EgressGuard`.
@@ -82,6 +86,19 @@ pub fn listening(tcp: u16, dns: u16) -> std::io::Result<bool> {
     aegis_proto::honeypot_listening(std::path::Path::new("/proc"), tcp, dns)
 }
 
+/// At SIGTERM, while the probes still hold: freezes each scope listed in
+/// `dir`, as ExecStopPost does once aegisd has gone. Returns the failures.
+pub fn freeze_marked(dir: &std::path::Path, sys: &Systemd) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|u| u.starts_with("aegis-incident-") && u.ends_with("-q.scope"))
+        .filter_map(|u| sys.freeze(&u).err().map(|e| format!("{u}: {e:#}")))
+        .collect()
+}
+
 /// A cgroup v2 id is its directory's inode.
 pub fn cgroup_id(dir: &str) -> std::io::Result<u64> {
     Ok(std::fs::metadata(dir)?.ino())
@@ -124,6 +141,15 @@ impl Enforcer {
     /// or there is no address left.
     pub(super) fn plan(&self, id: &str) -> Option<(Honeypot, Ipv4Addr)> {
         let hp = (*self.honeypot.lock().unwrap_or_else(|e| e.into_inner()))?;
+        if (self.observing.len() + 1) * hp.max_tasks as usize > HELD_BUDGET {
+            eprintln!(
+                "aegisd: {id}: {} trees of up to {} tasks observed already; \
+                 quarantined with the network dropped",
+                self.observing.len(),
+                hp.max_tasks
+            );
+            return None;
+        }
         if self.observing.len() >= hp.max_incidents as usize {
             eprintln!(
                 "aegisd: {id}: {} trees observed already ([honeypot] max_incidents); \
@@ -172,7 +198,7 @@ impl Enforcer {
             }
         };
         if let Err(e) = self.open_up(unit, cgid, held, hp, addr, acts) {
-            self.unmark(unit);
+            // The marker, if written, goes once the caller has frozen it.
             acts.push(act(
                 "observe",
                 Some(unit),
@@ -298,8 +324,9 @@ impl Enforcer {
         let unit = q_unit(id);
         let mut acts = Vec::new();
         // Nothing left in the scope: nothing to freeze.
+        let empty = matches!(self.sys.is_populated(QUARANTINE_SLICE, &unit), Ok(false));
         let mut frozen = false;
-        if !matches!(self.sys.is_populated(QUARANTINE_SLICE, &unit), Ok(false)) {
+        if !empty {
             let a = self.freeze(&unit);
             frozen = a.ok;
             acts.push(a);
@@ -313,7 +340,7 @@ impl Enforcer {
             acts.extend(self.close_holds(&unit, c, frozen));
         }
         acts.extend(self.remove_redirects(&unit));
-        acts.extend(self.unobserve(id, why));
+        acts.extend(self.unobserve(id, why, !frozen && !empty));
         acts
     }
 
@@ -352,17 +379,25 @@ impl Enforcer {
         acts
     }
 
-    /// Frees the address and takes the guard off the scope.
-    pub(super) fn unobserve(&mut self, id: &str, why: &str) -> Vec<ActionRecord> {
+    /// Frees the address and takes the guard off the scope. With `keep`
+    /// (a tree that could not be frozen) the guard and the marker stay.
+    pub(super) fn unobserve(&mut self, id: &str, why: &str, keep: bool) -> Vec<ActionRecord> {
         let unit = q_unit(id);
         let mut acts = Vec::new();
         // At start the record alone says it was observed.
         let was = self.observing.remove(id).is_some() || super::observing(&self.actions(id));
-        if was {
+        // Also when the record no longer says observing: a marker kept
+        // after a failed freeze must not outlive a release or kill.
+        if !keep {
             self.unmark(&unit);
+        }
+        if was {
             let mut a = act("honeypot_close", None, vec![], Ok(None));
             a.detail = Some(why.into());
             acts.push(a);
+        }
+        if keep {
+            return acts;
         }
         if let Err(e) = self.guard.detach(&cgroup_dir(&unit)) {
             acts.push(act("guard", Some(&unit), vec![], Err(e)));
@@ -371,20 +406,25 @@ impl Enforcer {
     }
 
     /// Closes each observation whose window has passed, or every one once
-    /// a reload has set the network back to "drop".
+    /// a reload has set the network back to "drop" or moved the ports.
     pub(super) fn expire_observations(&mut self) {
         let hp = *self.honeypot.lock().unwrap_or_else(|e| e.into_inner());
-        let why = match hp {
-            Some(_) => "observation window ended",
-            None => "quarantine.network is now \"drop\"",
-        };
-        let due: Vec<String> = self
+        let due: Vec<(String, &str)> = self
             .observing
             .iter()
-            .filter(|(_, o)| hp.is_none_or(|h| o.opened.elapsed() >= h.window))
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, o)| {
+                let why = match hp {
+                    None => "quarantine.network is now \"drop\"",
+                    Some(h) if (h.tcp_port, h.dns_port) != (o.tcp, o.dns) => {
+                        "the honeypot ports changed"
+                    }
+                    Some(h) if o.opened.elapsed() >= h.window => "observation window ended",
+                    Some(_) => return None,
+                };
+                Some((id.clone(), why))
+            })
             .collect();
-        for id in due {
+        for (id, why) in due {
             eprintln!("aegisd: {id}: {why}; frozen");
             let acts = self.close_observation(&id, why);
             self.finish(&id, acts, None);
@@ -407,12 +447,18 @@ impl Enforcer {
         if whole && Nft::has_local_rule(listing) {
             return;
         }
+        let mut removed = Vec::new();
         let r = self.nft.ensure_nat().and_then(|()| {
             if whole {
                 return Ok(Vec::new());
             }
             for (c, h) in &red {
-                self.nft.remove(c, *h)?;
+                let r = self.nft.remove(c, *h);
+                let failed = r.is_err();
+                removed.push(act("nft_remove", Some(&unit), vec![], r.map(|()| Some(*h))));
+                if failed {
+                    bail!("removing a partial set of honeypot rules failed");
+                }
             }
             self.nft.redirect(&cg, o.addr, o.tcp, o.dns)
         });
@@ -420,9 +466,13 @@ impl Enforcer {
             Ok(hs) if hs.is_empty() => {}
             Ok(hs) => {
                 eprintln!("aegisd: {id}: honeypot rules {why}");
-                self.finish(id, redirect_acts(&unit, hs, Some(why)), None);
+                removed.extend(redirect_acts(&unit, hs, Some(why)));
+                self.finish(id, removed, None);
             }
             Err(e) => {
+                if !removed.is_empty() {
+                    self.finish(id, std::mem::take(&mut removed), None);
+                }
                 let failing = self
                     .actions(id)
                     .iter()
@@ -472,7 +522,7 @@ impl Enforcer {
             .with_context(|| format!("marking {unit} in {}", d.display()))
     }
 
-    fn unmark(&self, unit: &str) {
+    pub(super) fn unmark(&self, unit: &str) {
         if let Some(d) = &self.marks {
             let _ = std::fs::remove_file(d.join(unit));
         }
@@ -482,6 +532,46 @@ impl Enforcer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static FROZE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn sigterm_freezes_only_the_marked_scopes() {
+        fn run(_: &str, a: &[String]) -> Result<String> {
+            FROZE.with(|f| f.borrow_mut().push(a.join(" ")));
+            if a[1].contains("bad") {
+                bail!("no such unit")
+            }
+            Ok(String::new())
+        }
+        let d = std::env::temp_dir().join(format!("aegis-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for f in [
+            "aegis-incident-A-q.scope",
+            "aegis-incident-bad-q.scope",
+            "other.scope",
+        ] {
+            std::fs::write(d.join(f), "").unwrap();
+        }
+        let sys = Systemd::with(run, |_, _| true);
+        let failed = freeze_marked(&d, &sys);
+        let mut froze = FROZE.with(|f| f.take());
+        froze.sort();
+        assert_eq!(
+            froze,
+            [
+                "freeze aegis-incident-A-q.scope",
+                "freeze aegis-incident-bad-q.scope"
+            ]
+        );
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].starts_with("aegis-incident-bad-q.scope: "));
+        assert!(freeze_marked(&d.join("none"), &sys).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn pick_addr_skips_taken_and_edges() {
