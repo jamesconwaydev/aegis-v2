@@ -18,7 +18,9 @@ fn port<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
     }
 }
 
-fn at_least_one<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default + PartialEq>(
+/// Refuses zero (the type's default) with "must be at least 1".
+/// aegisd's other settings use it too.
+pub fn at_least_one<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default + PartialEq>(
     d: D,
 ) -> Result<T, D::Error> {
     let v = T::deserialize(d)?;

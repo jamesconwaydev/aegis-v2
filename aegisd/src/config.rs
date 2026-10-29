@@ -10,6 +10,7 @@ use serde::de::{self, DeserializeOwned, Deserializer};
 use serde::Deserialize;
 use toml::Spanned;
 
+use aegis_proto::honeypot::at_least_one;
 pub use aegis_proto::honeypot::HoneypotConfig;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -46,17 +47,6 @@ fn non_negative<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
         Err(de::Error::custom(format!(
             "must be a finite number >= 0, got {v}"
         )))
-    }
-}
-
-fn at_least_one<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default + PartialEq>(
-    d: D,
-) -> Result<T, D::Error> {
-    let v = T::deserialize(d)?;
-    if v == T::default() {
-        Err(de::Error::custom("must be at least 1"))
-    } else {
-        Ok(v)
     }
 }
 
