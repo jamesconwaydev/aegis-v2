@@ -117,6 +117,25 @@ pub struct Session {
     /// SHA-256 (hex) of each payload file in the session directory; at
     /// most 256.
     pub payloads: Vec<String>,
+    /// The name the tree looked up before connecting to `dst`, when the
+    /// honeypot's DNS handed out that address.
+    pub dns_name: Option<String>,
+    /// Each DNS question asked in this session and what it was told; at
+    /// most 32.
+    pub queries: Vec<DnsQuery>,
+}
+
+/// One DNS question and its answer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsQuery {
+    /// Lower case, no trailing dot; bytes that aren't printable ASCII
+    /// written as `\DDD`.
+    pub name: String,
+    /// `A`, `AAAA`, ..., or `TYPE<n>` for one with no mnemonic.
+    pub qtype: String,
+    /// The address given, for an A question.
+    pub answer: Option<Ipv4Addr>,
 }
 
 #[cfg(test)]
@@ -137,6 +156,12 @@ mod tests {
             truncated: true,
             timed_out: false,
             payloads: vec!["ab".into()],
+            dns_name: Some("c2.example".into()),
+            queries: vec![DnsQuery {
+                name: "c2.example".into(),
+                qtype: "A".into(),
+                answer: Some(Ipv4Addr::new(198, 18, 0, 1)),
+            }],
         }
     }
 
@@ -146,6 +171,7 @@ mod tests {
         let j = serde_json::to_string(&s).unwrap();
         assert!(j.contains("\"protocol\":\"raw\""), "{j}");
         assert!(j.contains("\"dst\":\"1.2.3.4:6667\""), "{j}");
+        assert!(j.contains("\"answer\":\"198.18.0.1\""), "{j}");
         assert_eq!(serde_json::from_str::<Session>(&j).unwrap(), s);
     }
 

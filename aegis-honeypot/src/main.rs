@@ -6,9 +6,11 @@
 //! does.
 
 mod dispatch;
+mod dns;
 mod pcap;
 mod serve;
 mod session;
+mod udp;
 
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::DirBuilderExt;
@@ -99,23 +101,25 @@ fn listen_fds(
     Ok(names.into_iter().map(String::from).zip(3..).collect())
 }
 
-/// Whether `fd` is a listening socket. A unit that passes anything else
-/// would have the accept loop failing forever.
-fn listening(fd: RawFd) -> bool {
+/// An int-valued SOL_SOCKET option of `fd`, or None when it has none.
+fn sockopt(fd: RawFd, opt: libc::c_int) -> Option<libc::c_int> {
     let mut v: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: getsockopt writes at most `len` bytes into `v`; a bad fd
     // is only an error.
-    let r = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ACCEPTCONN,
-            (&raw mut v).cast(),
-            &mut len,
-        )
-    };
-    r == 0 && v == 1
+    let r = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, opt, (&raw mut v).cast(), &mut len) };
+    (r == 0).then_some(v)
+}
+
+/// Whether `fd` is a listening socket. A unit that passes anything else
+/// would have the accept loop failing forever.
+fn listening(fd: RawFd) -> bool {
+    sockopt(fd, libc::SO_ACCEPTCONN) == Some(1)
+}
+
+/// Whether `fd` is a datagram socket, as dns-udp must be.
+fn datagram(fd: RawFd) -> bool {
+    sockopt(fd, libc::SO_TYPE) == Some(libc::SOCK_DGRAM)
 }
 
 /// The spool under systemd's StateDirectory, the first one when it
@@ -125,6 +129,16 @@ fn spool(state: Option<&str>) -> PathBuf {
         .and_then(|s| s.split(':').next())
         .filter(|s| !s.is_empty());
     PathBuf::from(first.unwrap_or(STATE)).join("spool")
+}
+
+/// Why a task that should run for good stopped; never, for no task.
+async fn ended(task: Option<tokio::task::JoinHandle<()>>) -> String {
+    match task {
+        Some(t) => t
+            .await
+            .map_or_else(|e| e.to_string(), |()| "stopped".into()),
+        None => std::future::pending().await,
+    }
 }
 
 fn run() -> Result<()> {
@@ -156,6 +170,16 @@ fn run() -> Result<()> {
     };
     let tcp = fd("tcp")?.context("systemd passed no socket named tcp")?;
     let dns = fd("dns-tcp")?;
+    let dns_udp = match fds.iter().find(|(n, _)| n == "dns-udp") {
+        Some(&(_, fd)) if datagram(fd) => {
+            udp::pktinfo(fd).context("dns-udp: IP_PKTINFO")?;
+            Some(fd)
+        }
+        Some(&(_, fd)) => {
+            bail!("socket dns-udp (fd {fd}) is not a datagram socket; check aegis-honeypot.socket")
+        }
+        None => None,
+    };
     // Once, here: each session checks free space on it before creating
     // anything of its own.
     let spool = spool(env("STATE_DIRECTORY").as_deref());
@@ -170,6 +194,8 @@ fn run() -> Result<()> {
         max_time: Duration::from_secs(cfg.session_seconds),
         floor: FLOOR,
         slots: Slots::default(),
+        udp_slots: udp::slots(),
+        names: Default::default(),
     });
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -183,17 +209,34 @@ fn run() -> Result<()> {
             l.set_nonblocking(true)?;
             Ok(tokio::net::TcpListener::from_std(l)?)
         };
-        let main = accept(srv.clone(), listener(tcp)?, None);
         // Nothing redirects to dns-tcp, but a client that finds the port
         // gets DNS.
-        match dns {
+        let dns_tcp = match dns {
+            Some(d) => Some(tokio::task::spawn_local(accept(
+                srv.clone(),
+                listener(d)?,
+                Some(Protocol::Dns),
+            ))),
+            None => None,
+        };
+        let dns_udp = match dns_udp {
             Some(d) => {
-                let dns = accept(srv, listener(d)?, Some(Protocol::Dns));
-                tokio::join!(main, dns);
+                // SAFETY: as for the listeners.
+                let s = unsafe { std::net::UdpSocket::from_raw_fd(d) };
+                s.set_nonblocking(true)?;
+                let s = tokio::net::UdpSocket::from_std(s)?;
+                Some(tokio::task::spawn_local(udp::serve(srv.clone(), s)))
             }
-            None => main.await,
+            None => None,
+        };
+        let tcp = listener(tcp)?;
+        // Any of them stopping exits the process, so systemd restarts all
+        // of it rather than it running on half-deaf.
+        tokio::select! {
+            () = accept(srv, tcp, None) => bail!("tcp: stopped"),
+            why = ended(dns_tcp) => bail!("dns-tcp: {why}"),
+            why = ended(dns_udp) => bail!("dns-udp: {why}"),
         }
-        Ok(())
     })
 }
 
@@ -277,6 +320,41 @@ mod tests {
         let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         assert!(!listening(u.as_raw_fd()));
         assert!(!listening(-1));
+    }
+
+    #[test]
+    fn only_datagram_sockets_are_served_as_dns_udp() {
+        use std::os::fd::AsRawFd;
+        let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(datagram(u.as_raw_fd()));
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(!datagram(l.as_raw_fd()));
+        assert!(!datagram(-1));
+    }
+
+    #[tokio::test]
+    async fn a_dns_task_that_stops_is_noticed() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+        let wait = Duration::from_secs(1);
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let h = tokio::task::spawn_local(async { panic!("boom") });
+                let why = timeout(wait, ended(Some(h)))
+                    .await
+                    .expect("a panic went unnoticed");
+                assert!(why.contains("panicked"), "{why}");
+                let h = tokio::task::spawn_local(async {});
+                let why = timeout(wait, ended(Some(h)))
+                    .await
+                    .expect("a return went unnoticed");
+                assert_eq!(why, "stopped");
+                // No socket, no task: nothing to wait for.
+                assert!(timeout(Duration::from_millis(10), ended(None))
+                    .await
+                    .is_err());
+            })
+            .await;
     }
 
     #[test]
