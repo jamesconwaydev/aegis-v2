@@ -83,6 +83,8 @@ pub fn status(r: &Response) -> Option<String> {
         deferred_overflow,
         incident_suppressed,
         enforce_dropped,
+        network,
+        incidents_observing,
         telemetry_dropped: t,
     } = r
     else {
@@ -95,7 +97,9 @@ pub fn status(r: &Response) -> Option<String> {
         kv("uptime", duration(*uptime_s)),
         kv("events", events_total.to_string()),
         kv("dropped events", dropped_events.to_string()),
+        kv("quarantine network", network.clone()),
         kv("open incidents", incidents_open.to_string()),
+        kv("observing incidents", incidents_observing.to_string()),
         kv("incident write errors", incident_errors.to_string()),
         kv("incidents dropped", incident_dropped.to_string()),
         kv("verifications skipped", verify_skipped.to_string()),
@@ -539,6 +543,8 @@ mod tests {
             deferred_overflow: 7,
             incident_suppressed: 12,
             enforce_dropped: 13,
+            network: "honeypot".into(),
+            incidents_observing: 2,
             telemetry_dropped: aegis_proto::TelemetryDropped {
                 journald: 8,
                 otlp_queue_full: 9,
@@ -559,6 +565,8 @@ mod tests {
             ("defer queue overflows", "7"),
             ("incident repeats not recorded", "12"),
             ("enforce jobs dropped", "13"),
+            ("quarantine network", "honeypot"),
+            ("observing incidents", "2"),
             ("journald", "8"),
             ("otlp queue full", "9"),
             ("otlp export failed", "10"),

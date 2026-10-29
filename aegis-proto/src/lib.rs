@@ -10,6 +10,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod listen;
+pub use listen::honeypot_listening;
+
 pub const SOCKET: &str = "/run/aegis-v2/aegisd.sock";
 
 /// Longest request line, newline excluded.
@@ -37,6 +40,10 @@ pub enum Request {
     IncidentKill {
         id: String,
     },
+}
+
+fn default_network() -> String {
+    "drop".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -67,6 +74,13 @@ pub enum Response {
         /// Enforcement jobs dropped because the enforcer's queue was full.
         #[serde(default)]
         enforce_dropped: u64,
+        /// `drop` or `honeypot`: what quarantine does with the network.
+        /// Absent from a pre-v0.3 daemon, which only drops.
+        #[serde(default = "default_network")]
+        network: String,
+        /// Incidents being observed in the honeypot right now.
+        #[serde(default)]
+        incidents_observing: u64,
         telemetry_dropped: TelemetryDropped,
     },
     Incidents(Vec<IncidentSummary>),
@@ -173,6 +187,24 @@ mod tests {
         assert_eq!(r, Request::IncidentKill { id: "AEG-1".into() });
         let line = serde_json::to_string(&Response::Done("killed AEG-1".into())).unwrap();
         assert_eq!(line, r#"{"Done":"killed AEG-1"}"#);
+    }
+
+    #[test]
+    fn old_status_reply_still_parses() {
+        // A v0.2 daemon: no network, no incidents_observing.
+        let old = r#"{"Status":{"version":"0.2.3","mode":"enforce","uptime_s":1,
+            "events_total":2,"dropped_events":0,"probes":[],"incidents_open":0,
+            "incident_errors":0,"incident_dropped":0,"verify_skipped":0,
+            "deferred_overflow":0,"telemetry_dropped":{"journald":0,
+            "otlp_queue_full":0,"otlp_export_failed":0,"otlp_disconnected":0}}}"#;
+        match serde_json::from_str::<Response>(old).unwrap() {
+            Response::Status {
+                network,
+                incidents_observing,
+                ..
+            } => assert_eq!((network.as_str(), incidents_observing), ("drop", 0)),
+            r => panic!("{r:?}"),
+        }
     }
 
     #[test]
