@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod honeypot;
 mod listen;
 pub use listen::honeypot_listening;
 
