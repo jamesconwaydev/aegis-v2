@@ -54,6 +54,15 @@ static OFFSETS: KernelOffsets = KernelOffsets {
     task_mm: 0,
     mm_env_start: 0,
     mm_env_end: 0,
+    sock_sk: 0,
+    sk_family: 0,
+    sk_net: 0,
+    sk_cgrp_data: 0,
+    cgroup_kn: 0,
+    kn_id: 0,
+    net_inum: 0,
+    inode_i_mode: 0,
+    init_net_inum: 0,
 };
 
 /// Volatile, so the compiler can't fold the zero the object ships with.

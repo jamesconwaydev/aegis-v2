@@ -130,18 +130,47 @@ pub struct KernelOffsets {
     pub task_mm: u32,
     pub mm_env_start: u32,
     pub mm_env_end: u32,
+    pub sock_sk: u32,
+    /// `sock.__sk_common.skc_family`.
+    pub sk_family: u32,
+    /// `sock.__sk_common.skc_net`, a `struct net *`.
+    pub sk_net: u32,
+    /// `sock.sk_cgrp_data.cgroup`, a `struct cgroup *`.
+    pub sk_cgrp_data: u32,
+    pub cgroup_kn: u32,
+    pub kn_id: u32,
+    /// `net.ns.inum`.
+    pub net_inum: u32,
+    pub inode_i_mode: u32,
+    /// Not an offset: the inode number of the initial network
+    /// namespace, which is how the hold recognises `init_net`.
+    pub init_net_inum: u32,
+}
+
+/// A `HELD` value. `net_cgroup` is 0 for a plain hold (no network); set
+/// to a cgroup id, the held process may use sockets created in that
+/// cgroup, and its new processes inherit the hold.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hold {
+    /// The group leader's start time, so a recycled tgid isn't held.
+    pub start_time_ns: u64,
+    pub net_cgroup: u64,
 }
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for Event {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for KernelOffsets {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for Hold {}
 
 // The eBPF side and userspace must agree on this layout byte for byte.
 const _: () = assert!(core::mem::offset_of!(Event, cgroup_id) == 40);
 const _: () = assert!(core::mem::offset_of!(Event, child_start_time_ns) == 368);
 const _: () = assert!(core::mem::offset_of!(Event, exe_ino) == 376);
 const _: () = assert!(core::mem::size_of::<Event>() == 392);
+const _: () = assert!(core::mem::size_of::<Hold>() == 16);
 
 #[cfg(test)]
 mod tests {
