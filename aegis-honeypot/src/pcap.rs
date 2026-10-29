@@ -22,6 +22,11 @@ pub const SEGMENT: usize = 1400;
 /// What one TCP segment adds on disk to its data: pcap record header,
 /// IPv4 and TCP headers.
 pub const SEGMENT_COST: u64 = 16 + 20 + 20;
+/// What one UDP datagram adds on disk to its data: pcap record header,
+/// IPv4 and UDP headers.
+pub const DATAGRAM_COST: u64 = 16 + 20 + 8;
+/// The most one IPv4 UDP datagram can carry; `datagram` cuts there.
+pub const MAX_DATAGRAM: usize = 65535 - 28;
 /// The file header, the handshake and the close: the same in every
 /// session, and not charged to its cap.
 pub const FIXED_COST: u64 = 24 + 6 * SEGMENT_COST;
@@ -75,10 +80,9 @@ impl Pcap {
     }
 
     /// One UDP datagram; DNS over UDP records through this.
-    #[allow(dead_code)]
     pub fn datagram(&mut self, from_client: bool, data: &[u8]) -> io::Result<()> {
         // What fits in one IPv4 packet; DNS never comes close.
-        let data = &data[..data.len().min(65535 - 28)];
+        let data = &data[..data.len().min(MAX_DATAGRAM)];
         let (src, dst) = self.ends(from_client);
         let mut l4 = Vec::with_capacity(8 + data.len());
         l4.extend(src.port().to_be_bytes());

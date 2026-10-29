@@ -6,3 +6,4 @@
 #![cfg(fuzzing)]
 
 pub mod dispatch;
+pub mod dns;

@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aegis_proto::honeypot::{self, Protocol};
+use aegis_proto::honeypot::{self, DnsQuery, Protocol};
 use sha2::{Digest, Sha256};
 
-use crate::pcap::{Pcap, SEGMENT, SEGMENT_COST};
+use crate::pcap::{Pcap, DATAGRAM_COST, MAX_DATAGRAM, SEGMENT, SEGMENT_COST};
 
 /// Sessions open at once from one incident address, and in all (§4.3).
 const PER_ADDR: usize = 64;
@@ -52,6 +52,17 @@ fn create(path: &Path) -> io::Result<File> {
 /// `session.json`, 256 of them stay well under aegisd's 64 KiB read.
 const MAX_PAYLOADS: usize = 256;
 
+/// DNS questions one session records. Even at the longest a name can
+/// be written out, 32 keep `session.json` under aegisd's 64 KiB read.
+const MAX_QUERIES: usize = 32;
+
+/// How a session's bytes are framed in its pcap.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Transport {
+    Tcp,
+    Udp,
+}
+
 /// The least free space (bytes, inodes) a spool must keep for a new
 /// session to open. Most hosts keep /var/lib on the root filesystem.
 #[derive(Clone, Copy)]
@@ -70,6 +81,7 @@ pub struct Session {
     dir: PathBuf,
     done: PathBuf,
     pcap: Pcap,
+    transport: Transport,
     cap: u64,
     /// Charged against `cap`: pcap data segments, and payloads. The pcap
     /// header, handshake and close are the same in every session and
@@ -104,11 +116,13 @@ impl Session {
     /// take the fixed pcap header, handshake and close. `spool` must
     /// exist. None when the spool is below `floor`: the honeypot
     /// would rather miss a session than fill the host's disk.
+    #[allow(clippy::too_many_arguments)] // each one is the session's own
     pub fn open(
         spool: &Path,
         cap: u64,
         floor: Floor,
         protocol: Protocol,
+        transport: Transport,
         addr: Ipv4Addr,
         src: SocketAddrV4,
         dst: SocketAddrV4,
@@ -126,7 +140,9 @@ impl Session {
         let dir = base.join(&id);
         DirBuilder::new().mode(0o750).create(&dir)?;
         let mut pcap = Pcap::new(create(&dir.join("stream.pcap"))?, src, dst)?;
-        pcap.syn()?;
+        if transport == Transport::Tcp {
+            pcap.syn()?;
+        }
         Ok(Some(Self {
             done: base.join("done").join(&id),
             rec: honeypot::Session {
@@ -142,9 +158,12 @@ impl Session {
                 truncated: false,
                 timed_out: false,
                 payloads: Vec::new(),
+                dns_name: None,
+                queries: Vec::new(),
             },
             dir,
             pcap,
+            transport,
             cap,
             used: 0,
         }))
@@ -179,6 +198,36 @@ impl Session {
         Ok(more)
     }
 
+    /// Records one UDP datagram whole, or none of it once it no longer
+    /// fits under the cap: then false, and `truncated`.
+    pub fn datagram(&mut self, from_client: bool, data: &[u8]) -> io::Result<bool> {
+        let kept = &data[..data.len().min(MAX_DATAGRAM)];
+        let n = kept.len() as u64;
+        if n + DATAGRAM_COST > self.cap - self.used {
+            self.rec.truncated = true;
+            return Ok(false);
+        }
+        self.pcap.datagram(from_client, kept)?;
+        self.used += n + DATAGRAM_COST;
+        if from_client {
+            self.rec.bytes_in += n;
+        } else {
+            self.rec.bytes_out += n;
+        }
+        self.rec.truncated |= kept.len() < data.len();
+        Ok(true)
+    }
+
+    /// Adds one DNS question to the record, up to `MAX_QUERIES`; past
+    /// that, only `truncated` says there were more.
+    pub fn query(&mut self, q: DnsQuery) {
+        if self.rec.queries.len() < MAX_QUERIES {
+            self.rec.queries.push(q);
+        } else {
+            self.rec.truncated = true;
+        }
+    }
+
     /// Keeps `data` as a payload file named by its SHA-256, once, and
     /// charges it to the cap. None, and `truncated`, when it doesn't fit
     /// or the session already holds `MAX_PAYLOADS`. Protocol handlers
@@ -204,7 +253,9 @@ impl Session {
     /// Ends the pcap, writes `session.json` and moves the directory to
     /// `done/`. Returns where it landed.
     pub fn close(mut self) -> io::Result<PathBuf> {
-        self.pcap.fin()?;
+        if self.transport == Transport::Tcp {
+            self.pcap.fin()?;
+        }
         self.rec.ended_ms = now_ms();
         let json = serde_json::to_vec_pretty(&self.rec).map_err(io::Error::other)?;
         create(&self.dir.join("session.json"))?.write_all(&json)?;
@@ -283,16 +334,29 @@ pub(crate) mod tests {
     };
 
     fn try_open(spool: &Path, cap: u64, floor: Floor) -> Option<Session> {
+        open_as(spool, cap, floor, Transport::Tcp)
+    }
+
+    fn open_as(spool: &Path, cap: u64, floor: Floor, t: Transport) -> Option<Session> {
         Session::open(
             spool,
             cap,
             floor,
             Protocol::Raw,
+            t,
             Ipv4Addr::new(127, 77, 0, 5),
             "10.0.0.2:40000".parse().unwrap(),
             "1.2.3.4:6667".parse().unwrap(),
         )
         .unwrap()
+    }
+
+    fn udp(spool: &Path, cap: u64) -> Session {
+        open_as(spool, cap, NO_FLOOR, Transport::Udp).unwrap()
+    }
+
+    fn pcap_of(done: &Path) -> Vec<crate::pcap::tests::Pkt> {
+        crate::pcap::tests::read(&std::fs::read(done.join("stream.pcap")).unwrap())
     }
 
     fn open(spool: &Path, cap: u64) -> Session {
@@ -468,6 +532,77 @@ pub(crate) mod tests {
             "left a directory"
         );
         assert!(try_open(&sp, 100, NO_FLOOR).is_some());
+        std::fs::remove_dir_all(sp).unwrap();
+    }
+
+    #[test]
+    fn a_udp_session_is_datagrams_only() {
+        let sp = spool("udp");
+        let mut s = udp(&sp, 1000);
+        assert!(s.datagram(true, b"query").unwrap());
+        assert!(s.datagram(false, b"answer!").unwrap());
+        assert_eq!((s.rec.bytes_in, s.rec.bytes_out), (5, 7));
+        assert!(!s.rec.truncated);
+        let pkts = pcap_of(&s.close().unwrap());
+        // No handshake and no close: UDP has neither.
+        let got: Vec<_> = pkts.iter().map(|p| (p.proto, p.data.clone())).collect();
+        assert_eq!(got, [(17, b"query".to_vec()), (17, b"answer!".to_vec())]);
+        std::fs::remove_dir_all(sp).unwrap();
+    }
+
+    #[test]
+    fn a_datagram_flood_stays_within_the_cap_on_disk() {
+        let sp = spool("dflood");
+        let max = 10_000;
+        let mut s = udp(&sp, max);
+        let mut sent = 0;
+        while s.datagram(sent % 2 == 0, b"x").unwrap() {
+            sent += 1;
+            assert!(sent < max, "the cap never refused a datagram");
+        }
+        assert!(s.rec.truncated);
+        // A datagram that doesn't fit is left out whole.
+        assert_eq!(s.rec.bytes_in + s.rec.bytes_out, sent);
+        let done = s.close().unwrap();
+        let size = std::fs::metadata(done.join("stream.pcap")).unwrap().len();
+        assert!(size <= max + crate::pcap::FIXED_COST, "{size}");
+        assert!(size > max - 2 * DATAGRAM_COST, "{size}");
+        assert_eq!(pcap_of(&done).len() as u64, sent);
+        std::fs::remove_dir_all(sp).unwrap();
+    }
+
+    #[test]
+    fn a_datagram_too_big_for_ipv4_is_cut_and_flagged() {
+        let sp = spool("dbig");
+        let mut s = udp(&sp, 1 << 20);
+        assert!(s.datagram(true, &vec![7; MAX_DATAGRAM + 1]).unwrap());
+        assert_eq!(s.rec.bytes_in, MAX_DATAGRAM as u64);
+        assert!(s.rec.truncated);
+        std::fs::remove_dir_all(sp).unwrap();
+    }
+
+    #[test]
+    fn queries_stop_at_their_limit_and_the_record_stays_small() {
+        let sp = spool("queries");
+        let mut s = udp(&sp, 1 << 20);
+        // The longest a recorded name gets: 255 bytes on the wire, each
+        // one escaped as \DDD, which JSON escapes again.
+        let q = DnsQuery {
+            name: "\\377".repeat(250) + "...",
+            qtype: "TYPE65535".into(),
+            answer: Some(Ipv4Addr::new(198, 19, 255, 255)),
+        };
+        s.rec.dns_name = Some(q.name.clone());
+        for _ in 0..MAX_QUERIES {
+            s.query(q.clone());
+        }
+        assert!(!s.rec.truncated);
+        s.query(q);
+        assert!(s.rec.truncated);
+        assert_eq!(s.rec.queries.len(), MAX_QUERIES);
+        let done = s.close().unwrap();
+        let json = std::fs::metadata(done.join("session.json")).unwrap().len();
+        assert!(json < 64 * 1024, "{json}");
         std::fs::remove_dir_all(sp).unwrap();
     }
 

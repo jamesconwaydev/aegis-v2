@@ -2,6 +2,7 @@
 //! From an accepted connection to a filed session: where it was going,
 //! what to answer it as, and the caps around the answer.
 
+use std::cell::RefCell;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -10,13 +11,14 @@ use std::time::Duration;
 
 use aegis_proto::honeypot::Protocol;
 use anyhow::Result;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use crate::dispatch::{by_bytes, by_port, PEEK};
+use crate::dns::{self, Names};
 use crate::pcap::FIXED_COST;
-use crate::session::{Floor, Session, Slots};
+use crate::session::{Floor, Session, Slots, Transport};
 
 /// How long a client on an unknown port gets to speak first. A client
 /// that waits to be spoken to is answered as raw after this.
@@ -43,18 +45,54 @@ impl Handler for CatchAll {
     }
 }
 
+/// DNS over TCP: each message framed by a two-byte length (RFC 1035
+/// 4.2.2), answered in turn.
+pub struct Dns<'a>(&'a RefCell<Names>);
+
+impl Handler for Dns<'_> {
+    async fn serve(&self, s: &mut Session, mut io: TcpStream) -> Result<()> {
+        // The largest frame there is; the length can't ask for more.
+        let mut buf = vec![0u8; 2 + usize::from(u16::MAX)];
+        loop {
+            io.read_exact(&mut buf[..2]).await?;
+            let end = 2 + usize::from(u16::from_be_bytes([buf[0], buf[1]]));
+            io.read_exact(&mut buf[2..end]).await?;
+            if !s.record(true, &buf[..end])? {
+                return Ok(());
+            }
+            let Some((reply, asked)) =
+                dns::answer(&buf[2..end], &mut self.0.borrow_mut(), s.rec.addr)
+            else {
+                continue;
+            };
+            if let Some(q) = asked {
+                s.query(q);
+            }
+            // At most 512 bytes, so the length always fits.
+            let out = [&(reply.len() as u16).to_be_bytes()[..], &reply].concat();
+            let more = s.record(false, &out)?;
+            io.write_all(&out).await?;
+            if !more {
+                return Ok(());
+            }
+        }
+    }
+}
+
 pub struct Server {
     pub spool: PathBuf,
     pub max_bytes: u64,
     pub max_time: Duration,
     pub floor: Floor,
     pub slots: Slots,
+    /// Shared by DNS and the TCP side, which labels connections from it.
+    pub names: RefCell<Names>,
 }
 
 /// What the spool must have free for one more session: the floor, plus
 /// all that the `open` sessions (this one among them) may still write,
 /// their pcap and a full session.json each.
-fn reserve(floor: Floor, open: usize, cap: u64) -> Floor {
+pub fn reserve(floor: Floor, open: usize, cap: u64) -> Floor {
     let each = cap.saturating_add(FIXED_COST).saturating_add(64 * 1024);
     Floor {
         bytes: floor
@@ -67,7 +105,7 @@ fn reserve(floor: Floor, open: usize, cap: u64) -> Floor {
 /// Whether a connection landed on an incident address. aegisd redirects
 /// observed trees into 127.77.0.0/16 only; anything else on loopback is
 /// some local user, who mustn't fill the spool.
-fn incident_addr(ip: Ipv4Addr) -> bool {
+pub fn incident_addr(ip: Ipv4Addr) -> bool {
     ip.octets()[..2] == [127, 77]
 }
 
@@ -109,7 +147,20 @@ pub async fn handle(srv: Rc<Server>, io: TcpStream, forced: Option<Protocol>) ->
     let (SocketAddr::V4(local), SocketAddr::V4(src)) = (io.local_addr()?, io.peer_addr()?) else {
         return Ok(());
     };
-    let addr = *local.ip();
+    let dst = original_dst(&io).unwrap_or(local);
+    run(srv, io, *local.ip(), src, dst, forced).await
+}
+
+/// The rest of `handle`, from where the connection landed (`addr`) and
+/// where it was going (`dst`).
+async fn run(
+    srv: Rc<Server>,
+    io: TcpStream,
+    addr: Ipv4Addr,
+    src: SocketAddrV4,
+    dst: SocketAddrV4,
+    forced: Option<Protocol>,
+) -> Result<()> {
     // Not an incident address, or over a cap: dropping `io` closes it,
     // and nothing is recorded.
     if !incident_addr(addr) {
@@ -118,7 +169,6 @@ pub async fn handle(srv: Rc<Server>, io: TcpStream, forced: Option<Protocol>) ->
     let Some(_slot) = srv.slots.take(addr) else {
         return Ok(());
     };
-    let dst = original_dst(&io).unwrap_or(local);
     let protocol = match forced.or(by_port(dst.port())) {
         Some(p) => p,
         None => {
@@ -135,6 +185,7 @@ pub async fn handle(srv: Rc<Server>, io: TcpStream, forced: Option<Protocol>) ->
         srv.max_bytes,
         reserve(srv.floor, srv.slots.open(), srv.max_bytes),
         protocol,
+        Transport::Tcp,
         addr,
         src,
         dst,
@@ -146,8 +197,17 @@ pub async fn handle(srv: Rc<Server>, io: TcpStream, forced: Option<Protocol>) ->
         );
         return Ok(());
     };
-    // Every protocol is answered as catch-all until its own handler lands.
-    match timeout(srv.max_time, CatchAll.serve(&mut s, io)).await {
+    s.rec.dns_name = srv
+        .names
+        .borrow()
+        .name_of(addr, *dst.ip())
+        .map(str::to_owned);
+    // The rest are answered as catch-all until their own handlers land.
+    let served = match protocol {
+        Protocol::Dns => timeout(srv.max_time, Dns(&srv.names).serve(&mut s, io)).await,
+        _ => timeout(srv.max_time, CatchAll.serve(&mut s, io)).await,
+    };
+    match served {
         Ok(Ok(())) => {}
         Ok(Err(e)) if quiet(&e) => {}
         Ok(Err(e)) => eprintln!("aegis-honeypot: session {}: {e:#}", s.rec.id),
@@ -199,6 +259,7 @@ mod tests {
             max_time,
             floor: NO_FLOOR,
             slots: Slots::default(),
+            names: RefCell::default(),
         })
     }
 
@@ -415,6 +476,7 @@ mod tests {
                 inodes: 0,
             },
             slots: Slots::default(),
+            names: RefCell::default(),
         });
         let other = srv.slots.take(Ipv4Addr::new(127, 77, 0, 9)).unwrap();
         refused(&srv, INCIDENT).await;
@@ -422,6 +484,120 @@ mod tests {
         drop(other);
         let s = one(&srv, None, |c| async move { drop(c) }).await;
         assert_eq!(s.addr, INCIDENT);
+    }
+
+    fn framed(id: u16, name: &str, t: hickory_proto::rr::RecordType) -> Vec<u8> {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        let mut m = Message::new(id, MessageType::Query, OpCode::Query);
+        m.add_query(Query::query(
+            hickory_proto::rr::Name::from_ascii(name).unwrap(),
+            t,
+        ));
+        let b = m.to_vec().unwrap();
+        [&(b.len() as u16).to_be_bytes()[..], &b].concat()
+    }
+
+    async fn reply(c: &mut TcpStream) -> hickory_proto::op::Message {
+        let mut len = [0u8; 2];
+        c.read_exact(&mut len).await.unwrap();
+        let mut b = vec![0u8; u16::from_be_bytes(len).into()];
+        c.read_exact(&mut b).await.unwrap();
+        hickory_proto::op::Message::from_vec(&b).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dns_over_tcp_answers_each_framed_query() {
+        use hickory_proto::op::ResponseCode;
+        use hickory_proto::rr::RecordType;
+        let srv = server("hdns", 10_000, Duration::from_secs(5));
+        let (q1, q2) = (
+            framed(1, "c2.example.", RecordType::A),
+            framed(2, "c2.example.", RecordType::AAAA),
+        );
+        let sent = q1.len() + q2.len() + 7;
+        let rec = one(&srv, Some(Protocol::Dns), |mut c| async move {
+            // Both at once: the framing, not the reads, splits them.
+            c.write_all(&[q1, q2].concat()).await.unwrap();
+            let a = reply(&mut c).await;
+            assert_eq!(a.answers.len(), 1);
+            assert_eq!(a.metadata.id, 1);
+            assert!(reply(&mut c).await.answers.is_empty());
+            c.write_all(&[0, 5, 1, 2, 3, 4, 5]).await.unwrap();
+            assert_eq!(
+                reply(&mut c).await.metadata.response_code,
+                ResponseCode::FormErr
+            );
+            c.shutdown().await.unwrap();
+        })
+        .await;
+        assert_eq!(rec.protocol, Protocol::Dns);
+        assert_eq!(rec.bytes_in, sent as u64);
+        assert!(rec.bytes_out > 0);
+        let asked: Vec<_> = rec
+            .queries
+            .iter()
+            .map(|q| (q.name.as_str(), q.answer))
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                ("c2.example", Some(Ipv4Addr::new(198, 18, 0, 1))),
+                ("c2.example", None)
+            ]
+        );
+        assert!(!rec.truncated && !rec.timed_out);
+    }
+
+    #[tokio::test]
+    async fn port_53_is_answered_as_dns() {
+        let srv = server("h53", 10_000, Duration::from_secs(5));
+        let (c, io) = pair(INCIDENT).await;
+        let src = match c.local_addr().unwrap() {
+            SocketAddr::V4(a) => a,
+            a => panic!("{a}"),
+        };
+        let dst = SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53);
+        let q = framed(9, "x.example.", hickory_proto::rr::RecordType::A);
+        bounded(&srv, async {
+            let client = async move {
+                let mut c = c;
+                c.write_all(&q).await.unwrap();
+                assert_eq!(reply(&mut c).await.metadata.id, 9);
+            };
+            let (r, ()) = tokio::join!(run(srv.clone(), io, INCIDENT, src, dst, None), client);
+            r.unwrap();
+        })
+        .await;
+        let rec = only_session(&srv.spool);
+        assert_eq!((rec.protocol, rec.dst), (Protocol::Dns, dst));
+    }
+
+    #[tokio::test]
+    async fn a_connection_to_a_given_address_is_labelled_with_its_name() {
+        let srv = server("hlabel", 1000, Duration::from_secs(5));
+        let ip = srv.names.borrow_mut().address(INCIDENT, "c2.example");
+        for (dst, want) in [
+            (SocketAddrV4::new(ip, 443), Some("c2.example")),
+            (SocketAddrV4::new(Ipv4Addr::new(198, 18, 0, 2), 443), None),
+            (
+                SocketAddrV4::new(Ipv4Addr::new(93, 184, 216, 34), 443),
+                None,
+            ),
+        ] {
+            let (c, io) = pair(INCIDENT).await;
+            let src = match c.local_addr().unwrap() {
+                SocketAddr::V4(a) => a,
+                a => panic!("{a}"),
+            };
+            drop(c);
+            bounded(&srv, run(srv.clone(), io, INCIDENT, src, dst, None))
+                .await
+                .unwrap();
+            let rec = only_session(&srv.spool);
+            assert_eq!(rec.dst, dst);
+            assert_eq!(rec.dns_name.as_deref(), want, "{dst}");
+            std::fs::create_dir(&srv.spool).unwrap();
+        }
     }
 
     #[tokio::test]

@@ -296,6 +296,7 @@ whatever bytes it's handed:
 | `proc_parsers` | `parse_stat`, `env_taint`, `is_service_cgroup`, `in_unit` |
 | `nft_listing` | `Nft::echoed_handle`, `Nft::unresolved`, `Nft::handles` |
 | `dispatch` | a honeypot client's first bytes into `by_bytes`; `by_port` |
+| `dns_message` | a honeypot DNS message into `answer`, asked twice |
 
 The fuzz crate sits outside the workspace, because cargo-fuzz needs
 nightly. Its `rust-toolchain.toml` pins the same nightly the image
