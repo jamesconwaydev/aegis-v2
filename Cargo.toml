@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["aegis-common", "aegis-ebpf", "aegis-proto", "aegisd", "aegisctl", "aegis-sim", "xtask"]
+members = ["aegis-common", "aegis-ebpf", "aegis-proto", "aegis-honeypot", "aegisd", "aegisctl", "aegis-sim", "xtask"]
 # aegis-ebpf only builds for the BPF target, via aegisd's build script.
 # aegis-sim is a Linux-only test tool, built explicitly by the e2e task.
-default-members = ["aegis-common", "aegis-proto", "aegisd", "aegisctl", "xtask"]
+default-members = ["aegis-common", "aegis-proto", "aegis-honeypot", "aegisd", "aegisctl", "xtask"]
 
 [workspace.package]
 version = "0.2.3"

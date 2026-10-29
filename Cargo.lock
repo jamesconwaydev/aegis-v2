@@ -19,6 +19,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-honeypot"
+version = "0.2.3"
+dependencies = [
+ "aegis-proto",
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "aegis-proto"
 version = "0.2.3"
 dependencies = [

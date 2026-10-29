@@ -283,7 +283,8 @@ Adding a scenario means adding a `[[scenario]]` with a `name`, a shell
 Some of what aegisd reads, it doesn't control. The config is hand-edited.
 Any root process can write to the control socket. A crash or a full disk
 can leave an incident file half-written, and a watched process gets a say
-in what its own `/proc` files contain. Each of those parsers has a fuzz
+in what its own `/proc` files contain. The honeypot reads nothing but
+what a hostile client sends it. Each of those parsers has a fuzz
 target in `fuzz/`, and none of them may panic, hang or eat memory,
 whatever bytes it's handed:
 
@@ -294,6 +295,7 @@ whatever bytes it's handed:
 | `incident_store` | `incident.json` and `timeline.jsonl` into `IncidentStore` |
 | `proc_parsers` | `parse_stat`, `env_taint`, `is_service_cgroup`, `in_unit` |
 | `nft_listing` | `Nft::echoed_handle`, `Nft::unresolved`, `Nft::handles` |
+| `dispatch` | a honeypot client's first bytes into `by_bytes`; `by_port` |
 
 The fuzz crate sits outside the workspace, because cargo-fuzz needs
 nightly. Its `rust-toolchain.toml` pins the same nightly the image
