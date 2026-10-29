@@ -7,10 +7,12 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aegis_proto::honeypot::Protocol;
 use anyhow::Result;
+use rustls::ServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -19,6 +21,7 @@ use crate::dispatch::{by_bytes, by_port, PEEK};
 use crate::dns::{self, Names};
 use crate::pcap::FIXED_COST;
 use crate::session::{Conn, Floor, Session, Slots, Transport};
+use crate::web::{Http, Https};
 
 /// How long a client on an unknown port gets to speak first. A client
 /// that waits to be spoken to is answered as raw after this.
@@ -92,6 +95,8 @@ pub struct Server {
     pub udp_slots: Slots,
     /// Shared by DNS and the TCP side, which labels connections from it.
     pub names: RefCell<Names>,
+    /// HTTPS, with a leaf from the host's CA for each name asked.
+    pub tls: Arc<ServerConfig>,
 }
 
 impl Server {
@@ -121,11 +126,13 @@ pub fn incident_addr(ip: Ipv4Addr) -> bool {
     ip.octets()[..2] == [127, 77]
 }
 
-/// How plenty of clients say goodbye; not worth a log line each.
+/// How plenty of clients say goodbye, or fail TLS (scanners, clients
+/// that won't trust the cert); not worth a log line each.
 fn quiet(e: &anyhow::Error) -> bool {
     use std::io::ErrorKind::{BrokenPipe, ConnectionReset, UnexpectedEof};
-    e.downcast_ref::<std::io::Error>()
-        .is_some_and(|e| matches!(e.kind(), ConnectionReset | BrokenPipe | UnexpectedEof))
+    e.downcast_ref::<rustls::Error>().is_some()
+        || e.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| matches!(e.kind(), ConnectionReset | BrokenPipe | UnexpectedEof))
 }
 
 /// Where the tree was connecting before the redirect. None when the
@@ -218,6 +225,8 @@ async fn run(
     // The rest are answered as catch-all until their own handlers land.
     let served = match protocol {
         Protocol::Dns => timeout(srv.max_time, Dns(&srv.names).serve(&mut s, io)).await,
+        Protocol::Http => timeout(srv.max_time, Http.serve(&mut s, io)).await,
+        Protocol::Https => timeout(srv.max_time, Https(&srv.tls).serve(&mut s, io)).await,
         _ => timeout(srv.max_time, CatchAll.serve(&mut s, io)).await,
     };
     match served {
@@ -252,7 +261,7 @@ pub async fn accept(srv: Rc<Server>, l: TcpListener, forced: Option<Protocol>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::pcap::SEGMENT_COST;
     use crate::session::tests::NO_FLOOR;
@@ -262,11 +271,17 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     /// An incident address; any 127/8 address is local on Linux.
-    const INCIDENT: Ipv4Addr = Ipv4Addr::new(127, 77, 0, 1);
+    pub const INCIDENT: Ipv4Addr = Ipv4Addr::new(127, 77, 0, 1);
 
-    fn server(name: &str, max_bytes: u64, max_time: Duration) -> Rc<Server> {
+    pub fn server(name: &str, max_bytes: u64, max_time: Duration) -> Rc<Server> {
+        server_with_ca(name, max_bytes, max_time).0
+    }
+
+    /// A server, and the CA (PEM) its HTTPS leaves chain to.
+    pub fn server_with_ca(name: &str, max_bytes: u64, max_time: Duration) -> (Rc<Server>, Vec<u8>) {
         let spool = crate::session::tests::spool(name);
-        Rc::new(Server {
+        let (tls, ca) = crate::ca::tests::tls(name);
+        let srv = Rc::new(Server {
             spool,
             max_bytes,
             max_time,
@@ -274,19 +289,21 @@ mod tests {
             slots: Slots::default(),
             udp_slots: crate::udp::slots(),
             names: RefCell::default(),
-        })
+            tls,
+        });
+        (srv, ca)
     }
 
     /// Fails a test that would otherwise hang. Past the time cap and the
     /// peek, so it never fires first when the code is right.
-    async fn bounded<T>(srv: &Server, f: impl Future<Output = T>) -> T {
+    pub async fn bounded<T>(srv: &Server, f: impl Future<Output = T>) -> T {
         timeout(srv.max_time * 2 + PEEK_WAIT, f)
             .await
             .expect("hung past the time cap")
     }
 
     /// A connected (client, accepted) pair landing on `ip`.
-    async fn pair(ip: Ipv4Addr) -> (TcpStream, TcpStream) {
+    pub async fn pair(ip: Ipv4Addr) -> (TcpStream, TcpStream) {
         let l = TcpListener::bind((ip, 0)).await.unwrap();
         let (c, accepted) = tokio::join!(TcpStream::connect(l.local_addr().unwrap()), l.accept());
         (c.unwrap(), accepted.unwrap().0)
@@ -376,6 +393,7 @@ mod tests {
         ] {
             assert!(quiet(&Error::from(k).into()), "{k:?}");
         }
+        assert!(quiet(&rustls::Error::NoCertificatesPresented.into()));
         assert!(!quiet(&Error::from(ErrorKind::PermissionDenied).into()));
         assert!(!quiet(&anyhow::anyhow!("disk full")));
     }
@@ -492,6 +510,7 @@ mod tests {
             slots: Slots::default(),
             udp_slots: crate::udp::slots(),
             names: RefCell::default(),
+            tls: crate::ca::tests::tls("hreserve").0,
         });
         let other = srv.slots.take(Ipv4Addr::new(127, 77, 0, 9)).unwrap();
         refused(&srv, INCIDENT).await;

@@ -345,6 +345,7 @@ mod tests {
             slots: Slots::default(),
             udp_slots: slots(),
             names: RefCell::default(),
+            tls: crate::ca::tests::tls(name).0,
         }
     }
 

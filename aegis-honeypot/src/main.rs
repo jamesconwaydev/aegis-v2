@@ -5,12 +5,16 @@
 //! process never holds root or a capability, and refuses to start if it
 //! does.
 
+mod ca;
 mod dispatch;
 mod dns;
+mod hello;
+mod http;
 mod pcap;
 mod serve;
 mod session;
 mod udp;
+mod web;
 
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::DirBuilderExt;
@@ -122,13 +126,13 @@ fn datagram(fd: RawFd) -> bool {
     sockopt(fd, libc::SO_TYPE) == Some(libc::SOCK_DGRAM)
 }
 
-/// The spool under systemd's StateDirectory, the first one when it
-/// lists several.
-fn spool(state: Option<&str>) -> PathBuf {
-    let first = state
+/// systemd's StateDirectory, the first one when it lists several. The
+/// CA lives here and the spool beneath it: aegisd walks only the spool.
+fn state(dirs: Option<&str>) -> PathBuf {
+    let first = dirs
         .and_then(|s| s.split(':').next())
         .filter(|s| !s.is_empty());
-    PathBuf::from(first.unwrap_or(STATE)).join("spool")
+    PathBuf::from(first.unwrap_or(STATE))
 }
 
 /// Why a task that should run for good stopped; never, for no task.
@@ -182,12 +186,15 @@ fn run() -> Result<()> {
     };
     // Once, here: each session checks free space on it before creating
     // anything of its own.
-    let spool = spool(env("STATE_DIRECTORY").as_deref());
+    let state = state(env("STATE_DIRECTORY").as_deref());
+    let spool = state.join("spool");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o750)
         .create(&spool)
         .with_context(|| spool.display().to_string())?;
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").context("hostname")?;
+    let tls = ca::config(ca::Certs::load(&state, host.trim())?)?;
     let srv = Rc::new(Server {
         spool,
         max_bytes: cfg.max_session_bytes,
@@ -196,6 +203,7 @@ fn run() -> Result<()> {
         slots: Slots::default(),
         udp_slots: udp::slots(),
         names: Default::default(),
+        tls,
     });
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -365,7 +373,11 @@ mod tests {
             (Some("/s"), "/s/spool"),
             (Some("/s:/t"), "/s/spool"),
         ] {
-            assert_eq!(spool(state), PathBuf::from(want), "{state:?}");
+            assert_eq!(
+                super::state(state).join("spool"),
+                PathBuf::from(want),
+                "{state:?}"
+            );
         }
     }
 

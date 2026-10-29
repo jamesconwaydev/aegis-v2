@@ -1,0 +1,5 @@
+GET /admin?x=1 HTTP/1.1
+Host: c2.example
+User-Agent: curl/8.12.1
+Accept: */*
+
