@@ -34,7 +34,7 @@ pub fn at_least_one<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default + P
 /// The honeypot's listeners and limits. aegisd reads it only when
 /// `quarantine.network = "honeypot"` in enforce mode; the honeypot
 /// always does.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HoneypotConfig {
     /// Where the redirected TCP connections land.

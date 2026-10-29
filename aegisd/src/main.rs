@@ -202,9 +202,21 @@ impl Verifying {
     }
 }
 
+/// Hands the honeypot its settings, in honeypot mode only. A failure
+/// leaves the honeypot on what it last read, so it warns, not stops.
+fn hand_honeypot(c: &Config) {
+    let path = Path::new(config::HONEYPOT_FILE);
+    match config::write_honeypot_file(c, path, config::honeypot_gid) {
+        Ok(None) => {}
+        Ok(Some(w)) => eprintln!("aegisd: warning: {w}"),
+        Err(e) => eprintln!("aegisd: warning: writing {}: {e}", path.display()),
+    }
+}
+
 async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     let started = Instant::now();
     let c = cfg.current();
+    hand_honeypot(&c);
     let store = Arc::new(
         IncidentStore::open(&c.incidents.dir)
             .with_context(|| format!("opening incident store {}", c.incidents.dir.display()))?,
@@ -367,6 +379,7 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                             eprintln!("aegisd: warning: {w}");
                         }
                         let c = cfg.current();
+                        hand_honeypot(&c);
                         pipe.set_config(&c);
                         *honeypot.lock().unwrap_or_else(|e| e.into_inner()) =
                             Honeypot::from_config(&c);

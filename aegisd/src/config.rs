@@ -778,6 +778,70 @@ impl ConfigHandle {
     }
 }
 
+/// Where the honeypot reads its settings. Beside /run/aegis-v2, not in
+/// it: that directory is 0700 root, and the honeypot is neither.
+pub const HONEYPOT_FILE: &str = "/run/aegis-honeypot.toml";
+const HONEYPOT_GROUP: &std::ffi::CStr = c"aegis-honeypot";
+
+/// The honeypot's group, if the package created it.
+pub fn honeypot_gid() -> Option<u32> {
+    // SAFETY: getgrnam takes a NUL-terminated name; the result is only
+    // read before any other call could reuse its static buffer.
+    let g = unsafe { libc::getgrnam(HONEYPOT_GROUP.as_ptr()) };
+    (!g.is_null()).then(|| unsafe { (*g).gr_gid })
+}
+
+/// Hands the honeypot `[honeypot]` and nothing else from `c`: the rest
+/// of the config can hold webhook and OTLP secrets. Written whole or not
+/// at all (temp file, then rename), 0640 root:`gid`. Only in honeypot
+/// mode; drop mode writes nothing and doesn't call `gid`, as v0.2.3
+/// looked nothing up. Returns a warning when
+/// there's no group to let the honeypot read it.
+pub fn write_honeypot_file(
+    c: &Config,
+    path: &Path,
+    gid: impl FnOnce() -> Option<u32>,
+) -> std::io::Result<Option<String>> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if c.quarantine.network != NetworkMode::Honeypot {
+        return Ok(None);
+    }
+    // Only now: the lookup can go through NSS to systemd-userdbd, which
+    // drop mode (v0.2.3) never touches.
+    let gid = gid();
+    let tmp = path.with_extension("toml.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    std::os::unix::fs::fchown(&f, Some(0), Some(gid.unwrap_or(0)))?;
+    // After the chown, so the group never sees a mode meant for root.
+    f.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+    // Serialized whole, so a field added to HoneypotConfig can't be
+    // left out of what the honeypot reads.
+    #[derive(serde::Serialize)]
+    struct Only<'a> {
+        honeypot: &'a HoneypotConfig,
+    }
+    let text = toml::to_string(&Only {
+        honeypot: &c.honeypot,
+    })
+    .map_err(std::io::Error::other)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(gid.is_none().then(|| {
+        format!(
+            "no aegis-honeypot group, so {} is root's alone and the honeypot can't read it",
+            path.display()
+        )
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +883,68 @@ mod tests {
 
     fn load(t: &Dir, body: &str) -> Result<Config, ConfigError> {
         Config::load(&t.main(body), &t.dir(), &bare(t))
+    }
+
+    #[test]
+    fn honeypot_file_holds_only_honeypot_settings() {
+        use std::os::unix::fs::MetadataExt;
+        let t = Dir::new("hp-file");
+        let path = t.0.join("aegis-honeypot.toml");
+        let c = load(
+            &t,
+            "[quarantine]\nnetwork = \"honeypot\"\n[honeypot]\nsession_seconds = 9\n\
+             [telemetry.otlp]\nendpoint = \"https://h:4318\"\n\
+             [telemetry.otlp.headers]\nAuthorization = \"Bearer s3cret\"\n",
+        )
+        .unwrap();
+        assert_eq!(write_honeypot_file(&c, &path, || Some(4242)).unwrap(), None);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("s3cret"), "{body}");
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Only {
+            honeypot: HoneypotConfig,
+        }
+        assert_eq!(toml::from_str::<Only>(&body).unwrap().honeypot, c.honeypot);
+        let m = std::fs::metadata(&path).unwrap();
+        assert_eq!((m.mode() & 0o777, m.uid(), m.gid()), (0o640, 0, 4242));
+        assert!(!path.with_extension("toml.tmp").exists());
+
+        // No group: still written, root's alone, and said so.
+        let w = write_honeypot_file(&c, &path, || None).unwrap().unwrap();
+        assert!(w.contains("aegis-honeypot group"), "{w}");
+        assert_eq!(std::fs::metadata(&path).unwrap().gid(), 0);
+    }
+
+    #[test]
+    fn drop_mode_never_looks_up_the_honeypot_group() {
+        // getgrnam can reach systemd-userdbd over varlink, which v0.2.3
+        // never did and SELinux denies; drop mode must not ask.
+        let t = Dir::new("hp-nss");
+        let c = load(&t, "").unwrap();
+        let path = t.0.join("aegis-honeypot.toml");
+        let asked = std::cell::Cell::new(false);
+        let w = write_honeypot_file(&c, &path, || {
+            asked.set(true);
+            Some(4242)
+        });
+        assert_eq!(w.unwrap(), None);
+        assert!(!asked.get(), "drop mode looked up the honeypot group");
+    }
+
+    #[test]
+    fn drop_mode_writes_no_honeypot_file() {
+        let t = Dir::new("hp-drop");
+        let path = t.0.join("aegis-honeypot.toml");
+        for body in [
+            "",
+            "[quarantine]\nnetwork = \"drop\"\n[honeypot]\ntcp_port = 3000\n",
+        ] {
+            let c = load(&t, body).unwrap();
+            assert_eq!(write_honeypot_file(&c, &path, || Some(4242)).unwrap(), None);
+            assert_eq!(std::fs::read_dir(&t.0).unwrap().count(), 2, "{body:?}");
+            assert!(!path.exists());
+        }
     }
 
     #[test]
