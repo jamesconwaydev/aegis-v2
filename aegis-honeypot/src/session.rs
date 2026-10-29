@@ -110,23 +110,30 @@ pub fn free(dir: &Path) -> io::Result<(u64, Option<u64>)> {
     Ok((bytes, (st.f_files != 0).then_some(st.f_favail)))
 }
 
+/// What a session is and who it's between.
+pub struct Conn {
+    pub protocol: Protocol,
+    pub transport: Transport,
+    /// The incident address it landed on.
+    pub addr: Ipv4Addr,
+    pub src: SocketAddrV4,
+    pub dst: SocketAddrV4,
+}
+
 impl Session {
-    /// Creates `spool/<addr>/<id>/` and starts its pcap with the
-    /// handshake. `cap` bounds what the session leaves on disk, give or
+    /// Creates `spool/<addr>/<id>/` and starts its pcap, with the
+    /// handshake for TCP. `cap` bounds what the session leaves on disk, give or
     /// take the fixed pcap header, handshake and close. `spool` must
     /// exist. None when the spool is below `floor`: the honeypot
     /// would rather miss a session than fill the host's disk.
-    #[allow(clippy::too_many_arguments)] // each one is the session's own
-    pub fn open(
-        spool: &Path,
-        cap: u64,
-        floor: Floor,
-        protocol: Protocol,
-        transport: Transport,
-        addr: Ipv4Addr,
-        src: SocketAddrV4,
-        dst: SocketAddrV4,
-    ) -> io::Result<Option<Self>> {
+    pub fn open(spool: &Path, cap: u64, floor: Floor, c: Conn) -> io::Result<Option<Self>> {
+        let Conn {
+            protocol,
+            transport,
+            addr,
+            src,
+            dst,
+        } = c;
         // Before any mkdir, so a refused session leaves nothing behind.
         if !above(spool, floor)? {
             return Ok(None);
@@ -266,8 +273,19 @@ impl Session {
 
 /// Counts open sessions against the caps. Single-threaded: every
 /// session runs on the one runtime thread.
-#[derive(Clone, Default)]
-pub struct Slots(Rc<RefCell<(usize, HashMap<Ipv4Addr, usize>)>>);
+#[derive(Clone)]
+pub struct Slots {
+    counts: Rc<RefCell<(usize, HashMap<Ipv4Addr, usize>)>>,
+    per_addr: usize,
+    total: usize,
+}
+
+/// TCP's caps (§4.3).
+impl Default for Slots {
+    fn default() -> Self {
+        Self::new(PER_ADDR, TOTAL)
+    }
+}
 
 /// One open session's place; dropping it frees the place.
 pub struct Slot {
@@ -276,17 +294,26 @@ pub struct Slot {
 }
 
 impl Slots {
+    /// Counts of their own, with these caps.
+    pub fn new(per_addr: usize, total: usize) -> Self {
+        Self {
+            counts: Rc::default(),
+            per_addr,
+            total,
+        }
+    }
+
     /// Sessions open now, from every address.
     pub fn open(&self) -> usize {
-        self.0.borrow().0
+        self.counts.borrow().0
     }
 
     /// A place for one more session from `addr`, or None at either cap.
     pub fn take(&self, addr: Ipv4Addr) -> Option<Slot> {
-        let mut g = self.0.borrow_mut();
+        let mut g = self.counts.borrow_mut();
         let (total, per) = &mut *g;
         let n = per.entry(addr).or_default();
-        if *total >= TOTAL || *n >= PER_ADDR {
+        if *total >= self.total || *n >= self.per_addr {
             if *n == 0 {
                 per.remove(&addr);
             }
@@ -303,7 +330,7 @@ impl Slots {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let mut g = self.slots.0.borrow_mut();
+        let mut g = self.slots.counts.borrow_mut();
         let (total, per) = &mut *g;
         *total -= 1;
         if let Some(n) = per.get_mut(&self.addr) {
@@ -338,17 +365,14 @@ pub(crate) mod tests {
     }
 
     fn open_as(spool: &Path, cap: u64, floor: Floor, t: Transport) -> Option<Session> {
-        Session::open(
-            spool,
-            cap,
-            floor,
-            Protocol::Raw,
-            t,
-            Ipv4Addr::new(127, 77, 0, 5),
-            "10.0.0.2:40000".parse().unwrap(),
-            "1.2.3.4:6667".parse().unwrap(),
-        )
-        .unwrap()
+        let c = Conn {
+            protocol: Protocol::Raw,
+            transport: t,
+            addr: Ipv4Addr::new(127, 77, 0, 5),
+            src: "10.0.0.2:40000".parse().unwrap(),
+            dst: "1.2.3.4:6667".parse().unwrap(),
+        };
+        Session::open(spool, cap, floor, c).unwrap()
     }
 
     fn udp(spool: &Path, cap: u64) -> Session {
@@ -625,7 +649,7 @@ pub(crate) mod tests {
         }
         assert!(s.take(b).is_none());
         drop(held);
-        assert_eq!(s.0.borrow().0, 0);
-        assert!(s.0.borrow().1.is_empty());
+        assert_eq!(s.open(), 0);
+        assert!(s.counts.borrow().1.is_empty());
     }
 }

@@ -18,7 +18,7 @@ use tokio::time::timeout;
 use crate::dispatch::{by_bytes, by_port, PEEK};
 use crate::dns::{self, Names};
 use crate::pcap::FIXED_COST;
-use crate::session::{Floor, Session, Slots, Transport};
+use crate::session::{Conn, Floor, Session, Slots, Transport};
 
 /// How long a client on an unknown port gets to speak first. A client
 /// that waits to be spoken to is answered as raw after this.
@@ -60,9 +60,12 @@ impl Handler for Dns<'_> {
             if !s.record(true, &buf[..end])? {
                 return Ok(());
             }
-            let Some((reply, asked)) =
-                dns::answer(&buf[2..end], &mut self.0.borrow_mut(), s.rec.addr)
-            else {
+            let Some((reply, asked)) = dns::answer(
+                &buf[2..end],
+                &mut self.0.borrow_mut(),
+                s.rec.addr,
+                std::time::Instant::now(),
+            ) else {
                 continue;
             };
             if let Some(q) = asked {
@@ -85,8 +88,17 @@ pub struct Server {
     pub max_time: Duration,
     pub floor: Floor,
     pub slots: Slots,
+    /// UDP DNS sessions' own; see `udp::slots`.
+    pub udp_slots: Slots,
     /// Shared by DNS and the TCP side, which labels connections from it.
     pub names: RefCell<Names>,
+}
+
+impl Server {
+    /// Sessions open now, TCP and UDP.
+    pub fn open(&self) -> usize {
+        self.slots.open() + self.udp_slots.open()
+    }
 }
 
 /// What the spool must have free for one more session: the floor, plus
@@ -183,12 +195,14 @@ async fn run(
     let opened = Session::open(
         &srv.spool,
         srv.max_bytes,
-        reserve(srv.floor, srv.slots.open(), srv.max_bytes),
-        protocol,
-        Transport::Tcp,
-        addr,
-        src,
-        dst,
+        reserve(srv.floor, srv.open(), srv.max_bytes),
+        Conn {
+            protocol,
+            transport: Transport::Tcp,
+            addr,
+            src,
+            dst,
+        },
     )?;
     let Some(mut s) = opened else {
         eprintln!(
@@ -199,9 +213,8 @@ async fn run(
     };
     s.rec.dns_name = srv
         .names
-        .borrow()
-        .name_of(addr, *dst.ip())
-        .map(str::to_owned);
+        .borrow_mut()
+        .label(addr, *dst.ip(), std::time::Instant::now());
     // The rest are answered as catch-all until their own handlers land.
     let served = match protocol {
         Protocol::Dns => timeout(srv.max_time, Dns(&srv.names).serve(&mut s, io)).await,
@@ -259,6 +272,7 @@ mod tests {
             max_time,
             floor: NO_FLOOR,
             slots: Slots::default(),
+            udp_slots: crate::udp::slots(),
             names: RefCell::default(),
         })
     }
@@ -476,6 +490,7 @@ mod tests {
                 inodes: 0,
             },
             slots: Slots::default(),
+            udp_slots: crate::udp::slots(),
             names: RefCell::default(),
         });
         let other = srv.slots.take(Ipv4Addr::new(127, 77, 0, 9)).unwrap();
@@ -486,47 +501,34 @@ mod tests {
         assert_eq!(s.addr, INCIDENT);
     }
 
-    fn framed(id: u16, name: &str, t: hickory_proto::rr::RecordType) -> Vec<u8> {
-        use hickory_proto::op::{Message, MessageType, OpCode, Query};
-        let mut m = Message::new(id, MessageType::Query, OpCode::Query);
-        m.add_query(Query::query(
-            hickory_proto::rr::Name::from_ascii(name).unwrap(),
-            t,
-        ));
-        let b = m.to_vec().unwrap();
+    fn framed(id: u16, name: &str, t: u16) -> Vec<u8> {
+        let b = crate::dns::wire::query(id, name, t);
         [&(b.len() as u16).to_be_bytes()[..], &b].concat()
     }
 
-    async fn reply(c: &mut TcpStream) -> hickory_proto::op::Message {
+    async fn reply(c: &mut TcpStream) -> crate::dns::wire::Reply {
         let mut len = [0u8; 2];
         c.read_exact(&mut len).await.unwrap();
         let mut b = vec![0u8; u16::from_be_bytes(len).into()];
         c.read_exact(&mut b).await.unwrap();
-        hickory_proto::op::Message::from_vec(&b).unwrap()
+        crate::dns::wire::read(&b)
     }
 
     #[tokio::test]
     async fn dns_over_tcp_answers_each_framed_query() {
-        use hickory_proto::op::ResponseCode;
-        use hickory_proto::rr::RecordType;
+        use crate::dns::wire::{A, AAAA};
         let srv = server("hdns", 10_000, Duration::from_secs(5));
-        let (q1, q2) = (
-            framed(1, "c2.example.", RecordType::A),
-            framed(2, "c2.example.", RecordType::AAAA),
-        );
+        let (q1, q2) = (framed(1, "c2.example.", A), framed(2, "c2.example.", AAAA));
         let sent = q1.len() + q2.len() + 7;
         let rec = one(&srv, Some(Protocol::Dns), |mut c| async move {
             // Both at once: the framing, not the reads, splits them.
             c.write_all(&[q1, q2].concat()).await.unwrap();
             let a = reply(&mut c).await;
-            assert_eq!(a.answers.len(), 1);
-            assert_eq!(a.metadata.id, 1);
-            assert!(reply(&mut c).await.answers.is_empty());
+            assert_eq!(a.a.len(), 1);
+            assert_eq!(a.id, 1);
+            assert!(reply(&mut c).await.a.is_empty());
             c.write_all(&[0, 5, 1, 2, 3, 4, 5]).await.unwrap();
-            assert_eq!(
-                reply(&mut c).await.metadata.response_code,
-                ResponseCode::FormErr
-            );
+            assert_eq!(reply(&mut c).await.rcode(), 1);
             c.shutdown().await.unwrap();
         })
         .await;
@@ -549,6 +551,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_over_udp_never_takes_the_places_tcp_needs() {
+        use crate::dns::wire::{query, A};
+        let srv = server("hudp", 10_000, Duration::from_secs(5));
+        let mut g = crate::udp::Groups::default();
+        let q = query(1, "c2.example.", A);
+        let now = tokio::time::Instant::now();
+        // A stub resolver uses a new port for each lookup.
+        for port in 4000..4100 {
+            let src = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), port);
+            let to = SocketAddrV4::new(INCIDENT, 2553);
+            assert!(g.datagram(&srv, &q, src, to, now).is_some(), "unanswered");
+        }
+        assert_eq!(srv.udp_slots.open(), 16);
+        let rec = one(&srv, None, |c| async move { drop(c) }).await;
+        assert_eq!(rec.addr, INCIDENT);
+    }
+
+    #[tokio::test]
     async fn port_53_is_answered_as_dns() {
         let srv = server("h53", 10_000, Duration::from_secs(5));
         let (c, io) = pair(INCIDENT).await;
@@ -557,12 +577,12 @@ mod tests {
             a => panic!("{a}"),
         };
         let dst = SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53);
-        let q = framed(9, "x.example.", hickory_proto::rr::RecordType::A);
+        let q = framed(9, "x.example.", crate::dns::wire::A);
         bounded(&srv, async {
             let client = async move {
                 let mut c = c;
                 c.write_all(&q).await.unwrap();
-                assert_eq!(reply(&mut c).await.metadata.id, 9);
+                assert_eq!(reply(&mut c).await.id, 9);
             };
             let (r, ()) = tokio::join!(run(srv.clone(), io, INCIDENT, src, dst, None), client);
             r.unwrap();
@@ -575,7 +595,10 @@ mod tests {
     #[tokio::test]
     async fn a_connection_to_a_given_address_is_labelled_with_its_name() {
         let srv = server("hlabel", 1000, Duration::from_secs(5));
-        let ip = srv.names.borrow_mut().address(INCIDENT, "c2.example");
+        let ip = srv
+            .names
+            .borrow_mut()
+            .address(INCIDENT, "c2.example", std::time::Instant::now());
         for (dst, want) in [
             (SocketAddrV4::new(ip, 443), Some("c2.example")),
             (SocketAddrV4::new(Ipv4Addr::new(198, 18, 0, 2), 443), None),

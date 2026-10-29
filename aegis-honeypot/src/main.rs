@@ -131,6 +131,16 @@ fn spool(state: Option<&str>) -> PathBuf {
     PathBuf::from(first.unwrap_or(STATE)).join("spool")
 }
 
+/// Why a task that should run for good stopped; never, for no task.
+async fn ended(task: Option<tokio::task::JoinHandle<()>>) -> String {
+    match task {
+        Some(t) => t
+            .await
+            .map_or_else(|e| e.to_string(), |()| "stopped".into()),
+        None => std::future::pending().await,
+    }
+}
+
 fn run() -> Result<()> {
     let status = std::fs::read_to_string("/proc/self/status").context("/proc/self/status")?;
     if let Some(why) = refusal(&status) {
@@ -184,6 +194,7 @@ fn run() -> Result<()> {
         max_time: Duration::from_secs(cfg.session_seconds),
         floor: FLOOR,
         slots: Slots::default(),
+        udp_slots: udp::slots(),
         names: Default::default(),
     });
 
@@ -200,17 +211,32 @@ fn run() -> Result<()> {
         };
         // Nothing redirects to dns-tcp, but a client that finds the port
         // gets DNS.
-        if let Some(d) = dns {
-            tokio::task::spawn_local(accept(srv.clone(), listener(d)?, Some(Protocol::Dns)));
+        let dns_tcp = match dns {
+            Some(d) => Some(tokio::task::spawn_local(accept(
+                srv.clone(),
+                listener(d)?,
+                Some(Protocol::Dns),
+            ))),
+            None => None,
+        };
+        let dns_udp = match dns_udp {
+            Some(d) => {
+                // SAFETY: as for the listeners.
+                let s = unsafe { std::net::UdpSocket::from_raw_fd(d) };
+                s.set_nonblocking(true)?;
+                let s = tokio::net::UdpSocket::from_std(s)?;
+                Some(tokio::task::spawn_local(udp::serve(srv.clone(), s)))
+            }
+            None => None,
+        };
+        let tcp = listener(tcp)?;
+        // Any of them stopping exits the process, so systemd restarts all
+        // of it rather than it running on half-deaf.
+        tokio::select! {
+            () = accept(srv, tcp, None) => bail!("tcp: stopped"),
+            why = ended(dns_tcp) => bail!("dns-tcp: {why}"),
+            why = ended(dns_udp) => bail!("dns-udp: {why}"),
         }
-        if let Some(d) = dns_udp {
-            // SAFETY: as for the listeners.
-            let s = unsafe { std::net::UdpSocket::from_raw_fd(d) };
-            s.set_nonblocking(true)?;
-            tokio::task::spawn_local(udp::serve(srv.clone(), tokio::net::UdpSocket::from_std(s)?));
-        }
-        accept(srv, listener(tcp)?, None).await;
-        Ok(())
     })
 }
 
@@ -304,6 +330,31 @@ mod tests {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         assert!(!datagram(l.as_raw_fd()));
         assert!(!datagram(-1));
+    }
+
+    #[tokio::test]
+    async fn a_dns_task_that_stops_is_noticed() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+        let wait = Duration::from_secs(1);
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let h = tokio::task::spawn_local(async { panic!("boom") });
+                let why = timeout(wait, ended(Some(h)))
+                    .await
+                    .expect("a panic went unnoticed");
+                assert!(why.contains("panicked"), "{why}");
+                let h = tokio::task::spawn_local(async {});
+                let why = timeout(wait, ended(Some(h)))
+                    .await
+                    .expect("a return went unnoticed");
+                assert_eq!(why, "stopped");
+                // No socket, no task: nothing to wait for.
+                assert!(timeout(Duration::from_millis(10), ended(None))
+                    .await
+                    .is_err());
+            })
+            .await;
     }
 
     #[test]

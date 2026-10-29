@@ -11,8 +11,6 @@ publish = false
 aegis-proto = { path = "../aegis-proto" }
 
 anyhow = { workspace = true, features = ["std"] }
-# Parsing and building only: no resolver, no DNSSEC, no network I/O.
-hickory-proto = { version = "0.26.3", default-features = false }
 libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }

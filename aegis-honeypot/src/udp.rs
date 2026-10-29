@@ -18,10 +18,18 @@ use tokio::time::{sleep_until, Instant};
 
 use crate::dns;
 use crate::serve::{incident_addr, reserve, Server};
-use crate::session::{Session, Slot, Transport};
+use crate::session::{Conn, Session, Slot, Slots, Transport};
 
 /// Queries from one client port this close together are one session.
 pub const GROUP: Duration = Duration::from_secs(5);
+
+/// Open UDP sessions per incident address, and in all. Their own count,
+/// apart from TCP's: a stub resolver takes a new port per lookup, and
+/// each port holds its session for 5 s, so sharing would let a tree's
+/// lookups crowd out the connections that follow them.
+pub fn slots() -> Slots {
+    Slots::new(16, 256)
+}
 
 struct Group {
     s: Session,
@@ -57,10 +65,11 @@ impl Groups {
         if !incident_addr(addr) {
             return None;
         }
-        let (reply, asked) = match dns::answer(msg, &mut srv.names.borrow_mut(), addr) {
-            Some((r, q)) => (Some(r), q),
-            None => (None, None),
-        };
+        let (reply, asked) =
+            match dns::answer(msg, &mut srv.names.borrow_mut(), addr, now.into_std()) {
+                Some((r, q)) => (Some(r), q),
+                None => (None, None),
+            };
         let key = (addr, src);
         let g = match self.0.entry(key) {
             Entry::Occupied(e) => Some(e.into_mut()),
@@ -105,18 +114,20 @@ impl Groups {
 /// A new session for `src`, or None over a cap.
 fn open(srv: &Server, src: SocketAddrV4, local: SocketAddrV4, now: Instant) -> Option<Group> {
     let addr = *local.ip();
-    let slot = srv.slots.take(addr)?;
+    let slot = srv.udp_slots.take(addr)?;
     // The original destination of a DNATed datagram isn't kept anywhere
     // an unprivileged socket can read, so `dst` is where it landed.
     let opened = Session::open(
         &srv.spool,
         srv.max_bytes,
-        reserve(srv.floor, srv.slots.open(), srv.max_bytes),
-        Protocol::Dns,
-        Transport::Udp,
-        addr,
-        src,
-        local,
+        reserve(srv.floor, srv.open(), srv.max_bytes),
+        Conn {
+            protocol: Protocol::Dns,
+            transport: Transport::Udp,
+            addr,
+            src,
+            dst: local,
+        },
     );
     match opened {
         Ok(Some(s)) => Some(Group {
@@ -212,10 +223,18 @@ fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddrV4, Ip
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
+        // A cut control message can't be trusted to say where it went.
+        if m.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Ok(None);
+        }
+        let whole = libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
         let mut local = None;
         let mut c = libc::CMSG_FIRSTHDR(&raw const m);
         while !c.is_null() {
-            if (*c).cmsg_level == libc::IPPROTO_IP && (*c).cmsg_type == libc::IP_PKTINFO {
+            if (*c).cmsg_level == libc::IPPROTO_IP
+                && (*c).cmsg_type == libc::IP_PKTINFO
+                && (*c).cmsg_len as usize >= whole
+            {
                 let pi: libc::in_pktinfo = std::ptr::read_unaligned(libc::CMSG_DATA(c).cast());
                 local = Some(Ipv4Addr::from(u32::from_be(pi.ipi_addr.s_addr)));
             }
@@ -309,11 +328,9 @@ pub async fn serve(srv: Rc<Server>, sock: UdpSocket) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::wire::{self, query, A, AAAA};
     use crate::session::tests::{spool, NO_FLOOR};
-    use crate::session::Slots;
     use aegis_proto::honeypot;
-    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-    use hickory_proto::rr::{Name, RData, RecordType};
     use std::cell::RefCell;
     use std::path::Path;
 
@@ -326,14 +343,9 @@ mod tests {
             max_time,
             floor: NO_FLOOR,
             slots: Slots::default(),
+            udp_slots: slots(),
             names: RefCell::default(),
         }
-    }
-
-    fn query(id: u16, name: &str, t: RecordType) -> Vec<u8> {
-        let mut m = Message::new(id, MessageType::Query, OpCode::Query);
-        m.add_query(Query::query(Name::from_ascii(name).unwrap(), t));
-        m.to_vec().unwrap()
     }
 
     fn cli(port: u16) -> SocketAddrV4 {
@@ -364,9 +376,9 @@ mod tests {
         let srv = server("ugroup", 10_000, Duration::from_secs(300));
         let mut g = Groups::default();
         let t0 = Instant::now();
-        let q = query(1, "c2.example.", RecordType::A);
+        let q = query(1, "c2.example.", A);
         assert!(g.datagram(&srv, &q, cli(4000), at(INCIDENT), t0).is_some());
-        let q2 = query(2, "c2.example.", RecordType::AAAA);
+        let q2 = query(2, "c2.example.", AAAA);
         let s4 = Duration::from_secs(4);
         assert!(g
             .datagram(&srv, &q2, cli(4000), at(INCIDENT), t0 + s4)
@@ -406,12 +418,13 @@ mod tests {
         let srv = server("usplit", 10_000, Duration::from_secs(300));
         let mut g = Groups::default();
         let t0 = Instant::now();
-        let q = query(1, "a.example.", RecordType::A);
+        let q = query(1, "a.example.", A);
         g.datagram(&srv, &q, cli(4000), at(INCIDENT), t0);
         g.datagram(&srv, &q, cli(4001), at(INCIDENT), t0);
         g.expire(t0 + GROUP, srv.max_time);
         g.datagram(&srv, &q, cli(4000), at(INCIDENT), t0 + GROUP);
         g.expire(t0 + GROUP * 2, srv.max_time);
+        assert_eq!(srv.udp_slots.open(), 0, "a filed session kept its place");
         let s = filed(&srv.spool, INCIDENT);
         assert_eq!(s.len(), 3);
         assert!(s.iter().all(|s| s.queries.len() == 1));
@@ -423,7 +436,7 @@ mod tests {
         let srv = server("utime", 10_000, Duration::from_secs(10));
         let mut g = Groups::default();
         let t0 = Instant::now();
-        let q = query(1, "a.example.", RecordType::A);
+        let q = query(1, "a.example.", A);
         for i in 0..3 {
             g.datagram(
                 &srv,
@@ -444,7 +457,7 @@ mod tests {
 
     #[test]
     fn the_byte_cap_files_the_session_at_once() {
-        let q = query(1, "a.example.", RecordType::A);
+        let q = query(1, "a.example.", A);
         // Room for the query, not for its reply.
         let cap = q.len() as u64 + 2 * crate::pcap::DATAGRAM_COST;
         let srv = server("ucap", cap, Duration::from_secs(300));
@@ -453,6 +466,7 @@ mod tests {
         // Answered all the same.
         assert!(g.datagram(&srv, &q, cli(4000), at(INCIDENT), t0).is_some());
         assert_eq!(g.next(srv.max_time), None);
+        assert_eq!(srv.udp_slots.open(), 0, "a filed session kept its place");
         let s = filed(&srv.spool, INCIDENT);
         assert_eq!(s.len(), 1);
         assert!(s[0].truncated);
@@ -464,7 +478,7 @@ mod tests {
     fn a_non_incident_address_gets_no_answer_and_no_session() {
         let srv = server("ulocal", 10_000, Duration::from_secs(300));
         let mut g = Groups::default();
-        let q = query(1, "a.example.", RecordType::A);
+        let q = query(1, "a.example.", A);
         let local = at(Ipv4Addr::LOCALHOST);
         assert_eq!(g.datagram(&srv, &q, cli(4000), local, Instant::now()), None);
         assert_eq!(g.next(srv.max_time), None);
@@ -481,9 +495,9 @@ mod tests {
     #[test]
     fn a_full_address_is_answered_but_not_recorded() {
         let srv = server("ufull", 10_000, Duration::from_secs(300));
-        let _held: Vec<_> = std::iter::from_fn(|| srv.slots.take(INCIDENT)).collect();
+        let _held: Vec<_> = std::iter::from_fn(|| srv.udp_slots.take(INCIDENT)).collect();
         let mut g = Groups::default();
-        let q = query(1, "a.example.", RecordType::A);
+        let q = query(1, "a.example.", A);
         assert!(g
             .datagram(&srv, &q, cli(4000), at(INCIDENT), Instant::now())
             .is_some());
@@ -493,18 +507,12 @@ mod tests {
     }
 
     /// The reply's answers, or its response code when it has none.
-    fn answers(reply: &[u8]) -> Result<Vec<Ipv4Addr>, ResponseCode> {
-        let m = Message::from_vec(reply).unwrap();
-        if m.metadata.response_code != ResponseCode::NoError {
-            return Err(m.metadata.response_code);
+    fn answers(reply: &[u8]) -> Result<Vec<Ipv4Addr>, u8> {
+        let r = wire::read(reply);
+        if r.rcode() != 0 {
+            return Err(r.rcode());
         }
-        Ok(m.answers
-            .iter()
-            .map(|r| match &r.data {
-                RData::A(a) => a.0,
-                d => panic!("{d:?}"),
-            })
-            .collect())
+        Ok(r.a)
     }
 
     #[tokio::test]
@@ -537,30 +545,20 @@ mod tests {
             }
         };
         let client = async {
-            let (r1, from) = ask(query(1, "c2.example.", RecordType::A), to)
-                .await
-                .unwrap();
+            let (r1, from) = ask(query(1, "c2.example.", A), to).await.unwrap();
             assert_eq!(from, to.into(), "the reply came from the wrong address");
-            let (r2, _) = ask(query(2, "C2.EXAMPLE.", RecordType::A), to)
-                .await
-                .unwrap();
-            let (r3, _) = ask(query(3, "other.example.", RecordType::A), to)
-                .await
-                .unwrap();
+            let (r2, _) = ask(query(2, "C2.EXAMPLE.", A), to).await.unwrap();
+            let (r3, _) = ask(query(3, "other.example.", A), to).await.unwrap();
             assert_eq!(answers(&r1), Ok(vec![Ipv4Addr::new(198, 18, 0, 1)]));
             assert_eq!(answers(&r1), answers(&r2));
             assert_eq!(answers(&r3), Ok(vec![Ipv4Addr::new(198, 18, 0, 2)]));
-            let (r, _) = ask(query(4, "c2.example.", RecordType::AAAA), to)
-                .await
-                .unwrap();
+            let (r, _) = ask(query(4, "c2.example.", AAAA), to).await.unwrap();
             assert_eq!(answers(&r), Ok(vec![]));
             let (r, _) = ask(vec![0xab, 0xcd, 0, 0, 0], to).await.unwrap();
-            assert_eq!(answers(&r), Err(ResponseCode::FormErr));
+            assert_eq!(answers(&r), Err(1));
             let lo = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
             assert!(
-                ask(query(5, "c2.example.", RecordType::A), lo)
-                    .await
-                    .is_none(),
+                ask(query(5, "c2.example.", A), lo).await.is_none(),
                 "answered on 127.0.0.1"
             );
         };
