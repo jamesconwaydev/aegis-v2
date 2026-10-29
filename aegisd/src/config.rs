@@ -10,6 +10,8 @@ use serde::de::{self, DeserializeOwned, Deserializer};
 use serde::Deserialize;
 use toml::Spanned;
 
+pub use aegis_proto::honeypot::HoneypotConfig;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -292,54 +294,6 @@ fn at_least_16<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
         Ok(v)
     } else {
         Err(de::Error::custom(format!("must be at least 16, got {v}")))
-    }
-}
-
-fn port<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
-    let v = u32::deserialize(d)?;
-    match u16::try_from(v) {
-        Ok(p) if p >= 1024 => Ok(p),
-        _ => Err(de::Error::custom(format!(
-            "must be a port from 1024 to 65535, got {v}"
-        ))),
-    }
-}
-
-/// The honeypot's listeners and limits. Read only when
-/// `quarantine.network = "honeypot"` in enforce mode.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct HoneypotConfig {
-    /// Where the redirected TCP connections land.
-    #[serde(deserialize_with = "port")]
-    pub tcp_port: u16,
-    /// Where the redirected DNS queries land.
-    #[serde(deserialize_with = "port")]
-    pub dns_port: u16,
-    /// Most bytes kept from one session.
-    #[serde(deserialize_with = "at_least_one")]
-    pub max_session_bytes: u64,
-    /// Longest one session may run.
-    #[serde(deserialize_with = "at_least_one")]
-    pub session_seconds: u64,
-    /// `pids.max` on an observed tree's scope.
-    #[serde(deserialize_with = "at_least_one")]
-    pub max_tasks: u32,
-    /// Trees observed at once; more get drop quarantine.
-    #[serde(deserialize_with = "at_least_one")]
-    pub max_incidents: u32,
-}
-
-impl Default for HoneypotConfig {
-    fn default() -> Self {
-        Self {
-            tcp_port: 2580,
-            dns_port: 2553,
-            max_session_bytes: 4_194_304,
-            session_seconds: 300,
-            max_tasks: 256,
-            max_incidents: 32,
-        }
     }
 }
 
