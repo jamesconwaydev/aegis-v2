@@ -11,8 +11,12 @@
 //! An entry with a `net_cgroup` is an open hold (honeypot): the process
 //! may connect and send, but only on an IPv4 or IPv6 socket in
 //! `init_net` that was created in that cgroup, so sockets from before the
-//! move stay refused. It may fork, and `inherit` holds each new process
-//! the same way before it first runs. Everything else stays refused.
+//! move stay refused. It may fork. Everything else stays refused.
+//!
+//! `inherit` copies whatever hold the parent has to each new process
+//! before it first runs. A fork that passed `task_alloc` just before its
+//! parent was held, or before an open hold was closed, still yields a
+//! held child.
 //!
 //! `aegis_guard` sits on the quarantine slice's egress and drops whatever
 //! isn't IPv4 to the honeypot, in case the nft redirect is ever missing.
@@ -86,24 +90,21 @@ fn deny(errno: i32) -> i32 {
 }
 
 /// Called from `sched_process_fork`, after the child is set up and
-/// before it is first woken. A child of an open hold is held the same
-/// way, so nothing it runs ever goes unheld.
+/// before it is first woken. The child gets the parent's hold as it
+/// stands now, open or not, so nothing it runs ever goes unheld.
 #[inline(always)]
 pub(crate) fn inherit(child_tgid: u32, child_start_time_ns: u64) {
-    match held() {
-        Some(h) if h.net_cgroup != 0 => {
-            let hold = Hold {
-                start_time_ns: child_start_time_ns,
-                net_cgroup: h.net_cgroup,
-            };
-            let _ = HELD.insert(&child_tgid, &hold, 0);
-        }
-        _ => {}
+    if let Some(h) = held() {
+        let hold = Hold {
+            start_time_ns: child_start_time_ns,
+            net_cgroup: h.net_cgroup,
+        };
+        let _ = HELD.insert(&child_tgid, &hold, 0);
     }
 }
 
 /// A plain hold refuses every fork. An open one allows them (threads
-/// need nothing; `inherit` holds new processes) but not into another
+/// need nothing; `inherit` holds new processes), but not into another
 /// cgroup, which would carry a child out of the scope's rules.
 #[lsm(hook = "task_alloc")]
 pub fn aegis_hold_fork(ctx: LsmContext) -> i32 {

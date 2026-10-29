@@ -76,19 +76,27 @@ impl Holds {
                 .insert(tgid, h, flags)
                 .with_context(|| format!("holding {tgid}"))?,
             None => {
-                if flags != BPF_EXIST || self.mem.contains_key(&tgid) {
-                    self.mem.insert(tgid, h);
-                }
+                // The map refuses BPF_EXIST on a missing key; so does this.
+                anyhow::ensure!(
+                    flags != BPF_EXIST || self.mem.contains_key(&tgid),
+                    "holding {tgid}: no entry"
+                );
+                self.mem.insert(tgid, h);
             }
         }
         Ok(())
     }
 
-    /// Every entry, read before anything changes.
-    fn entries(&self) -> Vec<(u32, Hold)> {
+    /// Every entry, read before anything changes. A key deleted mid-walk
+    /// (its process exited) is skipped; any other failure is an error,
+    /// so a scope is never taken as closed with entries unread.
+    fn entries(&self) -> Result<Vec<(u32, Hold)>> {
         match &self.map {
-            Some(m) => m.iter().filter_map(Result::ok).collect(),
-            None => self.mem.iter().map(|(&t, &h)| (t, h)).collect(),
+            Some(m) => m
+                .iter()
+                .collect::<Result<_, _>>()
+                .context("reading held processes"),
+            None => Ok(self.mem.iter().map(|(&t, &h)| (t, h)).collect()),
         }
     }
 
@@ -141,10 +149,19 @@ impl Holds {
 
     /// Takes the network back from every hold opened to `cgroup_id`,
     /// children the kernel added included. Returns their tgids.
+    ///
+    /// The walk is not atomic: an open-held process that forks while it
+    /// runs can add an entry the walk misses. Freeze the scope first, so
+    /// the set is stable, or freeze and then call this a second time.
     #[allow(dead_code)] // the honeypot enforcer
     pub fn close_scope(&mut self, cgroup_id: u64) -> Result<Vec<u32>> {
+        let entries = self.entries()?;
+        self.close(entries, cgroup_id)
+    }
+
+    fn close(&mut self, entries: Vec<(u32, Hold)>, cgroup_id: u64) -> Result<Vec<u32>> {
         let mut tgids = Vec::new();
-        for (tgid, h) in self.entries() {
+        for (tgid, h) in entries {
             if cgroup_id != 0 && h.net_cgroup == cgroup_id {
                 let closed = Hold { net_cgroup: 0, ..h };
                 match self.set(tgid, closed, BPF_EXIST) {
@@ -159,10 +176,12 @@ impl Holds {
     }
 
     /// Releases every hold opened to `cgroup_id`. Returns their tgids.
+    /// Like `close_scope`, it can miss entries added during the walk, so
+    /// call it on a frozen scope.
     #[allow(dead_code)] // the honeypot enforcer
     pub fn release_scope(&mut self, cgroup_id: u64) -> Result<Vec<u32>> {
         let mut tgids = Vec::new();
-        for (tgid, h) in self.entries() {
+        for (tgid, h) in self.entries()? {
             if cgroup_id != 0 && h.net_cgroup == cgroup_id {
                 self.release(ProcKey {
                     tgid,
@@ -540,6 +559,21 @@ mod tests {
         assert_eq!(h.release_scope(50).unwrap(), vec![12]);
         assert_eq!(h.held(), 4);
         assert_eq!(net(&h, 12), None);
+    }
+
+    #[test]
+    fn close_scope_skips_a_process_that_exited_mid_walk() {
+        let mut h = Holds::default();
+        for tgid in [10, 11] {
+            h.hold(key(tgid, 7)).unwrap();
+            h.open(key(tgid, 7), 99).unwrap();
+        }
+        let read = h.entries().unwrap();
+        // 10 exits after the read; the kernel drops its entry.
+        h.mem.remove(&10);
+        assert_eq!(h.close(read, 99).unwrap(), vec![11]);
+        assert_eq!(net(&h, 10), None);
+        assert_eq!(net(&h, 11), Some(0));
     }
 
     #[test]
