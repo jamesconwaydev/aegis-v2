@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Fork and exit. Fork uses the BTF tracepoint because the classic one
-//! only carries the child's thread id, not its thread-group id.
+//! only carries the child's thread id, not its thread-group id. It also
+//! passes an open hold on to the child (`hold::inherit`).
 
 use aegis_common::EventKind;
 use aya_ebpf::{
@@ -11,7 +12,11 @@ use aya_ebpf::{
     programs::{BtfTracePointContext, TracePointContext},
 };
 
-use crate::{current, emit, hold::HELD, off, read};
+use crate::{
+    current, emit,
+    hold::{self, HELD},
+    off, read,
+};
 
 /// Processes we've already emitted an Exit for, so a race between the
 /// last threads can't double-report one. Keyed by (tgid, leader
@@ -28,12 +33,14 @@ pub fn aegis_fork(ctx: BtfTracePointContext) -> i32 {
     if child_tgid == (bpf_get_current_pid_tgid() >> 32) as u32 {
         return 0;
     }
+    // The child is its own group leader, so its own start time is the
+    // one that pairs with child_tgid to identify the new process.
+    let child_start: u64 = read(child, off!(task_start_time));
+    hold::inherit(child_tgid, child_start);
     emit(EventKind::Fork, |ev| {
         current(ev);
         ev.child_tgid = child_tgid;
-        // The child is its own group leader, so its own start time is the
-        // one that pairs with child_tgid to identify the new process.
-        ev.child_start_time_ns = read(child, off!(task_start_time));
+        ev.child_start_time_ns = child_start;
     });
     0
 }

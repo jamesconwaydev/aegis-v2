@@ -11,12 +11,12 @@ mod btf;
 
 use std::collections::BTreeMap;
 
-use aegis_common::{Event, KernelOffsets};
+use aegis_common::{Event, Hold, KernelOffsets};
 use aegis_proto::ProbeStatus;
 use anyhow::{anyhow, Context as _, Result};
 use aya::{
     maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf},
-    programs::{BtfTracePoint, Lsm, TracePoint},
+    programs::{BtfTracePoint, CgroupSkb, Lsm, TracePoint},
     Ebpf, EbpfLoader,
 };
 use tokio::{
@@ -44,18 +44,58 @@ pub struct EbpfHandle {
     pub holds: Holds,
 }
 
+/// `BPF_EXIST`: update an entry only if it is still there, so a process
+/// that exits mid-update isn't put back.
+const BPF_EXIST: u64 = 2;
+
 /// Processes the kernel's hold hooks refuse to let act. The kernel drops
-/// an entry itself when the process exits.
+/// an entry itself when the process exits, and copies an open hold to
+/// each new process.
 #[derive(Default)]
 pub struct Holds {
-    map: Option<HashMap<MapData, u32, u64>>,
+    map: Option<HashMap<MapData, u32, Hold>>,
     /// Stands in for the map when there is none (tests).
-    mem: BTreeMap<u32, u64>,
+    mem: BTreeMap<u32, Hold>,
 }
 
 impl Holds {
+    fn get(&self, tgid: u32) -> Result<Option<Hold>> {
+        match &self.map {
+            Some(m) => match m.get(&tgid, 0) {
+                Ok(h) => Ok(Some(h)),
+                Err(MapError::KeyNotFound) => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("reading hold on {tgid}")),
+            },
+            None => Ok(self.mem.get(&tgid).copied()),
+        }
+    }
+
+    fn set(&mut self, tgid: u32, h: Hold, flags: u64) -> Result<()> {
+        match &mut self.map {
+            Some(m) => m
+                .insert(tgid, h, flags)
+                .with_context(|| format!("holding {tgid}"))?,
+            None => {
+                if flags != BPF_EXIST || self.mem.contains_key(&tgid) {
+                    self.mem.insert(tgid, h);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every entry, read before anything changes.
+    fn entries(&self) -> Vec<(u32, Hold)> {
+        match &self.map {
+            Some(m) => m.iter().filter_map(Result::ok).collect(),
+            None => self.mem.iter().map(|(&t, &h)| (t, h)).collect(),
+        }
+    }
+
     /// Refuses pid 0-2 and aegisd itself, which must never be held, and
-    /// a zero start time, which the kernel would never match.
+    /// a zero start time, which the kernel would never match. Holding a
+    /// process that is already held leaves its entry alone, open or not:
+    /// a Fork event can arrive for a child the kernel already holds.
     pub fn hold(&mut self, k: ProcKey) -> Result<()> {
         anyhow::ensure!(
             k.tgid > 2 && k.tgid != std::process::id(),
@@ -67,15 +107,71 @@ impl Holds {
             "refusing to hold {}: no start time",
             k.tgid
         );
-        match &mut self.map {
-            Some(m) => m
-                .insert(k.tgid, k.start_time_ns, 0)
-                .with_context(|| format!("holding {}", k.tgid))?,
-            None => {
-                self.mem.insert(k.tgid, k.start_time_ns);
+        if self
+            .get(k.tgid)?
+            .is_some_and(|h| h.start_time_ns == k.start_time_ns)
+        {
+            return Ok(());
+        }
+        let h = Hold {
+            start_time_ns: k.start_time_ns,
+            net_cgroup: 0,
+        };
+        self.set(k.tgid, h, 0)
+    }
+
+    /// Opens `k`'s hold to sockets created in cgroup `cgroup_id`, and has
+    /// the kernel hold its new processes the same way. `k` must already
+    /// be held.
+    #[allow(dead_code)] // the honeypot enforcer
+    pub fn open(&mut self, k: ProcKey, cgroup_id: u64) -> Result<()> {
+        anyhow::ensure!(cgroup_id != 0, "opening {}: no cgroup id", k.tgid);
+        anyhow::ensure!(
+            self.get(k.tgid)?
+                .is_some_and(|h| h.start_time_ns == k.start_time_ns),
+            "opening {}: not held",
+            k.tgid
+        );
+        let h = Hold {
+            start_time_ns: k.start_time_ns,
+            net_cgroup: cgroup_id,
+        };
+        self.set(k.tgid, h, BPF_EXIST)
+    }
+
+    /// Takes the network back from every hold opened to `cgroup_id`,
+    /// children the kernel added included. Returns their tgids.
+    #[allow(dead_code)] // the honeypot enforcer
+    pub fn close_scope(&mut self, cgroup_id: u64) -> Result<Vec<u32>> {
+        let mut tgids = Vec::new();
+        for (tgid, h) in self.entries() {
+            if cgroup_id != 0 && h.net_cgroup == cgroup_id {
+                let closed = Hold { net_cgroup: 0, ..h };
+                match self.set(tgid, closed, BPF_EXIST) {
+                    Ok(()) => tgids.push(tgid),
+                    // Exited since the read; nothing left to close.
+                    Err(_) if self.get(tgid)?.is_none() => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
-        Ok(())
+        Ok(tgids)
+    }
+
+    /// Releases every hold opened to `cgroup_id`. Returns their tgids.
+    #[allow(dead_code)] // the honeypot enforcer
+    pub fn release_scope(&mut self, cgroup_id: u64) -> Result<Vec<u32>> {
+        let mut tgids = Vec::new();
+        for (tgid, h) in self.entries() {
+            if cgroup_id != 0 && h.net_cgroup == cgroup_id {
+                self.release(ProcKey {
+                    tgid,
+                    start_time_ns: h.start_time_ns,
+                })?;
+                tgids.push(tgid);
+            }
+        }
+        Ok(tgids)
     }
 
     /// Releases `k` only if the entry is still for that process: a tgid
@@ -85,7 +181,7 @@ impl Holds {
         let tgid = k.tgid;
         match &mut self.map {
             Some(m) => match m.get(&tgid, 0) {
-                Ok(s) if s == k.start_time_ns => match m.remove(&tgid) {
+                Ok(h) if h.start_time_ns == k.start_time_ns => match m.remove(&tgid) {
                     Err(MapError::SyscallError(e))
                         if e.io_error.kind() == std::io::ErrorKind::NotFound => {}
                     r => r.with_context(|| format!("releasing {tgid}"))?,
@@ -94,7 +190,7 @@ impl Holds {
                 Err(e) => Err(e).with_context(|| format!("releasing {tgid}"))?,
             },
             None => {
-                if self.mem.get(&tgid) == Some(&k.start_time_ns) {
+                if self.mem.get(&tgid).map(|h| h.start_time_ns) == Some(k.start_time_ns) {
                     self.mem.remove(&tgid);
                 }
             }
@@ -148,7 +244,37 @@ fn kernel_offsets(btf: &btf::Btf) -> Result<KernelOffsets> {
         task_mm: btf.offset("task_struct", "mm")?,
         mm_env_start: btf.offset("mm_struct", "env_start")?,
         mm_env_end: btf.offset("mm_struct", "env_end")?,
+        sock_sk: btf.offset("socket", "sk")?,
+        sk_family: btf.offset("sock", "__sk_common")? + btf.offset("sock_common", "skc_family")?,
+        // possible_net_t is a struct of one pointer.
+        sk_net: btf.offset("sock", "__sk_common")? + btf.offset("sock_common", "skc_net")?,
+        sk_cgrp_data: btf.offset("sock", "sk_cgrp_data")?
+            + btf.offset("sock_cgroup_data", "cgroup")?,
+        cgroup_kn: btf.offset("cgroup", "kn")?,
+        kn_id: btf.offset("kernfs_node", "id")?,
+        net_inum: btf.offset("net", "ns")? + btf.offset("ns_common", "inum")?,
+        inode_i_mode: btf.offset("inode", "i_mode")?,
+        init_net_inum: init_net_inum()?,
     })
+}
+
+/// The initial network namespace's inode number, from pid 1's. An open
+/// hold compares a socket's namespace against it, which needs no kernel
+/// address: aegisd can't read those from /proc/kallsyms without
+/// CAP_SYSLOG, and BTF doesn't carry them.
+fn init_net_inum() -> Result<u32> {
+    const NS: &str = "/proc/1/ns/net";
+    let link = std::fs::read_link(NS).with_context(|| format!("reading {NS}"))?;
+    parse_ns_link(&link.to_string_lossy()).with_context(|| format!("{NS} is {link:?}"))
+}
+
+fn parse_ns_link(link: &str) -> Option<u32> {
+    let inum = link
+        .strip_prefix("net:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()?;
+    (inum != 0).then_some(inum)
 }
 
 /// Loads and attaches every probe. Must be called inside a tokio
@@ -213,6 +339,10 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
             .with_context(|| format!("attaching lsm/{hook}"))?;
         attached(name, format!("lsm/{hook}"));
     }
+
+    // Verified now, attached to the quarantine slice by the enforcer.
+    let guard: &mut CgroupSkb = prog(&mut ebpf, "aegis_guard")?;
+    guard.load().context("loading cgroup_skb/egress")?;
 
     let fork: &mut BtfTracePoint = prog(&mut ebpf, "aegis_fork")?;
     fork.load("sched_process_fork", &kernel_btf)?;
@@ -343,6 +473,81 @@ mod tests {
         assert_eq!(h.held(), 1);
         h.release(now).unwrap();
         assert_eq!(h.held(), 0);
+    }
+
+    fn key(tgid: u32, start_time_ns: u64) -> ProcKey {
+        ProcKey {
+            tgid,
+            start_time_ns,
+        }
+    }
+
+    fn net(h: &Holds, tgid: u32) -> Option<u64> {
+        h.get(tgid).unwrap().map(|h| h.net_cgroup)
+    }
+
+    #[test]
+    fn hold_leaves_an_existing_hold_alone() {
+        let mut h = Holds::default();
+        h.hold(key(4242, 7)).unwrap();
+        h.open(key(4242, 7), 99).unwrap();
+        // A late Fork event for a child the kernel already holds.
+        h.hold(key(4242, 7)).unwrap();
+        assert_eq!(net(&h, 4242), Some(99));
+        // A reused tgid is a new process and gets a plain hold.
+        h.hold(key(4242, 8)).unwrap();
+        assert_eq!(net(&h, 4242), Some(0));
+    }
+
+    #[test]
+    fn open_needs_that_exact_process_held() {
+        let mut h = Holds::default();
+        assert!(h.open(key(4242, 7), 99).is_err());
+        h.hold(key(4242, 7)).unwrap();
+        assert!(h.open(key(4242, 8), 99).is_err());
+        assert!(h.open(key(4242, 7), 0).is_err());
+        assert_eq!(net(&h, 4242), Some(0));
+        h.open(key(4242, 7), 99).unwrap();
+        assert_eq!(net(&h, 4242), Some(99));
+    }
+
+    #[test]
+    fn close_and_release_scope_touch_only_that_scope() {
+        let mut h = Holds::default();
+        for (tgid, cg) in [(10, 99), (11, 99), (12, 50), (13, 0)] {
+            h.hold(key(tgid, 7)).unwrap();
+            if cg != 0 {
+                h.open(key(tgid, 7), cg).unwrap();
+            }
+        }
+        // A child the kernel copied in on fork.
+        h.mem.insert(
+            14,
+            Hold {
+                start_time_ns: 9,
+                net_cgroup: 99,
+            },
+        );
+
+        assert!(h.close_scope(0).unwrap().is_empty());
+        assert_eq!(h.close_scope(99).unwrap(), vec![10, 11, 14]);
+        assert_eq!(net(&h, 14), Some(0));
+        assert_eq!(net(&h, 12), Some(50));
+        assert_eq!(h.held(), 5);
+        // Closed holds no longer carry the id.
+        assert!(h.release_scope(99).unwrap().is_empty());
+
+        assert_eq!(h.release_scope(50).unwrap(), vec![12]);
+        assert_eq!(h.held(), 4);
+        assert_eq!(net(&h, 12), None);
+    }
+
+    #[test]
+    fn parses_the_netns_link() {
+        assert_eq!(parse_ns_link("net:[4026531840]"), Some(4026531840));
+        assert_eq!(parse_ns_link("net:[0]"), None);
+        assert_eq!(parse_ns_link("mnt:[4026531840]"), None);
+        assert_eq!(parse_ns_link("net:[x]"), None);
     }
 
     #[test]
