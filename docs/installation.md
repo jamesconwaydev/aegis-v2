@@ -69,6 +69,7 @@ it before you start the daemon.
 | `/usr/sbin/aegisd`                          | the daemon                |
 | `/usr/bin/aegisctl`                         | the CLI                   |
 | `/usr/lib/systemd/system/aegisd.service`    | the systemd unit          |
+| `/usr/libexec/aegis-v2/freeze-quarantine`   | freezes observed trees    |
 | `/etc/aegis-v2/config.toml`                 | main config, mode 0600    |
 | `/etc/aegis-v2/allowlist.d/00-default.toml` | default allowlist         |
 | `/var/lib/aegis-v2/`                        | incident store, mode 0700 |

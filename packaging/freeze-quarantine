@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# aegisd.service runs this whenever aegisd stops, crashes included. A
+# tree aegisd observes in honeypot mode runs unfrozen, held by programs
+# that end with aegisd, so it is frozen here. aegisd lists each such
+# scope in this directory. A released tree stays in the quarantine
+# slice too, but is never listed, so it keeps running.
+dir=/var/lib/aegis-v2/observing
+[ -d "$dir" ] || exit 0
+for f in "$dir"/aegis-incident-*-q.scope; do
+    [ -e "$f" ] || continue
+    unit=${f##*/}
+    systemctl freeze -- "$unit" || echo "freeze-quarantine: could not freeze $unit" >&2
+done
+exit 0

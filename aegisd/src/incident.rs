@@ -118,7 +118,10 @@ impl EvidenceRecord {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActionRecord {
     /// "hold" | "scope" | "attach" | "freeze" | "nft_drop" | "thaw" |
-    /// "unhold" | "nft_remove" | "kill" | "lift_limits" | "expired"
+    /// "unhold" | "nft_remove" | "kill" | "lift_limits" | "expired", and
+    /// in honeypot mode "guard" | "nft_accept" | "nft_dnat" |
+    /// "nft_redirect" | "observe" | "honeypot_open" | "close" |
+    /// "honeypot_close"
     pub kind: String,
     pub ok: bool,
     #[serde(default)]
