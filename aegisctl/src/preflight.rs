@@ -268,51 +268,51 @@ impl Preflight {
             "dnf install criu",
         ));
 
-        // Needed only for network = "honeypot", and only an enforce-mode
-        // config acts on it; otherwise a gap is advice.
-        let honeypot = config_value(&cfg, "quarantine", "network").as_deref() == Some("honeypot");
-        let port = |k: &str, d: u16| {
-            config_value(&cfg, "honeypot", k)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
-        };
-        let (tcp, dns) = (port("tcp_port", 2580), port("dns_port", 2553));
-        let mut missing = Vec::new();
-        if !unit_active(HONEYPOT_UNIT) {
-            missing.push(format!("{HONEYPOT_UNIT} is not active"));
-        }
-        if !aegis_proto::honeypot_listening(&under(root, "/proc"), tcp, dns).unwrap_or(false) {
-            missing.push(format!(
-                "nothing listens on 0.0.0.0 TCP {tcp} and UDP {dns}"
+        // Only network = "honeypot" uses any of this. Under drop (the
+        // default) the line passes without probing, so a v0.2 host's exit
+        // code is what it was. An enforce-mode config acts on honeypot;
+        // an audit one only gets advice.
+        if config_value(&cfg, "quarantine", "network").as_deref() != Some("honeypot") {
+            out.push(Check {
+                check: "honeypot",
+                status: Status::Pass,
+                detail: "not used (quarantine.network = \"drop\")".into(),
+                fix: None,
+            });
+        } else {
+            let port = |k: &str, d: u16| {
+                config_value(&cfg, "honeypot", k)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(d)
+            };
+            let (tcp, dns) = (port("tcp_port", 2580), port("dns_port", 2553));
+            let mut missing = Vec::new();
+            if !unit_active(HONEYPOT_UNIT) {
+                missing.push(format!("{HONEYPOT_UNIT} is not active"));
+            }
+            if !aegis_proto::honeypot_listening(&under(root, "/proc"), tcp, dns).unwrap_or(false) {
+                missing.push(format!(
+                    "nothing listens on 0.0.0.0 TCP {tcp} and UDP {dns}"
+                ));
+            }
+            let user = read(root, "/etc/passwd").is_some_and(|p| {
+                p.lines()
+                    .any(|l| l.split(':').next() == Some(HONEYPOT_USER))
+            });
+            if !user {
+                missing.push(format!("user {HONEYPOT_USER} does not exist"));
+            }
+            out.push(mk(
+                "honeypot",
+                missing.is_empty(),
+                if enforce { Status::Fail } else { Status::Warn },
+                format!(
+                    "{HONEYPOT_UNIT} active, ports {tcp}/{dns} listening, {HONEYPOT_USER} exists"
+                ),
+                missing.join("; "),
+                "Install the aegis-v2 package, then systemctl enable --now aegis-honeypot.socket.",
             ));
         }
-        let user = read(root, "/etc/passwd").is_some_and(|p| {
-            p.lines()
-                .any(|l| l.split(':').next() == Some(HONEYPOT_USER))
-        });
-        if !user {
-            missing.push(format!("user {HONEYPOT_USER} does not exist"));
-        }
-        out.push(mk(
-            "honeypot",
-            missing.is_empty(),
-            if honeypot && enforce {
-                Status::Fail
-            } else {
-                Status::Warn
-            },
-            format!("{HONEYPOT_UNIT} active, ports {tcp}/{dns} listening, {HONEYPOT_USER} exists"),
-            format!(
-                "{}{}",
-                missing.join("; "),
-                if honeypot {
-                    ""
-                } else {
-                    " (needed only for network = \"honeypot\", from v0.3.0)"
-                }
-            ),
-            "Install the aegis-v2 package, then systemctl enable --now aegis-honeypot.socket.",
-        ));
 
         // A root-only socket answers connect with EACCES for everyone
         // else; the daemon is still there.
@@ -511,23 +511,44 @@ mod tests {
     fn honeypot_line_follows_the_network_mode() {
         let f = fixture("hp");
         let sock = under(&f.root, aegis_proto::SOCKET);
-        let run = |active: bool| Preflight::run_with(&f.root, &[], &sock, &|_| active);
-        // Everything in place: pass.
-        assert_eq!(get(&run(true), "honeypot").status, Status::Pass);
-        // Unit down, no listeners, no user: one warning naming all three.
+        let bin = [under(&f.root, "/usr/bin")];
+        let run = |active: bool| Preflight::run_with(&f.root, &bin, &sock, &|_| active);
+        let honey = |extra: &str| {
+            put(&f.root, "etc/aegis-v2/config.toml", extra);
+            run(true)
+        };
+        // Drop (the default): not used, passes whatever the host has.
         fs::remove_file(f.root.join("proc/net/tcp")).unwrap();
         put(&f.root, "etc/passwd", "root:x:0:0::/root:/bin/bash\n");
         let c = run(false);
-        let h = get(&c, "honeypot");
-        assert_eq!(h.status, Status::Warn);
-        for want in [
-            "not active",
-            "nothing listens",
-            "does not exist",
-            "from v0.3.0",
-        ] {
-            assert!(h.detail.contains(want), "{want}: {}", h.detail);
-        }
+        assert_eq!(get(&c, "honeypot").status, Status::Pass);
+        assert!(get(&c, "honeypot").detail.contains("not used"));
+        // A v0.2.3-shaped host (no honeypot anything, drop config, enforce
+        // or not) keeps the exit code it had before this check existed.
+        assert_eq!(exit_code(&c), 0);
+        put(
+            &f.root,
+            "etc/aegis-v2/config.toml",
+            "[general]\nmode = \"enforce\"\n",
+        );
+        assert_eq!(exit_code(&run(false)), 0);
+        // With everything in place under honeypot: pass.
+        put(
+            &f.root,
+            "proc/net/tcp",
+            "sl local rem st\n0: 00000000:0A14 00000000:0000 0A 0:0\n",
+        );
+        put(
+            &f.root,
+            "etc/passwd",
+            "aegis-honeypot:x:990:990::/:/sbin/nologin\n",
+        );
+        assert_eq!(
+            get(&honey("[quarantine]\nnetwork = \"honeypot\"\n"), "honeypot").status,
+            Status::Pass
+        );
+        fs::remove_file(f.root.join("proc/net/tcp")).unwrap();
+        put(&f.root, "etc/passwd", "root:x:0:0::/root:/bin/bash\n");
         // network = "honeypot" in an audit config is still advice...
         put(
             &f.root,
@@ -536,7 +557,9 @@ mod tests {
         );
         let h = get(&run(false), "honeypot").clone();
         assert_eq!(h.status, Status::Warn);
-        assert!(!h.detail.contains("from v0.3.0"));
+        for want in ["not active", "nothing listens", "does not exist"] {
+            assert!(h.detail.contains(want), "{want}: {}", h.detail);
+        }
         // ...and a failure once the config enforces.
         put(
             &f.root,
@@ -553,7 +576,7 @@ mod tests {
         put(
             &f.root,
             "etc/aegis-v2/config.toml",
-            "[honeypot]\ntcp_port = 3000\ndns_port = 3001\n",
+            "[quarantine]\nnetwork = \"honeypot\"\n[honeypot]\ntcp_port = 3000\ndns_port = 3001\n",
         );
         let c = Preflight::run_with(&f.root, &[], &sock, &|_| true);
         assert!(get(&c, "honeypot").detail.contains("TCP 3000 and UDP 3001"));
