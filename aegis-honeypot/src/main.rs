@@ -11,6 +11,7 @@ mod serve;
 mod session;
 
 use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -21,17 +22,17 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use serve::{accept, Server};
-use session::Slots;
+use session::{Slots, FLOOR};
 
-/// aegisd's config. One file configures both; only `[honeypot]` is
-/// read here.
-const CONFIG: &str = "/etc/aegis-v2/config.toml";
+/// aegisd writes the `[honeypot]` table here, and only that: its own
+/// config is root's alone and can hold secrets.
+const CONFIG: &str = "/run/aegis-honeypot.toml";
 /// The unit's StateDirectory, when systemd doesn't say.
-const STATE: &str = "/var/lib/aegis-v2/honeypot";
+const STATE: &str = "/var/lib/aegis-honeypot";
 
-/// Why this process must not run, or None. Root or any capability in
-/// the permitted, effective or ambient set refuses; so does a status it
-/// can't read those from.
+/// Why this process must not run, or None. Root (any uid or gid, or a
+/// supplementary group 0) or any capability in the permitted, effective
+/// or ambient set refuses; so does a status it can't read those from.
 fn refusal(status: &str) -> Option<String> {
     let field = |k: &str| {
         status
@@ -44,6 +45,14 @@ fn refusal(status: &str) -> Option<String> {
     if uids.len() != 4 || uids.contains(&"0") {
         return Some(format!("refusing to run as root (Uid {uids:?})"));
     }
+    let gids: Vec<&str> = field("Gid").unwrap_or("").split_whitespace().collect();
+    if gids.len() != 4 || gids.contains(&"0") {
+        return Some(format!("refusing to run in group root (Gid {gids:?})"));
+    }
+    match field("Groups") {
+        Some(g) if !g.split_whitespace().any(|x| x == "0") => {}
+        g => return Some(format!("refusing to run in group root (Groups {g:?})")),
+    }
     ["CapPrm", "CapEff", "CapAmb"]
         .into_iter()
         .find_map(|k| match field(k) {
@@ -55,10 +64,10 @@ fn refusal(status: &str) -> Option<String> {
         })
 }
 
-/// The `[honeypot]` section of aegisd's config. Other sections are
-/// aegisd's to check, so they're skipped, not refused.
+/// The file aegisd writes: `[honeypot]` and nothing else.
 fn config(src: &str) -> Result<HoneypotConfig> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct File {
         #[serde(default)]
         honeypot: HoneypotConfig,
@@ -90,6 +99,34 @@ fn listen_fds(
     Ok(names.into_iter().map(String::from).zip(3..).collect())
 }
 
+/// Whether `fd` is a listening socket. A unit that passes anything else
+/// would have the accept loop failing forever.
+fn listening(fd: RawFd) -> bool {
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `v`; a bad fd
+    // is only an error.
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            (&raw mut v).cast(),
+            &mut len,
+        )
+    };
+    r == 0 && v == 1
+}
+
+/// The spool under systemd's StateDirectory, the first one when it
+/// lists several.
+fn spool(state: Option<&str>) -> PathBuf {
+    let first = state
+        .and_then(|s| s.split(':').next())
+        .filter(|s| !s.is_empty());
+    PathBuf::from(first.unwrap_or(STATE)).join("spool")
+}
+
 fn run() -> Result<()> {
     let status = std::fs::read_to_string("/proc/self/status").context("/proc/self/status")?;
     if let Some(why) = refusal(&status) {
@@ -98,7 +135,9 @@ fn run() -> Result<()> {
     let cfg = std::fs::read_to_string(CONFIG)
         .map_err(anyhow::Error::from)
         .and_then(|s| config(&s))
-        .with_context(|| CONFIG.to_string())?;
+        .with_context(|| {
+            format!("{CONFIG} (aegisd writes it when quarantine.network = \"honeypot\")")
+        })?;
     let env = |k| std::env::var(k).ok();
     let fds = listen_fds(
         env("LISTEN_PID").as_deref(),
@@ -106,12 +145,30 @@ fn run() -> Result<()> {
         env("LISTEN_FDNAMES").as_deref(),
         std::process::id(),
     )?;
-    let fd = |name: &str| fds.iter().find(|(n, _)| n == name).map(|&(_, fd)| fd);
-    let spool = PathBuf::from(env("STATE_DIRECTORY").unwrap_or_else(|| STATE.into())).join("spool");
+    let fd = |name: &str| -> Result<Option<RawFd>> {
+        let Some(&(_, fd)) = fds.iter().find(|(n, _)| n == name) else {
+            return Ok(None);
+        };
+        if !listening(fd) {
+            bail!("socket {name} (fd {fd}) is not listening; check aegis-honeypot.socket");
+        }
+        Ok(Some(fd))
+    };
+    let tcp = fd("tcp")?.context("systemd passed no socket named tcp")?;
+    let dns = fd("dns-tcp")?;
+    // Once, here: each session checks free space on it before creating
+    // anything of its own.
+    let spool = spool(env("STATE_DIRECTORY").as_deref());
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o750)
+        .create(&spool)
+        .with_context(|| spool.display().to_string())?;
     let srv = Rc::new(Server {
         spool,
         max_bytes: cfg.max_session_bytes,
         max_time: Duration::from_secs(cfg.session_seconds),
+        floor: FLOOR,
         slots: Slots::default(),
     });
 
@@ -126,11 +183,10 @@ fn run() -> Result<()> {
             l.set_nonblocking(true)?;
             Ok(tokio::net::TcpListener::from_std(l)?)
         };
-        let tcp = listener(fd("tcp").context("systemd passed no socket named tcp")?)?;
-        let main = accept(srv.clone(), tcp, None);
+        let main = accept(srv.clone(), listener(tcp)?, None);
         // Nothing redirects to dns-tcp, but a client that finds the port
         // gets DNS.
-        match fd("dns-tcp") {
+        match dns {
             Some(d) => {
                 let dns = accept(srv, listener(d)?, Some(Protocol::Dns));
                 tokio::join!(main, dns);
@@ -156,7 +212,7 @@ mod tests {
     use super::*;
 
     const STATUS: &str = "Name:\taegis-honeypot\nUmask:\t0022\nState:\tS (sleeping)\n\
-        Uid:\t991\t991\t991\t991\nGid:\t991\t991\t991\t991\n\
+        Uid:\t991\t991\t991\t991\nGid:\t991\t991\t991\t991\nGroups:\t991 \n\
         CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n\
         CapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\n\
         CapAmb:\t0000000000000000\nNoNewPrivs:\t1\n";
@@ -172,12 +228,18 @@ mod tests {
             ("Uid:\t991\t991\t991\t991", "Uid:\t0\t0\t0\t0"),
             ("Uid:\t991\t991\t991\t991", "Uid:\t991\t0\t991\t991"),
             ("Uid:\t991\t991\t991\t991", "Uid:\t991\t991\t0\t991"),
+            ("Gid:\t991\t991\t991\t991", "Gid:\t0\t991\t991\t991"),
+            ("Gid:\t991\t991\t991\t991", "Gid:\t991\t991\t991\t0"),
+            ("Groups:\t991 ", "Groups:\t991 0 "),
+            ("Groups:\t991 ", "Groups:\t0"),
             ("CapPrm:\t0000000000000000", "CapPrm:\t0000000000000400"),
             ("CapEff:\t0000000000000000", "CapEff:\t0000000000002000"),
             ("CapAmb:\t0000000000000000", "CapAmb:\t0000000000000001"),
             // Unreadable is not "no".
             ("CapEff:\t0000000000000000\n", ""),
             ("Uid:\t991\t991\t991\t991\n", ""),
+            ("Gid:\t991\t991\t991\t991\n", ""),
+            ("Groups:\t991 \n", ""),
             ("CapPrm:\t0000000000000000", "CapPrm:\t"),
         ] {
             let s = STATUS.replace(from, to);
@@ -189,16 +251,44 @@ mod tests {
     }
 
     #[test]
-    fn config_reads_honeypot_and_skips_the_rest() {
-        let c = config(
-            "[general]\nmode = \"enforce\"\n[scoring.weights]\ntmp_exec = 3.0\n\
-             [anything]\nx = [1, \"a\"]\n[honeypot]\nmax_session_bytes = 10\n\
-             session_seconds = 20\n",
-        )
-        .unwrap();
-        assert_eq!((c.max_session_bytes, c.session_seconds), (10, 20));
-        assert_eq!(c.tcp_port, 2580);
+    fn config_reads_what_aegisd_writes() {
+        let want = HoneypotConfig {
+            max_session_bytes: 10,
+            session_seconds: 20,
+            ..HoneypotConfig::default()
+        };
+        // What aegisd writes; its own test checks it writes this shape.
+        let text = "[honeypot]\ntcp_port = 2580\ndns_port = 2553\nmax_session_bytes = 10\n\
+                    session_seconds = 20\nmax_tasks = 256\nmax_incidents = 32\n";
+        assert_eq!(config(text).unwrap(), want);
         assert_eq!(config("").unwrap(), HoneypotConfig::default());
+        // Anything but [honeypot] means the wrong file, so it's refused.
+        let e = format!("{:#}", config("[telemetry]\njsonl = \"/x\"\n").unwrap_err());
+        assert!(e.contains("telemetry"), "{e}");
+    }
+
+    #[test]
+    fn only_listening_sockets_are_served() {
+        use std::os::fd::AsRawFd;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(listening(l.as_raw_fd()));
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        assert!(!listening(c.as_raw_fd()));
+        let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(!listening(u.as_raw_fd()));
+        assert!(!listening(-1));
+    }
+
+    #[test]
+    fn spool_sits_under_the_first_state_directory() {
+        for (state, want) in [
+            (None, "/var/lib/aegis-honeypot/spool"),
+            (Some(""), "/var/lib/aegis-honeypot/spool"),
+            (Some("/s"), "/s/spool"),
+            (Some("/s:/t"), "/s/spool"),
+        ] {
+            assert_eq!(spool(state), PathBuf::from(want), "{state:?}");
+        }
     }
 
     #[test]

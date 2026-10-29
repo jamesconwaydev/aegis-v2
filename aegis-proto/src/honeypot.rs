@@ -89,6 +89,10 @@ pub enum Protocol {
 
 /// `spool/<addr>/done/<id>/session.json`. Written by the honeypot when a
 /// session closes; aegisd reads it through a size cap and nothing else.
+///
+/// That cap is 64 KiB, so every list here (and every one added later)
+/// needs a bound the honeypot enforces that keeps the whole record under
+/// it; past the bound the honeypot stops adding and sets `truncated`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Session {
@@ -106,11 +110,12 @@ pub struct Session {
     /// Bytes recorded from the client and to it, after the byte cap.
     pub bytes_in: u64,
     pub bytes_out: u64,
-    /// The byte cap cut the session short.
+    /// The byte cap was reached and the session was closed there.
     pub truncated: bool,
     /// The time cap closed the session.
     pub timed_out: bool,
-    /// SHA-256 (hex) of each payload file in the session directory.
+    /// SHA-256 (hex) of each payload file in the session directory; at
+    /// most 256.
     pub payloads: Vec<String>,
 }
 

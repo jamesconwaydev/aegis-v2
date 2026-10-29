@@ -15,7 +15,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use crate::dispatch::{by_bytes, by_port, PEEK};
-use crate::session::{Session, Slots};
+use crate::pcap::FIXED_COST;
+use crate::session::{Floor, Session, Slots};
 
 /// How long a client on an unknown port gets to speak first. A client
 /// that waits to be spoken to is answered as raw after this.
@@ -46,7 +47,35 @@ pub struct Server {
     pub spool: PathBuf,
     pub max_bytes: u64,
     pub max_time: Duration,
+    pub floor: Floor,
     pub slots: Slots,
+}
+
+/// What the spool must have free for one more session: the floor, plus
+/// all that the `open` sessions (this one among them) may still write,
+/// their pcap and a full session.json each.
+fn reserve(floor: Floor, open: usize, cap: u64) -> Floor {
+    let each = cap.saturating_add(FIXED_COST).saturating_add(64 * 1024);
+    Floor {
+        bytes: floor
+            .bytes
+            .saturating_add((open as u64).saturating_mul(each)),
+        inodes: floor.inodes,
+    }
+}
+
+/// Whether a connection landed on an incident address. aegisd redirects
+/// observed trees into 127.77.0.0/16 only; anything else on loopback is
+/// some local user, who mustn't fill the spool.
+fn incident_addr(ip: Ipv4Addr) -> bool {
+    ip.octets()[..2] == [127, 77]
+}
+
+/// How plenty of clients say goodbye; not worth a log line each.
+fn quiet(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionReset, UnexpectedEof};
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| matches!(e.kind(), ConnectionReset | BrokenPipe | UnexpectedEof))
 }
 
 /// Where the tree was connecting before the redirect. None when the
@@ -81,7 +110,11 @@ pub async fn handle(srv: Rc<Server>, io: TcpStream, forced: Option<Protocol>) ->
         return Ok(());
     };
     let addr = *local.ip();
-    // Over a cap: dropping `io` closes it, and nothing is recorded.
+    // Not an incident address, or over a cap: dropping `io` closes it,
+    // and nothing is recorded.
+    if !incident_addr(addr) {
+        return Ok(());
+    }
     let Some(_slot) = srv.slots.take(addr) else {
         return Ok(());
     };
@@ -97,11 +130,26 @@ pub async fn handle(srv: Rc<Server>, io: TcpStream, forced: Option<Protocol>) ->
             by_bytes(&first[..n])
         }
     };
-    let mut s = Session::open(&srv.spool, srv.max_bytes, protocol, addr, src, dst)?;
+    let opened = Session::open(
+        &srv.spool,
+        srv.max_bytes,
+        reserve(srv.floor, srv.slots.open(), srv.max_bytes),
+        protocol,
+        addr,
+        src,
+        dst,
+    )?;
+    let Some(mut s) = opened else {
+        eprintln!(
+            "aegis-honeypot: {} is low on space or inodes; not recording",
+            srv.spool.display()
+        );
+        return Ok(());
+    };
     // Every protocol is answered as catch-all until its own handler lands.
     match timeout(srv.max_time, CatchAll.serve(&mut s, io)).await {
         Ok(Ok(())) => {}
-        // A reset or a broken pipe is how plenty of clients say goodbye.
+        Ok(Err(e)) if quiet(&e) => {}
         Ok(Err(e)) => eprintln!("aegis-honeypot: session {}: {e:#}", s.rec.id),
         Err(_) => s.rec.timed_out = true,
     }
@@ -133,9 +181,15 @@ pub async fn accept(srv: Rc<Server>, l: TcpListener, forced: Option<Protocol>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pcap::SEGMENT_COST;
+    use crate::session::tests::NO_FLOOR;
     use aegis_proto::honeypot;
+    use std::future::Future;
     use std::path::Path;
     use tokio::io::AsyncWriteExt;
+
+    /// An incident address; any 127/8 address is local on Linux.
+    const INCIDENT: Ipv4Addr = Ipv4Addr::new(127, 77, 0, 1);
 
     fn server(name: &str, max_bytes: u64, max_time: Duration) -> Rc<Server> {
         let spool = crate::session::tests::spool(name);
@@ -143,28 +197,44 @@ mod tests {
             spool,
             max_bytes,
             max_time,
+            floor: NO_FLOOR,
             slots: Slots::default(),
         })
     }
 
-    /// Runs `client` against one handled connection; returns what the
-    /// client read before the server closed, and the filed session.
+    /// Fails a test that would otherwise hang. Past the time cap and the
+    /// peek, so it never fires first when the code is right.
+    async fn bounded<T>(srv: &Server, f: impl Future<Output = T>) -> T {
+        timeout(srv.max_time * 2 + PEEK_WAIT, f)
+            .await
+            .expect("hung past the time cap")
+    }
+
+    /// A connected (client, accepted) pair landing on `ip`.
+    async fn pair(ip: Ipv4Addr) -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind((ip, 0)).await.unwrap();
+        let (c, accepted) = tokio::join!(TcpStream::connect(l.local_addr().unwrap()), l.accept());
+        (c.unwrap(), accepted.unwrap().0)
+    }
+
+    /// Runs `client` against one handled connection to an incident
+    /// address, and returns the filed session.
     async fn one<F, Fut>(srv: &Rc<Server>, forced: Option<Protocol>, client: F) -> honeypot::Session
     where
         F: FnOnce(TcpStream) -> Fut,
-        Fut: std::future::Future<Output = ()>,
+        Fut: Future<Output = ()>,
     {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let at = l.local_addr().unwrap();
-        let (c, accepted) = tokio::join!(TcpStream::connect(at), l.accept());
-        let (io, _) = accepted.unwrap();
-        let (r, ()) = tokio::join!(handle(srv.clone(), io, forced), client(c.unwrap()));
+        let (c, io) = pair(INCIDENT).await;
+        let (r, ()) = bounded(srv, async {
+            tokio::join!(handle(srv.clone(), io, forced), client(c))
+        })
+        .await;
         r.unwrap();
         only_session(&srv.spool)
     }
 
     fn only_session(spool: &Path) -> honeypot::Session {
-        let done = spool.join("127.0.0.1/done");
+        let done = spool.join("127.77.0.1/done");
         let mut d: Vec<_> = std::fs::read_dir(&done).unwrap().collect();
         assert_eq!(d.len(), 1);
         let p = d.pop().unwrap().unwrap().path();
@@ -180,27 +250,85 @@ mod tests {
         assert!(got.is_empty(), "{got:?}");
     }
 
+    /// Hands one connection to `ip` to `srv` and checks it was closed
+    /// with nothing filed.
+    async fn refused(srv: &Rc<Server>, ip: Ipv4Addr) {
+        let (c, io) = pair(ip).await;
+        bounded(srv, async {
+            handle(srv.clone(), io, None).await.unwrap();
+            eof(c).await;
+        })
+        .await;
+        let done = srv.spool.join(ip.to_string()).join("done");
+        if let Ok(mut d) = std::fs::read_dir(&done) {
+            assert!(d.next().is_none(), "{} has a session", done.display());
+        }
+    }
+
+    #[test]
+    fn only_incident_addresses_are_served() {
+        for (ip, ok) in [
+            ([127, 77, 0, 1], true),
+            ([127, 77, 255, 254], true),
+            ([127, 0, 0, 1], false),
+            ([127, 78, 0, 1], false),
+            ([127, 76, 255, 255], false),
+            ([10, 77, 0, 1], false),
+        ] {
+            assert_eq!(incident_addr(Ipv4Addr::from(ip)), ok, "{ip:?}");
+        }
+    }
+
+    #[test]
+    fn the_reservation_saturates_instead_of_wrapping() {
+        let f = |bytes| Floor { bytes, inodes: 7 };
+        assert_eq!(reserve(f(5), 0, 100).bytes, 5);
+        assert_eq!(
+            reserve(f(5), 2, 100).bytes,
+            5 + 2 * (100 + FIXED_COST + 65536)
+        );
+        assert_eq!(reserve(f(u64::MAX - 1), 512, u64::MAX).bytes, u64::MAX);
+        assert_eq!(reserve(f(5), 512, 100).inodes, 7);
+    }
+
+    #[test]
+    fn goodbyes_are_not_logged() {
+        use std::io::{Error, ErrorKind};
+        for k in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(quiet(&Error::from(k).into()), "{k:?}");
+        }
+        assert!(!quiet(&Error::from(ErrorKind::PermissionDenied).into()));
+        assert!(!quiet(&anyhow::anyhow!("disk full")));
+    }
+
     #[tokio::test]
     async fn catch_all_keeps_up_to_the_cap_then_closes() {
-        let srv = server("hcap", 10, Duration::from_secs(30));
+        // Room for 66 bytes in one segment, fewer in more: however the
+        // 200 bytes arrive, the cap ends the session.
+        let srv = server("hcap", 10 + 2 * SEGMENT_COST, Duration::from_secs(5));
         let rec = one(&srv, None, |mut c| async move {
-            c.write_all(b"0123456789abcdefghij").await.unwrap();
+            c.write_all(&[b'x'; 200]).await.unwrap();
             eof(c).await;
         })
         .await;
         assert_eq!(rec.protocol, Protocol::Raw);
-        assert_eq!((rec.bytes_in, rec.bytes_out), (10, 0));
+        assert!(rec.bytes_in <= 10 + SEGMENT_COST, "{}", rec.bytes_in);
+        assert_eq!(rec.bytes_out, 0);
         assert!(rec.truncated);
         assert!(!rec.timed_out);
         // Not NATed in the test, so the original destination is where
         // it landed.
-        assert_eq!(rec.addr, Ipv4Addr::LOCALHOST);
-        assert_eq!(rec.dst.ip(), &Ipv4Addr::LOCALHOST);
+        assert_eq!(rec.addr, INCIDENT);
+        assert_eq!(rec.dst.ip(), &INCIDENT);
     }
 
     #[tokio::test(start_paused = true)]
     async fn time_cap_closes_a_silent_session() {
-        let srv = server("htime", 10, Duration::from_secs(300));
+        let srv = server("htime", 1000, Duration::from_secs(300));
         let rec = one(&srv, None, eof).await;
         assert!(rec.timed_out);
         assert!(!rec.truncated);
@@ -210,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_client_that_hangs_up_ends_the_session() {
-        let srv = server("hbye", 100, Duration::from_secs(30));
+        let srv = server("hbye", 1000, Duration::from_secs(5));
         let rec = one(&srv, None, |mut c| async move {
             c.write_all(b"\x00\x01").await.unwrap();
             c.shutdown().await.unwrap();
@@ -222,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_port_is_dispatched_on_the_first_bytes() {
-        let srv = server("hpeek", 100, Duration::from_secs(30));
+        let srv = server("hpeek", 1000, Duration::from_secs(5));
         let rec = one(&srv, None, |mut c| async move {
             c.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
             c.shutdown().await.unwrap();
@@ -235,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_forced_listener_skips_dispatch() {
-        let srv = server("hforce", 100, Duration::from_secs(30));
+        let srv = server("hforce", 1000, Duration::from_secs(5));
         let rec = one(&srv, Some(Protocol::Dns), |mut c| async move {
             c.write_all(b"SSH-2.0-x\r\n").await.unwrap();
             c.shutdown().await.unwrap();
@@ -245,23 +373,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_non_incident_address_gets_no_session() {
+        let srv = server("hlocal", 1000, Duration::from_secs(5));
+        refused(&srv, Ipv4Addr::LOCALHOST).await;
+        assert_eq!(std::fs::read_dir(&srv.spool).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn a_full_address_gets_no_session() {
-        let srv = server("hfull", 100, Duration::from_secs(30));
-        let _held: Vec<_> = std::iter::from_fn(|| srv.slots.take(Ipv4Addr::LOCALHOST)).collect();
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (c, accepted) = tokio::join!(TcpStream::connect(l.local_addr().unwrap()), l.accept());
-        handle(srv.clone(), accepted.unwrap().0, None)
-            .await
-            .unwrap();
-        eof(c.unwrap()).await;
-        assert!(!srv.spool.exists());
+        let srv = server("hfull", 1000, Duration::from_secs(5));
+        let _held: Vec<_> = std::iter::from_fn(|| srv.slots.take(INCIDENT)).collect();
+        refused(&srv, INCIDENT).await;
+        assert_eq!(std::fs::read_dir(&srv.spool).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_full_disk_gets_no_session() {
+        let mut s = Rc::into_inner(server("hdisk", 1000, Duration::from_secs(5))).unwrap();
+        s.floor = Floor {
+            bytes: u64::MAX,
+            inodes: 0,
+        };
+        let srv = Rc::new(s);
+        refused(&srv, INCIDENT).await;
+        std::fs::remove_dir_all(&srv.spool).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_sessions_reserve_their_cap_against_the_floor() {
+        let spool = crate::session::tests::spool("hreserve");
+        let (avail, _) = crate::session::free(&spool).unwrap();
+        // The fixed floor takes half of what's free and each session
+        // reserves a third: room for the new session alone, not for it
+        // and one already open.
+        let srv = Rc::new(Server {
+            spool,
+            max_bytes: avail / 3,
+            max_time: Duration::from_secs(5),
+            floor: Floor {
+                bytes: avail / 2,
+                inodes: 0,
+            },
+            slots: Slots::default(),
+        });
+        let other = srv.slots.take(Ipv4Addr::new(127, 77, 0, 9)).unwrap();
+        refused(&srv, INCIDENT).await;
+        // With nothing else open, the same session is recorded.
+        drop(other);
+        let s = one(&srv, None, |c| async move { drop(c) }).await;
+        assert_eq!(s.addr, INCIDENT);
     }
 
     #[tokio::test]
     async fn an_un_natted_connection_has_no_original_destination() {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (c, accepted) = tokio::join!(TcpStream::connect(l.local_addr().unwrap()), l.accept());
+        let (c, io) = pair(INCIDENT).await;
         drop(c);
-        assert_eq!(original_dst(&accepted.unwrap().0), None);
+        assert_eq!(original_dst(&io), None);
     }
 }

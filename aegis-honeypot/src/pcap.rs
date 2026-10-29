@@ -18,7 +18,13 @@ const SYN: u8 = 0x02;
 const PSH: u8 = 0x08;
 const ACK: u8 = 0x10;
 /// Under a 1500-byte MTU, so a segment looks like one off the wire.
-const SEGMENT: usize = 1400;
+pub const SEGMENT: usize = 1400;
+/// What one TCP segment adds on disk to its data: pcap record header,
+/// IPv4 and TCP headers.
+pub const SEGMENT_COST: u64 = 16 + 20 + 20;
+/// The file header, the handshake and the close: the same in every
+/// session, and not charged to its cap.
+pub const FIXED_COST: u64 = 24 + 6 * SEGMENT_COST;
 
 pub struct Pcap {
     f: File,
