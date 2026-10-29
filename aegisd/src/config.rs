@@ -235,13 +235,36 @@ impl Allowlist {
     }
 }
 
+/// What a quarantined tree can reach on the network.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkMode {
+    /// Nothing: every connect and send is refused.
+    #[default]
+    Drop,
+    /// Only the honeypot, on loopback, for the observation window.
+    Honeypot,
+}
+
+impl NetworkMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NetworkMode::Drop => "drop",
+            NetworkMode::Honeypot => "honeypot",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuarantineConfig {
     #[serde(deserialize_with = "at_least_one")]
     pub overlay_max_size_mb: u32,
+    /// With `network = "honeypot"`, how long the tree is observed before
+    /// it is frozen.
     #[serde(deserialize_with = "at_least_one")]
     pub auto_expire_seconds: u64,
+    pub network: NetworkMode,
 }
 
 impl Default for QuarantineConfig {
@@ -249,6 +272,7 @@ impl Default for QuarantineConfig {
         Self {
             overlay_max_size_mb: 512,
             auto_expire_seconds: 3600,
+            network: NetworkMode::Drop,
         }
     }
 }
@@ -268,6 +292,54 @@ fn at_least_16<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
         Ok(v)
     } else {
         Err(de::Error::custom(format!("must be at least 16, got {v}")))
+    }
+}
+
+fn port<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+    let v = u32::deserialize(d)?;
+    match u16::try_from(v) {
+        Ok(p) if p >= 1024 => Ok(p),
+        _ => Err(de::Error::custom(format!(
+            "must be a port from 1024 to 65535, got {v}"
+        ))),
+    }
+}
+
+/// The honeypot's listeners and limits. Read only when
+/// `quarantine.network = "honeypot"` in enforce mode.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HoneypotConfig {
+    /// Where the redirected TCP connections land.
+    #[serde(deserialize_with = "port")]
+    pub tcp_port: u16,
+    /// Where the redirected DNS queries land.
+    #[serde(deserialize_with = "port")]
+    pub dns_port: u16,
+    /// Most bytes kept from one session.
+    #[serde(deserialize_with = "at_least_one")]
+    pub max_session_bytes: u64,
+    /// Longest one session may run.
+    #[serde(deserialize_with = "at_least_one")]
+    pub session_seconds: u64,
+    /// `pids.max` on an observed tree's scope.
+    #[serde(deserialize_with = "at_least_one")]
+    pub max_tasks: u32,
+    /// Trees observed at once; more get drop quarantine.
+    #[serde(deserialize_with = "at_least_one")]
+    pub max_incidents: u32,
+}
+
+impl Default for HoneypotConfig {
+    fn default() -> Self {
+        Self {
+            tcp_port: 2580,
+            dns_port: 2553,
+            max_session_bytes: 4_194_304,
+            session_seconds: 300,
+            max_tasks: 256,
+            max_incidents: 32,
+        }
     }
 }
 
@@ -452,6 +524,7 @@ pub struct Config {
     pub allowlist: Allowlist,
     pub quarantine: QuarantineConfig,
     pub throttle: ThrottleConfig,
+    pub honeypot: HoneypotConfig,
     pub telemetry: TelemetryConfig,
     pub incidents: IncidentConfig,
 }
@@ -532,6 +605,14 @@ fn parse<T: DeserializeOwned>(path: &Path, src: &str) -> Result<T, ConfigError> 
 #[serde(default)]
 struct Spans {
     general: SpanGeneral,
+    honeypot: SpanHoneypot,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SpanHoneypot {
+    tcp_port: Option<Spanned<u32>>,
+    dns_port: Option<Spanned<u32>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -560,6 +641,8 @@ pub struct Host {
     pub lsm_file: PathBuf,
     /// Where nft may live; any one existing is enough.
     pub nft: Vec<PathBuf>,
+    /// Holds `net/tcp` and `net/udp`.
+    pub proc_root: PathBuf,
 }
 
 impl Host {
@@ -567,6 +650,7 @@ impl Host {
         Self {
             lsm_file: "/sys/kernel/security/lsm".into(),
             nft: crate::enforce::nft::NFT_PATHS.map(PathBuf::from).into(),
+            proc_root: "/proc".into(),
         }
     }
 }
@@ -645,9 +729,39 @@ impl Config {
                 ),
             ));
         }
+        let hp = &cfg.honeypot;
+        if hp.tcp_port == hp.dns_port {
+            let at = start(&spans.honeypot.dns_port).or(start(&spans.honeypot.tcp_port));
+            return Err(ConfigError::at(
+                main,
+                &src,
+                at,
+                format!(
+                    "tcp_port and dns_port must differ, both are {}",
+                    hp.tcp_port
+                ),
+            ));
+        }
         let mut warnings: Vec<Warning> = unconfined_warning(main, &cfg.allowlist)
             .into_iter()
             .collect();
+        // Audit mode never reads [honeypot], so there is nothing to warn
+        // about. The real gate is at quarantine time.
+        if cfg.general.mode == Mode::Enforce
+            && cfg.quarantine.network == NetworkMode::Honeypot
+            && !aegis_proto::honeypot_listening(&host.proc_root, hp.tcp_port, hp.dns_port)
+                .unwrap_or(false)
+        {
+            warnings.push(Warning {
+                path: main.to_owned(),
+                message: format!(
+                    "quarantine.network = \"honeypot\" but nothing is listening on 0.0.0.0 \
+                     TCP {} and UDP {}; until aegis-honeypot.socket is up, quarantines \
+                     fall back to drop",
+                    hp.tcp_port, hp.dns_port
+                ),
+            });
+        }
 
         let mut files: Vec<PathBuf> = match std::fs::read_dir(dropin_dir) {
             Ok(rd) => rd
@@ -755,6 +869,7 @@ mod tests {
         Host {
             lsm_file: t.0.join("no-lsm"),
             nft: vec![t.0.join("no-nft")],
+            proc_root: t.0.join("no-proc"),
         }
     }
 
@@ -824,6 +939,16 @@ mod tests {
         assert_eq!(c.quarantine.auto_expire_seconds, 3600);
         assert_eq!(c.throttle.cpu_quota_percent, 25);
         assert_eq!(c.throttle.memory_high_mb, 256);
+        assert_eq!(c.quarantine.network, NetworkMode::Drop);
+        let h = &c.honeypot;
+        assert_eq!(
+            (h.tcp_port, h.dns_port, h.max_session_bytes),
+            (2580, 2553, 4194304)
+        );
+        assert_eq!(
+            (h.session_seconds, h.max_tasks, h.max_incidents),
+            (300, 256, 32)
+        );
         assert_eq!(c.scoring.half_life_secs, 30.0);
         assert_eq!(c.scoring.weights.tmp_exec, 25.0);
         let w = &c.scoring.weights;
@@ -1042,6 +1167,13 @@ mod tests {
             "scoring.scan.failed_connects",
             "quarantine.overlay_max_size_mb",
             "quarantine.auto_expire_seconds",
+            "quarantine.network",
+            "honeypot.tcp_port",
+            "honeypot.dns_port",
+            "honeypot.max_session_bytes",
+            "honeypot.session_seconds",
+            "honeypot.max_tasks",
+            "honeypot.max_incidents",
             "throttle.cpu_quota_percent",
             "throttle.memory_high_mb",
             "incidents.dir",
@@ -1092,6 +1224,91 @@ mod tests {
         assert!(e.message.contains("BPF LSM"), "{e}");
         let e = load(&t, "general = { mode = \"enforce\" }\n").unwrap_err();
         assert_eq!(e.line_col.unwrap().0, 1);
+    }
+
+    #[test]
+    fn honeypot_round_trip() {
+        let t = Dir::new("hp-ok");
+        let c = load(
+            &t,
+            "[quarantine]\nnetwork = \"honeypot\"\n[honeypot]\ntcp_port = 3000\n\
+             dns_port = 3001\nmax_session_bytes = 10\nsession_seconds = 20\n\
+             max_tasks = 30\nmax_incidents = 4\n",
+        )
+        .unwrap();
+        assert_eq!(c.quarantine.network, NetworkMode::Honeypot);
+        assert_eq!(c.quarantine.network.as_str(), "honeypot");
+        assert_eq!(
+            c.honeypot,
+            HoneypotConfig {
+                tcp_port: 3000,
+                dns_port: 3001,
+                max_session_bytes: 10,
+                session_seconds: 20,
+                max_tasks: 30,
+                max_incidents: 4,
+            }
+        );
+        // Audit mode accepts it and says nothing.
+        let m = t.main("[quarantine]\nnetwork = \"honeypot\"\n");
+        let (_, w) = Config::load_on(&m, &t.dir(), &bare(&t)).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn honeypot_errors_carry_their_line() {
+        let t = Dir::new("hp-bad");
+        for (body, line, msg) in [
+            ("[quarantine]\nnetwork = \"open\"\n", 2, "open"),
+            ("[honeypot]\ntcp_port = 80\n", 2, "1024 to 65535"),
+            ("[honeypot]\n\ndns_port = 65536\n", 3, "1024 to 65535"),
+            (
+                "[honeypot]\ntcp_port = 4000\ndns_port = 4000\n",
+                3,
+                "must differ",
+            ),
+            ("[honeypot]\nmax_session_bytes = 0\n", 2, "at least 1"),
+            ("[honeypot]\nsession_seconds = 0\n", 2, "at least 1"),
+            ("[honeypot]\nmax_tasks = 0\n", 2, "at least 1"),
+            ("[honeypot]\nmax_incidents = 0\n", 2, "at least 1"),
+            ("[honeypot]\nbogus = 1\n", 2, "bogus"),
+        ] {
+            let e = load(&t, body).unwrap_err();
+            assert_eq!(e.line_col.unwrap().0, line, "{body:?}: {e}");
+            assert!(e.message.contains(msg), "{body:?}: {e}");
+        }
+        // Default ports are both fine and distinct when only one is set
+        // to the other's default.
+        let e = load(&t, "[honeypot]\ntcp_port = 2553\n").unwrap_err();
+        assert!(e.message.contains("must differ"), "{e}");
+    }
+
+    #[test]
+    fn honeypot_mode_warns_when_ports_are_not_listening() {
+        let t = Dir::new("hp-warn");
+        let host = bare(&t);
+        std::fs::write(&host.lsm_file, "lockdown,bpf\n").unwrap();
+        std::fs::write(&host.nft[0], "").unwrap();
+        let m = t.main("[general]\nmode = \"enforce\"\n[quarantine]\nnetwork = \"honeypot\"\n");
+        let (_, w) = Config::load_on(&m, &t.dir(), &host).unwrap();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].message.contains("TCP 2580 and UDP 2553"), "{}", w[0]);
+        // With both listening, no warning.
+        let net = host.proc_root.join("net");
+        std::fs::create_dir_all(&net).unwrap();
+        let head = "sl local rem st\n";
+        std::fs::write(
+            net.join("tcp"),
+            format!("{head}0: 00000000:0A14 00000000:0000 0A 0:0\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            net.join("udp"),
+            format!("{head}0: 00000000:09F9 00000000:0000 07 0:0\n"),
+        )
+        .unwrap();
+        let (_, w) = Config::load_on(&m, &t.dir(), &host).unwrap();
+        assert!(w.is_empty(), "{w:?}");
     }
 
     #[test]

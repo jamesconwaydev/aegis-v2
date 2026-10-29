@@ -467,6 +467,13 @@ fn answer(
             deferred_overflow: pipe.deferred_overflow,
             incident_suppressed: pipe.incident_suppressed,
             enforce_dropped: enforcer.dropped.load(Ordering::Relaxed),
+            network: cfg.current().quarantine.network.as_str().into(),
+            incidents_observing: pipe
+                .store()
+                .list()
+                .iter()
+                .filter(|i| i.state.as_deref() == Some("observing"))
+                .count() as u64,
             telemetry_dropped: pipe.sinks.dropped(),
         },
         Request::IncidentsList => Response::Incidents(pipe.store().list()),

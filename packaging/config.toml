@@ -31,7 +31,27 @@ failed_connects = 10
 
 [quarantine]
 overlay_max_size_mb = 512
+# With network = "honeypot": how long a quarantined tree is observed
+# before it is frozen.
 auto_expire_seconds = 3600
+# What a quarantined tree can reach. "drop" cuts the network. "honeypot"
+# (from v0.3.0, enforce mode only) lets it talk to a fake internet on
+# loopback so you can watch what it does; needs aegis-honeypot.socket.
+network = "drop"
+
+# Enforce mode with network = "honeypot" only.
+[honeypot]
+# Where redirected TCP connections and DNS queries land. Distinct,
+# 1024 to 65535. The socket unit listens on them.
+tcp_port = 2580
+dns_port = 2553
+# Most bytes kept from one session, and the longest one may run.
+max_session_bytes = 4194304
+session_seconds = 300
+# pids.max on an observed tree.
+max_tasks = 256
+# Trees observed at once; more get drop quarantine.
+max_incidents = 32
 
 # Enforce mode only: the limits a tree runs under once throttled.
 [throttle]

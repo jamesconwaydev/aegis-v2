@@ -142,7 +142,12 @@ fn run(cli: &Cli) -> Result<(String, u8), String> {
         Cmd::Preflight => {
             let path: Vec<PathBuf> =
                 std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
-            let c = preflight::Preflight::run_with(Path::new("/"), &path, &cli.socket);
+            let c = preflight::Preflight::run_with(
+                Path::new("/"),
+                &path,
+                &cli.socket,
+                &preflight::systemd_active,
+            );
             let out = if cli.json {
                 pretty(&Value::Array(c.iter().map(|c| c.to_json()).collect()))
             } else {

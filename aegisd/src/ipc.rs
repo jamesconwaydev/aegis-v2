@@ -219,6 +219,8 @@ mod tests {
             deferred_overflow: 0,
             incident_suppressed: 0,
             enforce_dropped: 0,
+            network: "drop".into(),
+            incidents_observing: 0,
             telemetry_dropped: TelemetryDropped::default(),
         }
     }
