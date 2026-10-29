@@ -137,7 +137,24 @@ impl Systemd {
         pids: &[ProcKey],
         limits: Option<Limits>,
     ) -> Result<()> {
-        self.with_live(name, pids, |p| self.call_start(name, slice, p, &limits))
+        self.with_live(name, pids, |p| {
+            self.call_start(name, slice, p, &limits, None)
+        })
+    }
+
+    /// `start_scope` with `limits` and `TasksMax=tasks_max`: an observed
+    /// tree runs, so it gets the throttle caps and can't fork without end.
+    pub fn start_capped_scope(
+        &self,
+        name: &str,
+        slice: &str,
+        pids: &[ProcKey],
+        limits: Limits,
+        tasks_max: u32,
+    ) -> Result<()> {
+        self.with_live(name, pids, |p| {
+            self.call_start(name, slice, p, &Some(limits), Some(tasks_max))
+        })
     }
 
     /// Moves `pids` into `unit`, a scope that already runs: how a
@@ -222,6 +239,7 @@ impl Systemd {
         slice: &str,
         pids: &[ProcKey],
         limits: &Option<Limits>,
+        tasks_max: Option<u32>,
     ) -> Result<()> {
         let id = name.strip_prefix("aegis-incident-").unwrap_or(name);
         let id = id.strip_suffix(".scope").unwrap_or(id);
@@ -237,7 +255,8 @@ impl Systemd {
         ]
         .map(String::from)
         .into();
-        a.push(if limits.is_some() { "6" } else { "4" }.into());
+        let n = 4 + 2 * usize::from(limits.is_some()) + usize::from(tasks_max.is_some());
+        a.push(n.to_string());
         a.extend(["PIDs", "au"].map(String::from));
         a.push(pids.len().to_string());
         a.extend(pids.iter().map(|k| k.tgid.to_string()));
@@ -248,6 +267,10 @@ impl Systemd {
             a.push((u64::from(l.cpu_quota_percent) * 10_000).to_string());
             a.extend(["MemoryHigh", "t"].map(String::from));
             a.push(l.memory_high_bytes.to_string());
+        }
+        if let Some(t) = tasks_max {
+            a.extend(["TasksMax", "t"].map(String::from));
+            a.push(t.to_string());
         }
         // systemd refuses AttachProcessesToUnit on a scope that isn't
         // delegated (since v238: "Process migration not available on
@@ -407,6 +430,25 @@ mod tests {
         assert_eq!(c[0][8], "6");
         assert!(
             j.contains("MemoryHigh t 268435456 Delegate b true Description"),
+            "{j}"
+        );
+    }
+
+    #[test]
+    fn a_capped_scope_also_sets_tasks_max() {
+        take();
+        let l = Limits {
+            cpu_quota_percent: 25,
+            memory_high_bytes: 268435456,
+        };
+        Systemd::with(ok, alive_10)
+            .start_capped_scope("aegis-incident-AEG-x-q.scope", "s.slice", &[k(10)], l, 256)
+            .unwrap();
+        let c = take();
+        let j = c[0].join(" ");
+        assert_eq!(c[0][8], "7");
+        assert!(
+            j.contains("MemoryHigh t 268435456 TasksMax t 256 Delegate b true"),
             "{j}"
         );
     }

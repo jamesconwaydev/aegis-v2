@@ -7,7 +7,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -23,6 +23,10 @@ use crate::pipeline::{proc_start_matches, proc_stat};
 use crate::proctable::{ProcKey, ProcTable};
 use crate::scoring::Tier;
 use crate::telemetry::{now_ns, rfc3339, Sinks, TelemetryRecord};
+
+mod honeypot;
+use honeypot::Observed;
+pub use honeypot::{Guard, Honeypot, HoneypotParts};
 
 /// Jobs waiting for the enforcer; past this the loop drops and counts.
 const QUEUE: usize = 256;
@@ -210,14 +214,20 @@ impl EnforcerHandle {
     }
 }
 
+/// The three things the enforcer drives.
+pub struct Backends {
+    pub holds: Holds,
+    pub sys: Systemd,
+    pub nft: Nft,
+}
+
 pub fn spawn_enforcer(
     store: Arc<IncidentStore>,
-    holds: Holds,
-    sys: Systemd,
-    nft: Nft,
+    Backends { holds, sys, nft }: Backends,
     limits: Limits,
     sinks: Arc<Sinks>,
     enforcing: Arc<AtomicBool>,
+    hp: HoneypotParts,
 ) -> EnforcerHandle {
     let (tx, rx) = sync_channel(QUEUE);
     let mut h = EnforcerHandle::new(tx, sinks.clone());
@@ -237,10 +247,19 @@ pub fn spawn_enforcer(
         children: proc_children,
         forks: h.forks.clone(),
         reassert_pending: h.reassert_pending.clone(),
+        honeypot: hp.settings,
+        guard: hp.guard,
+        listening: honeypot::listening,
+        cgroup_id: honeypot::cgroup_id,
+        observing: HashMap::new(),
+        marks: Some(honeypot::MARKS.into()),
     };
     let t = std::thread::Builder::new()
         .name("aegis-enforce".into())
         .spawn(move || {
+            // Holds and the guard died with the last aegisd, and its
+            // ExecStopPost froze what it was observing.
+            e.close_observing();
             for job in rx {
                 e.run(job);
             }
@@ -388,6 +407,7 @@ pub fn summary_state(acts: &[ActionRecord], earlier_boot: bool) -> Option<&'stat
         Some(("unhold", _)) => "released",
         Some(("expired", _)) => "expired",
         _ if earlier_boot => "expired",
+        _ if observing(acts) => "observing",
         Some((_, a)) if quarantine(a) => {
             let frozen = acts
                 .iter()
@@ -403,6 +423,15 @@ pub fn summary_state(acts: &[ActionRecord], earlier_boot: bool) -> Option<&'stat
     })
 }
 
+/// Whether the tree has its network to the honeypot: opened and not
+/// yet closed by expiry, release, kill or a restart.
+fn observing(acts: &[ActionRecord]) -> bool {
+    acts.iter()
+        .rev()
+        .find(|a| a.ok && matches!(a.kind.as_str(), "honeypot_open" | "honeypot_close"))
+        .is_some_and(|a| a.kind == "honeypot_open")
+}
+
 /// nft rules added and not yet removed.
 fn live_rules(acts: &[ActionRecord]) -> Vec<u64> {
     let removed: HashSet<u64> = acts
@@ -411,7 +440,7 @@ fn live_rules(acts: &[ActionRecord]) -> Vec<u64> {
         .filter_map(|a| a.nft_handle)
         .collect();
     acts.iter()
-        .filter(|a| a.ok && a.kind == "nft_drop")
+        .filter(|a| a.ok && matches!(a.kind.as_str(), "nft_drop" | "nft_accept" | "nft_dnat"))
         .filter_map(|a| a.nft_handle)
         .filter(|h| !removed.contains(h))
         .collect()
@@ -440,6 +469,20 @@ pub struct Enforcer {
     forks: Arc<AtomicUsize>,
     /// Shared with the handle: a reassert is queued.
     reassert_pending: Arc<AtomicBool>,
+    /// Honeypot mode's settings; None while `quarantine.network` is
+    /// "drop". A reload changes it.
+    honeypot: Arc<Mutex<Option<Honeypot>>>,
+    guard: Box<dyn Guard>,
+    /// Whether the honeypot listens on (tcp, dns); tests pass a fake.
+    listening: fn(u16, u16) -> std::io::Result<bool>,
+    /// A cgroup's id, from its directory; tests pass a fake.
+    cgroup_id: fn(&str) -> std::io::Result<u64>,
+    /// Trees with their network open to the honeypot, by incident id.
+    /// None survive a restart: `close_observing` ends them at start.
+    observing: HashMap<String, Observed>,
+    /// Where each observed scope is named for the unit's ExecStopPost,
+    /// which freezes them if aegisd stops; None in tests.
+    marks: Option<std::path::PathBuf>,
 }
 
 impl Enforcer {
@@ -583,7 +626,9 @@ impl Enforcer {
 
     /// Hold, move, freeze, cut off. Each step is recorded; the verdict
     /// becomes `quarantined` only once the tree is moved and frozen. If
-    /// that fails the holds stay: they still stop the tree acting.
+    /// that fails the holds stay: they still stop the tree acting. In
+    /// honeypot mode a new tree is observed instead of frozen, if every
+    /// step to that succeeds (`observe`).
     fn quarantine(&mut self, id: &str, pids: &[ProcKey]) {
         let prior = self.actions(id);
         // An admin released or killed it; that stands.
@@ -602,14 +647,23 @@ impl Enforcer {
             done("nft_drop"),
         );
         let mut acts = Vec::new();
+        let watched = self.observing.get(id).map(|o| o.cgroup_id);
 
         let (mut held, mut errs) = (Vec::new(), Vec::new());
         for k in pids {
             match self.holds.hold(*k) {
-                Ok(()) => held.push(*k),
+                Ok(()) => {
+                    held.push(*k);
+                    // `hold` leaves an open hold alone: one opened for
+                    // another incident's scope is closed here.
+                    if let Err(e) = self.holds.close_one(*k, watched.unwrap_or(0)) {
+                        errs.push(format!("{e:#}"));
+                    }
+                }
                 Err(e) => errs.push(format!("{e:#}")),
             }
         }
+        let all_held = errs.is_empty();
         let r = if errs.is_empty() {
             Ok(None)
         } else {
@@ -625,6 +679,12 @@ impl Enforcer {
         // to the nanosecond. Each one's Fork event brings a job of its
         // own, with the exact key, that holds it.
         let all = self.with_children(pids);
+        // What only the walk found has no hold of ours, and an observed
+        // tree isn't frozen: it may run there only if the kernel already
+        // holds it (forked from an open hold).
+        let unheld = all[pids.len()..]
+            .iter()
+            .any(|k| !matches!(self.holds.start_time(k.tgid), Ok(Some(_))));
         let pids = &all[..];
 
         // A newcomer joins the scope the tree is already in. If the
@@ -634,33 +694,49 @@ impl Enforcer {
         let tried = prior
             .iter()
             .any(|a| a.kind == "scope" && a.unit.as_deref() == Some(unit.as_str()));
+        let plan = if scoped || tried || !all_held || unheld {
+            None
+        } else {
+            self.plan(id)
+        };
         let moved = if scoped {
             self.attach(&unit, pids, &mut acts)
         } else if tried {
             false
         } else {
-            let r = self.sys.start_scope(&unit, QUARANTINE_SLICE, pids, None);
+            let r = match plan {
+                Some((hp, _)) => self.sys.start_capped_scope(
+                    &unit,
+                    QUARANTINE_SLICE,
+                    pids,
+                    self.limits,
+                    hp.max_tasks,
+                ),
+                None => self.sys.start_scope(&unit, QUARANTINE_SLICE, pids, None),
+            };
             acts.push(act("scope", Some(&unit), tgids(pids), r.map(|_| None)));
             acts.last().unwrap().ok
         };
-        let mut now_frozen = frozen;
-        if moved && !frozen {
-            let is_frozen = || matches!(self.sys.is_frozen(QUARANTINE_SLICE, &unit), Ok(true));
-            let mut r = self.sys.freeze(&unit);
-            if r.is_err() && !is_frozen() {
-                // busctl returns once the start job is queued, not done:
-                // on a loaded host the scope may not be active yet.
-                std::thread::sleep(FREEZE_RETRY);
-                r = self.sys.freeze(&unit);
-            }
-            // The command can fail after the freeze took effect; the
-            // kernel has the last word. The error stays on the record.
-            let mut a = act("freeze", Some(&unit), vec![], r.map(|_| None));
-            if !a.ok {
-                a.ok = is_frozen();
-            }
+        let (mut observed, mut opened_to) = (false, None);
+        if let (true, Some((hp, addr))) = (moved, plan) {
+            (observed, opened_to) = self.observe(id, &unit, &held, hp, addr, &mut acts);
+        }
+        if watched.is_some() && moved && unheld {
+            // A newcomer brought processes that can't be held into a
+            // scope that isn't frozen: the observation ends now.
+            acts.extend(self.close_observation(id, "a process in the tree could not be held"));
+        }
+        let observing = observed || self.observing.contains_key(id);
+        let mut now_frozen = frozen || acts.iter().any(|a| a.ok && a.kind == "freeze");
+        if moved && !now_frozen && !observing {
+            let a = self.freeze(&unit);
             now_frozen = a.ok;
             acts.push(a);
+            // Opened partway before a step failed: take it back from
+            // the frozen tree.
+            if let Some(c) = opened_to {
+                acts.extend(self.close_holds(&unit, c, now_frozen));
+            }
         }
         if moved && now_frozen {
             // Once more: a child the walk found but couldn't hold may
@@ -671,17 +747,42 @@ impl Enforcer {
                 self.attach(&unit, &late, &mut acts);
             }
         }
+        let ruled = ruled || acts.iter().any(|a| a.kind == "nft_drop");
         if moved && !ruled {
-            let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &unit);
-            let r = self
-                .nft
-                .ensure_table()
-                .and_then(|()| self.drop_rule(&cg))
-                .map(|(h, _)| h);
-            acts.push(act("nft_drop", Some(&unit), vec![], r.map(Some)));
+            acts.push(self.add_drop(&unit));
         }
-        let v = (moved && now_frozen).then_some("quarantined");
+        let v = (moved && (now_frozen || observing)).then_some("quarantined");
         self.finish(id, acts, v);
+    }
+
+    /// The drop rule for `unit`'s cgroup, creating the table if needed.
+    fn add_drop(&self, unit: &str) -> ActionRecord {
+        let cg = Nft::scope_cgroup(QUARANTINE_SLICE, unit);
+        let r = self
+            .nft
+            .ensure_table()
+            .and_then(|()| self.drop_rule(&cg))
+            .map(|(h, _)| h);
+        act("nft_drop", Some(unit), vec![], r.map(Some))
+    }
+
+    /// Freezes `unit`. busctl returns once the start job is queued, not
+    /// done: on a loaded host the scope may not be active yet, so a
+    /// failure is tried once more. The command can fail after the freeze
+    /// took effect; the kernel has the last word. The error stays on the
+    /// record.
+    fn freeze(&self, unit: &str) -> ActionRecord {
+        let is_frozen = || matches!(self.sys.is_frozen(QUARANTINE_SLICE, unit), Ok(true));
+        let mut r = self.sys.freeze(unit);
+        if r.is_err() && !is_frozen() {
+            std::thread::sleep(FREEZE_RETRY);
+            r = self.sys.freeze(unit);
+        }
+        let mut a = act("freeze", Some(unit), vec![], r.map(|_| None));
+        if !a.ok {
+            a.ok = is_frozen();
+        }
+        a
     }
 
     /// Moves `pids` into the running quarantine scope and records it.
@@ -711,15 +812,16 @@ impl Enforcer {
         let quarantined = prior
             .iter()
             .any(|a| holding(a) || (a.ok && a.unit.as_deref() == Some(unit.as_str())));
-        let mut acts = Vec::new();
+        let mut acts = self.stop_observing(id);
         let mut done = format!("released {id}: limits lifted");
         if quarantined {
             // Unhold before the thaw: the tree is still frozen while the
             // holds come off, so it never wakes to find every write,
-            // connect and fork refused.
+            // connect and fork refused. Holds closed when an observation
+            // ended are no longer found by scope, so they are listed too.
             let keys: BTreeSet<(u32, u64)> = prior
                 .iter()
-                .filter(|a| a.kind == "hold")
+                .filter(|a| matches!(a.kind.as_str(), "hold" | "close"))
                 .flat_map(|a| a.pids.iter().copied().zip(a.start_times.iter().copied()))
                 .collect();
             let errs: Vec<String> = keys
@@ -750,6 +852,7 @@ impl Enforcer {
             }
             let found = self.find_rules(&prior, &unit);
             let gone = self.remove_rules(found, &unit, &mut acts);
+            acts.extend(self.unobserve(id, "released"));
             done = format!("released {id}: thawed, network restored{gone}");
             // The tree stays in its -q scope, so its accounting
             // lives under aegis-quarantine.slice. Moving it back to its
@@ -778,13 +881,15 @@ impl Enforcer {
             }
             return Err(format!("{id} was only throttled; release it instead"));
         }
+        let mut acts = self.stop_observing(id);
         // Looked up first: once the scope empties its cgroup goes, and
         // nft shows the rule by a bare id, no longer by the path.
         let found = self.find_rules(&prior, &unit);
         // A frozen cgroup still takes SIGKILL.
         let r = self.sys.kill(&unit);
-        let mut acts = vec![act("kill", Some(&unit), vec![], r.map(|_| None))];
+        acts.push(act("kill", Some(&unit), vec![], r.map(|_| None)));
         let gone = self.remove_rules(found, &unit, &mut acts);
+        acts.extend(self.unobserve(id, "killed"));
         self.conclude(id, acts, format!("killed {id}{gone}"))
     }
 
@@ -827,21 +932,24 @@ impl Enforcer {
     /// another incident's rule. Once the scope is gone nft shows a bare
     /// cgroup id instead, and then a recorded handle counts only if its
     /// line is one of those. None if no rule was ever added.
-    fn find_rules(&self, prior: &[ActionRecord], unit: &str) -> Option<Result<Vec<u64>>> {
+    /// Each comes with its chain.
+    fn find_rules(&self, prior: &[ActionRecord], unit: &str) -> Option<Result<Vec<(String, u64)>>> {
         if !prior.iter().any(|a| a.ok && a.kind == "nft_drop") {
             return None;
         }
         let cg = Nft::scope_cgroup(QUARANTINE_SLICE, unit);
         Some(self.nft.list().map(|l| {
             let l = l.unwrap_or_default();
-            let live = Nft::handles(&l, &cg);
-            if !live.is_empty() {
-                return live;
+            let mut live = Nft::handles(&l, &cg);
+            if live.is_empty() {
+                let bare = Nft::unresolved(&l);
+                live = live_rules(prior)
+                    .into_iter()
+                    .filter(|h| bare.contains(h))
+                    .collect();
             }
-            let bare = Nft::unresolved(&l);
-            live_rules(prior)
-                .into_iter()
-                .filter(|h| bare.contains(h))
+            live.into_iter()
+                .map(|h| (Nft::chain_of(&l, h).to_string(), h))
                 .collect()
         }))
     }
@@ -850,7 +958,7 @@ impl Enforcer {
     /// when there was no rule left to delete.
     fn remove_rules(
         &self,
-        found: Option<Result<Vec<u64>>>,
+        found: Option<Result<Vec<(String, u64)>>>,
         unit: &str,
         acts: &mut Vec<ActionRecord>,
     ) -> &'static str {
@@ -872,12 +980,12 @@ impl Enforcer {
             return "; its drop rule was already gone";
         }
         let mut all_gone = true;
-        for h in live {
+        for (chain, h) in live {
             let mut a = act(
                 "nft_remove",
                 Some(unit),
                 vec![],
-                self.nft.remove(h).map(|()| Some(h)),
+                self.nft.remove(&chain, h).map(|()| Some(h)),
             );
             // A ruleset flush since `find_rules` looked: nothing left to
             // delete, and the tree has its network back either way.
@@ -898,10 +1006,9 @@ impl Enforcer {
     /// Whether the live table no longer has rule `h`, or no longer
     /// exists. False if nft can't say.
     fn rule_gone(&self, h: u64) -> bool {
-        let tail = format!("# handle {h}");
         match self.nft.list() {
             Ok(None) => true,
-            Ok(Some(l)) => !l.lines().any(|l| l.trim_end().ends_with(&tail)),
+            Ok(Some(l)) => !Nft::has_rule(&l, h),
             Err(_) => false,
         }
     }
@@ -931,7 +1038,10 @@ impl Enforcer {
     /// interval. Nothing quarantined, no nft call. In audit mode it
     /// only restores a rule enforce mode added; a tree whose first rule
     /// failed gets one late only in enforce mode.
+    /// Observed trees are checked too, with their honeypot rules, and
+    /// any whose window has passed is closed first.
     fn reassert(&mut self) {
+        self.expire_observations();
         let enforcing = self.enforcing.load(Ordering::Relaxed);
         let ids: Vec<String> = self
             .store
@@ -950,7 +1060,7 @@ impl Enforcer {
             // its -q scope, which also means it was moved there.
             .filter(|s| {
                 let unit = q_unit(&s.id);
-                let live = if s.verdict == "quarantined" {
+                let live = if s.verdict == "quarantined" && !self.observing.contains_key(&s.id) {
                     self.sys.is_frozen(QUARANTINE_SLICE, &unit)
                 } else {
                     self.sys.is_populated(QUARANTINE_SLICE, &unit)
@@ -973,7 +1083,10 @@ impl Enforcer {
         for id in ids {
             let unit = q_unit(&id);
             let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &unit);
-            if !Nft::handles(&listing, &cg).is_empty() {
+            if self.observing.contains_key(&id) {
+                self.restore_redirects(&id, &listing, why);
+            }
+            if !Nft::drops(&listing, &cg).is_empty() {
                 continue;
             }
             let had = self
@@ -1131,6 +1244,7 @@ fn done(verdict: &str, acts: &[ActionRecord]) -> String {
             "scope" | "attach" => Some("moved"),
             "freeze" => Some("frozen"),
             "nft_drop" => Some("egress dropped"),
+            "honeypot_open" => Some("network open to the honeypot only"),
             _ => None,
         })
         .collect();
@@ -1168,6 +1282,8 @@ mod tests {
         static TABLE: RefCell<Option<FakeTable>> = const { RefCell::new(None) };
         /// Cgroups that no longer exist: nft lists their rules by id.
         static GONE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        /// Rules other than a drop in `out`, by handle: (chain, text).
+        static SHAPE: RefCell<HashMap<u64, (String, String)>> = RefCell::new(HashMap::new());
     }
 
     /// Records `prog args…`. nft keeps its table in TABLE, where a new
@@ -1186,30 +1302,78 @@ mod tests {
     fn fake_nft(t: &mut Option<FakeTable>, a: &[String]) -> Result<String> {
         let a: Vec<&str> = a.iter().map(String::as_str).collect();
         let gone = || anyhow::anyhow!("nft: exit Some(1): Error: No such file or directory");
+        let echo = a.first() == Some(&"--echo");
+        let added = a
+            .iter()
+            .position(|x| *x == "rule")
+            .filter(|&i| i > 0 && matches!(a[i - 1], "add" | "insert"));
+        if let Some(i) = added {
+            let (verb, chain) = (a[i - 1], a[i + 3]);
+            let (next, rules) = t.as_mut().ok_or_else(gone)?;
+            let at = a.iter().position(|x| *x == "level").unwrap() + 2;
+            let cg = if a[at] == "!=" { a[at + 1] } else { a[at] };
+            let h = *next;
+            *next += 1;
+            if verb == "insert" {
+                rules.insert(0, (h, cg.into()));
+            } else {
+                rules.push((h, cg.into()));
+            }
+            let tail = &a[i + 4..];
+            if chain != "out" || tail.contains(&"accept") || a[at] == "!=" {
+                let text: Vec<String> = tail
+                    .iter()
+                    .map(|x| {
+                        if *x == cg {
+                            format!("\"{x}\"")
+                        } else {
+                            x.to_string()
+                        }
+                    })
+                    .collect();
+                SHAPE.with(|s| s.borrow_mut().insert(h, (chain.into(), text.join(" "))));
+            }
+            return Ok(if echo {
+                format!("{verb} rule ... # handle {h}\n")
+            } else {
+                String::new()
+            });
+        }
         match a[..] {
             ["add", "table", ..] => {
                 t.get_or_insert((7, Vec::new()));
             }
-            ["--echo", ..] => {
-                let (next, rules) = t.as_mut().ok_or_else(gone)?;
-                rules.push((*next, a[a.len() - 3].into()));
-                *next += 1;
-                return Ok(format!("add rule ... drop # handle {}\n", *next - 1));
-            }
             ["-a", "list", ..] => {
                 let (_, rules) = t.as_ref().ok_or_else(gone)?;
                 let gone = GONE.with(|g| g.borrow().clone());
-                return Ok(rules
-                    .iter()
-                    .map(|(h, cg)| {
-                        let shown = if gone.contains(cg) {
-                            "18342".to_string()
-                        } else {
-                            format!("\"{cg}\"")
-                        };
-                        format!("socket cgroupv2 level 3 {shown} drop # handle {h}\n")
-                    })
-                    .collect());
+                let shape = SHAPE.with(|s| s.borrow().clone());
+                let line = |(h, cg): &(u64, String)| {
+                    let shown = if gone.contains(cg) {
+                        "18342".to_string()
+                    } else {
+                        format!("\"{cg}\"")
+                    };
+                    match shape.get(h) {
+                        Some((_, text)) => format!(
+                            "\t\t{} # handle {h}\n",
+                            text.replace(&format!("\"{cg}\""), &shown)
+                        ),
+                        None => format!("\t\tsocket cgroupv2 level 3 {shown} drop # handle {h}\n"),
+                    }
+                };
+                let chain = |c: &str| -> String {
+                    rules
+                        .iter()
+                        .filter(|r| shape.get(&r.0).map_or("out", |s| s.0.as_str()) == c)
+                        .map(line)
+                        .collect()
+                };
+                return Ok(format!(
+                    "table inet aegis {{ # handle 1\n\tchain out {{ # handle 2\n{}\t}}\n\
+                     \tchain nat_out {{ # handle 3\n{}\t}}\n}}\n",
+                    chain("out"),
+                    chain("nat_out")
+                ));
             }
             ["delete", "rule", .., h] => {
                 let (_, rules) = t.as_mut().ok_or_else(gone)?;
@@ -1228,6 +1392,9 @@ mod tests {
         TABLE.with(|t| t.borrow().as_ref().map(|t| t.1.clone()))
     }
     fn set_rules(r: Option<Vec<(u64, String)>>) {
+        if r.is_none() {
+            SHAPE.with(|s| s.borrow_mut().clear());
+        }
         TABLE.with(|t| {
             *t.borrow_mut() = r.map(|r| (r.iter().map(|x| x.0 + 1).max().unwrap_or(7), r))
         });
@@ -1344,8 +1511,36 @@ mod tests {
             children: |_| Vec::new(),
             forks: Arc::default(),
             reassert_pending: Arc::default(),
+            honeypot: Arc::default(),
+            guard: Box::<FakeGuard>::default(),
+            listening: listen_up,
+            cgroup_id: |_| Ok(99),
+            observing: HashMap::new(),
+            marks: None,
         };
         Fx { e, id, dir }
+    }
+
+    /// The guard, recorded in CALLS as `guard <dir>` and `unguard <dir>`.
+    #[derive(Default)]
+    struct FakeGuard(HashSet<String>);
+    impl Guard for FakeGuard {
+        fn attach(&mut self, dir: &str, tcp: u16, dns: u16) -> Result<()> {
+            let c = ["guard", dir, &tcp.to_string(), &dns.to_string()].map(String::from);
+            CALLS.with(|x| x.borrow_mut().push(c.into()));
+            self.0.insert(dir.into());
+            Ok(())
+        }
+        fn detach(&mut self, dir: &str) -> Result<()> {
+            if self.0.remove(dir) {
+                CALLS.with(|x| x.borrow_mut().push(vec!["unguard".into(), dir.into()]));
+            }
+            Ok(())
+        }
+    }
+    fn listen_up(_: u16, _: u16) -> std::io::Result<bool> {
+        CALLS.with(|x| x.borrow_mut().push(vec!["listen".into()]));
+        Ok(true)
     }
 
     impl Fx {
@@ -1388,12 +1583,18 @@ mod tests {
     fn spawn_slow(f: &Fx) -> EnforcerHandle {
         spawn_enforcer(
             f.e.store.clone(),
-            Holds::default(),
-            Systemd::with(slow, alive),
-            Nft::with(slow),
+            Backends {
+                holds: Holds::default(),
+                sys: Systemd::with(slow, alive),
+                nft: Nft::with(slow),
+            },
             f.e.limits,
             f.e.sinks.clone(),
             Arc::new(AtomicBool::new(true)),
+            HoneypotParts {
+                settings: Arc::default(),
+                guard: Box::<FakeGuard>::default(),
+            },
         )
     }
 
@@ -1968,6 +2169,12 @@ mod tests {
             children: |_| Vec::new(),
             forks: Arc::default(),
             reassert_pending: Arc::default(),
+            honeypot: Arc::default(),
+            guard: Box::<FakeGuard>::default(),
+            listening: listen_up,
+            cgroup_id: |_| Ok(99),
+            observing: HashMap::new(),
+            marks: None,
         };
         let r = run_reply(&mut e2, |reply| EnforceJob::Release {
             id: id.clone(),
@@ -3096,5 +3303,476 @@ mod tests {
             a.detail.as_deref(),
             Some("added late: the first attempt failed")
         );
+    }
+
+    /// An enforcer in honeypot mode with the default settings, whose
+    /// quarantine scope reads as running and not frozen.
+    fn hp(name: &str, run: Run) -> Fx {
+        let mut f = fx(name, run);
+        f.e.sys = Systemd::with(run, alive).with_events(unfrozen);
+        f.e.honeypot = Arc::new(Mutex::new(Some(Honeypot {
+            tcp_port: 2580,
+            dns_port: 2553,
+            max_tasks: 256,
+            max_incidents: 32,
+            window: Duration::from_secs(3600),
+        })));
+        f.e.marks = Some(f.dir.join("observing"));
+        f
+    }
+
+    fn observe(f: &mut Fx, pids: &[u32]) {
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: pids.iter().map(|&t| k(t)).collect(),
+        });
+    }
+
+    fn summary(f: &Fx) -> Option<String> {
+        f.e.store.list()[0].state.clone()
+    }
+
+    fn heads(c: &[Vec<String>]) -> Vec<String> {
+        c.iter()
+            .map(|a| a.iter().take(3).cloned().collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
+    /// What the fake table's chains hold: (chain, text) for each rule
+    /// that isn't a plain drop, in order, and the drops' cgroups.
+    fn shaped() -> Vec<(String, String)> {
+        let shape = SHAPE.with(|s| s.borrow().clone());
+        rules()
+            .unwrap_or_default()
+            .iter()
+            .map(|(h, cg)| {
+                shape
+                    .get(h)
+                    .cloned()
+                    .unwrap_or(("out".into(), format!("drop {cg}")))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn honeypot_quarantine_opens_after_rules() {
+        let mut f = hp("hp-open", ok);
+        observe(&mut f, &[10, 11]);
+        let unit = q_unit(&f.id);
+        let dir = format!("/sys/fs/cgroup/aegis.slice/aegis-quarantine.slice/{unit}");
+        let c = take();
+        assert_eq!(
+            heads(&c),
+            [
+                "/usr/bin/busctl call org.freedesktop.systemd1",
+                &format!("guard {dir} 2580"),
+                "/usr/sbin/nft add table",
+                "/usr/sbin/nft add chain",
+                "/usr/sbin/nft --echo --handle",
+                "/usr/sbin/nft add chain",
+                "/usr/sbin/nft -a list",
+                "/usr/sbin/nft add rule",
+                "/usr/sbin/nft --echo --handle",
+                "/usr/sbin/nft --echo --handle",
+                "/usr/sbin/nft --echo --handle",
+                "/usr/sbin/nft --echo --handle",
+                "listen",
+            ]
+        );
+        // The scope runs under the throttle caps and a task limit.
+        let start = c[0].join(" ");
+        assert!(start.contains("CPUQuotaPerSecUSec t 250000"), "{start}");
+        assert!(start.contains("TasksMax t 256"), "{start}");
+        assert!(!c.iter().any(|a| a.get(1).is_some_and(|s| s == "freeze")));
+        assert_eq!(
+            f.kinds(),
+            [
+                ("hold".into(), true),
+                ("scope".into(), true),
+                ("guard".into(), true),
+                ("nft_drop".into(), true),
+                ("nft_accept".into(), true),
+                ("nft_accept".into(), true),
+                ("nft_dnat".into(), true),
+                ("nft_dnat".into(), true),
+                ("honeypot_open".into(), true),
+            ]
+        );
+        let open = last_act(&f);
+        assert_eq!(open.detail.as_deref(), Some("127.77.0.1"));
+        assert_eq!(open.pids, [10, 11]);
+        assert_eq!(f.incident().verdict, "quarantined");
+        assert_eq!(summary(&f).as_deref(), Some("observing"));
+        assert!(f.dir.join("observing").join(&unit).exists());
+        // The accepts sit ahead of the drop in `out`; DNAT in nat_out.
+        let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &unit);
+        let q = format!("\"{cg}\"");
+        assert_eq!(
+            shaped(),
+            [
+                ("out".into(), format!("socket cgroupv2 level 3 {q} ip daddr 127.77.0.1 udp dport 2553 counter accept")),
+                ("out".into(), format!("socket cgroupv2 level 3 {q} ip daddr 127.77.0.1 tcp dport 2580 counter accept")),
+                ("out".into(), format!("drop {cg}")),
+                ("out".into(), "ip daddr 127.77.0.0/16 socket cgroupv2 level 2 != \"aegis.slice/aegis-quarantine.slice\" counter drop".into()),
+                ("nat_out".into(), format!("socket cgroupv2 level 3 {q} meta l4proto tcp counter dnat ip to 127.77.0.1:2580")),
+                ("nat_out".into(), format!("socket cgroupv2 level 3 {q} udp dport 53 counter dnat ip to 127.77.0.1:2553")),
+            ]
+        );
+        // Both holds are open to the scope.
+        assert_eq!(f.e.holds.close_scope(99).unwrap(), [10, 11]);
+    }
+
+    #[test]
+    fn no_listener_falls_back_to_drop_quarantine() {
+        fn down(_: u16, _: u16) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        let mut f = hp("hp-down", ok);
+        f.e.listening = down;
+        observe(&mut f, &[10]);
+        let kinds = f.kinds();
+        let rm = ("nft_remove".to_string(), true);
+        assert_eq!(
+            kinds[8..],
+            [
+                ("observe".into(), false),
+                rm.clone(),
+                rm.clone(),
+                rm.clone(),
+                rm,
+                ("freeze".into(), true)
+            ]
+        );
+        assert!(!kinds.iter().any(|k| k.0 == "honeypot_open"));
+        // No address was taken, so no rule sends anything to one: only
+        // the drop rule and the slice-wide rule are left.
+        let left = shaped();
+        assert!(
+            left.iter()
+                .all(|r| !r.1.contains("accept") && r.0 != "nat_out"),
+            "{left:?}"
+        );
+        assert!(f.e.holds.close_scope(99).unwrap().is_empty());
+        assert_eq!(f.e.holds.held(), 1);
+        assert_eq!(f.incident().verdict, "quarantined");
+        assert_eq!(summary(&f).as_deref(), Some("quarantined"));
+        assert!(f.e.observing.is_empty());
+        assert!(!f.dir.join("observing").join(q_unit(&f.id)).exists());
+        assert!(
+            f.log().contains("nothing listens on 0.0.0.0:2580 (TCP)"),
+            "{}",
+            f.log()
+        );
+    }
+
+    #[test]
+    fn rule_failure_never_opens() {
+        fn no_insert(prog: &str, a: &[String]) -> Result<String> {
+            if a.get(2).is_some_and(|s| s == "insert") {
+                bail!("nft: exit Some(1): Error: Could not process rule")
+            }
+            ok(prog, a)
+        }
+        let mut f = hp("hp-norule", no_insert);
+        observe(&mut f, &[10]);
+        let c = take();
+        assert!(!c.iter().any(|a| a[0] == "listen"));
+        assert_eq!(
+            f.kinds()[2..],
+            [
+                ("guard".into(), true),
+                ("nft_drop".into(), true),
+                ("observe".into(), false),
+                ("freeze".into(), true),
+            ]
+        );
+        assert!(f.e.holds.close_scope(99).unwrap().is_empty());
+        assert_eq!(f.incident().verdict, "quarantined");
+    }
+
+    #[test]
+    fn max_incidents_falls_back_to_drop() {
+        let mut f = hp("hp-full", ok);
+        if let Some(h) = f.e.honeypot.lock().unwrap().as_mut() {
+            h.max_incidents = 1;
+        }
+        f.e.observing.insert(
+            "AEG-other".into(),
+            Observed {
+                addr: "127.77.0.1".parse().unwrap(),
+                cgroup_id: 55,
+                opened: std::time::Instant::now(),
+                tcp: 2580,
+                dns: 2553,
+            },
+        );
+        observe(&mut f, &[10]);
+        let c = take();
+        assert_eq!(c[0][9], "4", "a v0.2 scope: no limits");
+        assert_eq!(
+            f.kinds(),
+            [
+                ("hold".into(), true),
+                ("scope".into(), true),
+                ("freeze".into(), true),
+                ("nft_drop".into(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tree_the_walk_finds_more_of_is_not_observed() {
+        let mut f = hp("hp-walk", ok);
+        f.e.children = |p| {
+            if p.tgid == 10 {
+                vec![k(12)]
+            } else {
+                Vec::new()
+            }
+        };
+        observe(&mut f, &[10]);
+        let kinds = f.kinds();
+        assert!(!kinds
+            .iter()
+            .any(|k| k.0 == "honeypot_open" || k.0 == "guard"));
+        assert!(kinds.contains(&("freeze".into(), true)));
+    }
+
+    #[test]
+    fn expiry_closes_freezes_and_frees() {
+        let mut f = hp("hp-expire", ok);
+        observe(&mut f, &[10]);
+        // A child the kernel held open when 10 forked.
+        f.e.holds.hold(k(12)).unwrap();
+        f.e.holds.open(k(12), 99).unwrap();
+        if let Some(h) = f.e.honeypot.lock().unwrap().as_mut() {
+            h.window = Duration::ZERO;
+        }
+        let n = f.kinds().len();
+        take();
+        f.e.run(EnforceJob::Reassert);
+        let kinds = f.kinds()[n..].to_vec();
+        assert_eq!(
+            kinds,
+            [
+                ("freeze".into(), true),
+                ("close".into(), true),
+                ("nft_remove".into(), true),
+                ("nft_remove".into(), true),
+                ("nft_remove".into(), true),
+                ("nft_remove".into(), true),
+                ("honeypot_close".into(), true),
+            ]
+        );
+        let close = &f.incident().actions[n + 1];
+        assert_eq!(close.pids, [10, 12]);
+        assert_eq!(close.start_times, [110, 112]);
+        assert_eq!(
+            last_act(&f).detail.as_deref(),
+            Some("observation window ended")
+        );
+        // Held, closed, frozen behind its drop rule: a v0.2 quarantine.
+        assert_eq!(f.e.holds.held(), 2);
+        assert!(f.e.holds.close_scope(99).unwrap().is_empty());
+        let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &q_unit(&f.id));
+        assert_eq!(shaped()[0], ("out".into(), format!("drop {cg}")));
+        assert_eq!(shaped().len(), 2, "the drop and the slice-wide rule");
+        assert_eq!(summary(&f).as_deref(), Some("quarantined"));
+        assert!(f.e.observing.is_empty());
+        assert!(!f.dir.join("observing").join(q_unit(&f.id)).exists());
+        // The window is checked again: nothing more happens.
+        f.e.sys = Systemd::with(ok, alive).with_events(frozen);
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(f.kinds().len(), n + 7);
+    }
+
+    #[test]
+    fn release_unholds_map_entries_for_scope() {
+        // Observing: the kernel's copy of a child is found by scope.
+        let mut f = hp("hp-rel", ok);
+        observe(&mut f, &[10]);
+        f.e.holds.hold(k(12)).unwrap();
+        f.e.holds.open(k(12), 99).unwrap();
+        take();
+        let id = f.id.clone();
+        run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply }).unwrap();
+        assert_eq!(f.e.holds.held(), 0);
+        let c = take();
+        assert_eq!(c[0][1], "freeze", "frozen before the holds are walked");
+        assert!(c.iter().any(|a| a[0] == "unguard"));
+        assert!(shaped().iter().all(|r| r.1.contains("level 2 !=")));
+        assert_eq!(summary(&f).as_deref(), Some("released"));
+        assert!(f.e.observing.is_empty());
+
+        // Expired: the closed entries no longer carry the scope, so the
+        // recorded list unholds them.
+        let mut f = hp("hp-rel-expired", ok);
+        observe(&mut f, &[10]);
+        f.e.holds.hold(k(12)).unwrap();
+        f.e.holds.open(k(12), 99).unwrap();
+        if let Some(h) = f.e.honeypot.lock().unwrap().as_mut() {
+            h.window = Duration::ZERO;
+        }
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(f.e.holds.held(), 2);
+        let id = f.id.clone();
+        run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply }).unwrap();
+        assert_eq!(f.e.holds.held(), 0);
+        assert!(rules().unwrap().iter().all(|r| !r.1.contains("incident")));
+    }
+
+    #[test]
+    fn kill_removes_both_chains() {
+        let mut f = hp("hp-kill", ok);
+        observe(&mut f, &[10]);
+        take();
+        let id = f.id.clone();
+        run_reply(&mut f.e, |reply| EnforceJob::Kill { id, reply }).unwrap();
+        let c = take();
+        let deletes: Vec<&str> = c
+            .iter()
+            .filter(|a| a[1] == "delete")
+            .map(|a| a[5].as_str())
+            .collect();
+        assert_eq!(deletes, ["out", "out", "out", "nat_out", "nat_out"]);
+        assert!(shaped().iter().all(|r| r.1.contains("level 2 !=")));
+        assert_eq!(f.e.holds.held(), 0);
+        assert_eq!(summary(&f).as_deref(), Some("killed"));
+        assert_eq!(last_act(&f).detail.as_deref(), Some("killed"));
+        // The address is free for the next tree.
+        assert!(f.e.observing.is_empty());
+    }
+
+    #[test]
+    fn reassert_restores_nat_rules_for_observing() {
+        let mut f = hp("hp-reassert", ok);
+        observe(&mut f, &[10]);
+        let before = shaped();
+        // `systemctl reload nftables`: the whole table goes.
+        set_rules(None);
+        take();
+        f.e.run(EnforceJob::Reassert);
+        let mut after = shaped();
+        // Restored with the same rules in the same order: accepts ahead of
+        // the drop, DNAT in nat_out. The slice-wide rule is re-added once.
+        let norm = |v: &mut Vec<(String, String)>| v.sort();
+        let mut b = before.clone();
+        norm(&mut b);
+        norm(&mut after);
+        assert_eq!(after, b);
+        let out: Vec<(String, String)> = shaped().into_iter().filter(|r| r.0 == "out").collect();
+        let drop = out.iter().position(|r| r.1.starts_with("drop ")).unwrap();
+        assert_eq!(
+            out[..drop]
+                .iter()
+                .filter(|r| r.1.ends_with("accept"))
+                .count(),
+            2
+        );
+        let tail: Vec<(String, bool)> = f.kinds().into_iter().rev().take(5).collect();
+        assert!(tail.iter().all(|k| k.1));
+        assert_eq!(
+            last_act(&f).detail.as_deref(),
+            Some("re-added after the table was removed")
+        );
+        assert_eq!(summary(&f).as_deref(), Some("observing"));
+
+        // One DNAT rule deleted by hand: the rest go and all four return.
+        let nat = rules()
+            .unwrap()
+            .into_iter()
+            .find(|r| SHAPE.with(|s| s.borrow().get(&r.0).is_some_and(|x| x.0 == "nat_out")))
+            .unwrap()
+            .0;
+        TABLE.with(|t| t.borrow_mut().as_mut().unwrap().1.retain(|r| r.0 != nat));
+        let n = f.kinds().len();
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(f.kinds().len(), n + 4);
+        let mut again = shaped();
+        norm(&mut again);
+        assert_eq!(again, b);
+        // In place: the next pass only looks.
+        take();
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(heads(&take()), ["/usr/sbin/nft -a list"]);
+    }
+
+    #[test]
+    fn start_closes_observing_incidents() {
+        let mut f = hp("hp-start", ok);
+        observe(&mut f, &[10]);
+        let unit = q_unit(&f.id);
+        assert!(f.dir.join("observing").join(&unit).exists());
+        // A new aegisd: nothing in memory, a fresh map.
+        f.e.observing.clear();
+        f.e.holds = Holds::default();
+        let n = f.kinds().len();
+        take();
+        f.e.close_observing();
+        assert_eq!(take()[0][1..3], ["freeze".to_string(), unit.clone()]);
+        let kinds = f.kinds()[n..].to_vec();
+        assert_eq!(kinds[0], ("freeze".into(), true));
+        assert_eq!(kinds.iter().filter(|k| k.0 == "nft_remove").count(), 4);
+        assert_eq!(last_act(&f).kind, "honeypot_close");
+        assert_eq!(last_act(&f).detail.as_deref(), Some("aegisd restarted"));
+        assert_eq!(summary(&f).as_deref(), Some("quarantined"));
+        assert!(!f.dir.join("observing").exists());
+        // Run twice, nothing more.
+        f.e.close_observing();
+        assert_eq!(f.kinds().len(), n + kinds.len());
+    }
+
+    #[test]
+    fn a_drop_quarantine_closes_a_hold_opened_for_another_scope() {
+        let mut f = fx("hp-drop-close", ok);
+        f.e.holds.hold(k(10)).unwrap();
+        f.e.holds.open(k(10), 55).unwrap();
+        observe(&mut f, &[10]);
+        assert!(f.e.holds.close_scope(55).unwrap().is_empty());
+        assert_eq!(f.e.holds.held(), 1);
+        assert_eq!(f.incident().verdict, "quarantined");
+    }
+
+    #[test]
+    fn a_fork_in_an_observed_tree_stays_open_and_unfrozen() {
+        let mut f = hp("hp-fork", ok);
+        observe(&mut f, &[10]);
+        // The kernel copied 10's open hold to its child 12.
+        f.e.holds.hold(k(12)).unwrap();
+        f.e.holds.open(k(12), 99).unwrap();
+        take();
+        f.e.run(EnforceJob::Fork {
+            id: f.id.clone(),
+            tier: Tier::Quarantine,
+            pid: k(12),
+        });
+        assert!(!take()
+            .iter()
+            .any(|a| a.get(1).is_some_and(|s| s == "freeze")));
+        assert_eq!(f.e.holds.close_scope(99).unwrap(), [10, 12]);
+        assert_eq!(summary(&f).as_deref(), Some("observing"));
+    }
+
+    #[test]
+    fn a_newcomer_bringing_unheld_processes_ends_the_observation() {
+        let mut f = hp("hp-unheld", ok);
+        observe(&mut f, &[10]);
+        f.e.children = |p| {
+            if p.tgid == 20 {
+                vec![k(21)]
+            } else {
+                Vec::new()
+            }
+        };
+        f.e.run(EnforceJob::Quarantine {
+            id: f.id.clone(),
+            pids: vec![k(20)],
+        });
+        assert_eq!(summary(&f).as_deref(), Some("quarantined"));
+        assert_eq!(
+            last_act(&f).detail.as_deref(),
+            Some("a process in the tree could not be held")
+        );
+        assert!(f.e.holds.close_scope(99).unwrap().is_empty());
     }
 }

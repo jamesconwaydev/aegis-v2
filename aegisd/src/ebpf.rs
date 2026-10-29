@@ -10,13 +10,17 @@
 mod btf;
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use aegis_common::{Event, Hold, KernelOffsets};
 use aegis_proto::ProbeStatus;
 use anyhow::{anyhow, Context as _, Result};
 use aya::{
     maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf},
-    programs::{BtfTracePoint, CgroupSkb, Lsm, TracePoint},
+    programs::{
+        cgroup_skb::CgroupSkbLinkId, BtfTracePoint, CgroupAttachMode, CgroupSkb,
+        CgroupSkbAttachType, Lsm, TracePoint,
+    },
     Ebpf, EbpfLoader,
 };
 use tokio::{
@@ -36,12 +40,57 @@ pub struct Config {
 }
 
 pub struct EbpfHandle {
-    // Owns the loaded programs; dropping it detaches them.
-    _ebpf: Ebpf,
+    // Owns the loaded programs; dropping it, and the guard's share,
+    // detaches them.
+    _ebpf: Arc<Mutex<Ebpf>>,
     dropped: PerCpuArray<MapData, u64>,
     probes: Vec<ProbeStatus>,
     /// Taken by the enforcer at startup.
     pub holds: Holds,
+    /// Taken by the enforcer at startup.
+    pub guard: Option<EgressGuard>,
+}
+
+/// `aegis_guard` on each observed tree's scope: it drops whatever a
+/// socket made there sends unless it is for the honeypot, so a flushed
+/// nft table never sends the tree to the real network. Attached per
+/// scope, not to the slice, so a released tree, which stays in its
+/// scope, gets its network back once the link is gone.
+pub struct EgressGuard {
+    ebpf: Arc<Mutex<Ebpf>>,
+    ports: Array<MapData, u16>,
+    links: std::collections::HashMap<String, CgroupSkbLinkId>,
+}
+
+impl crate::enforce::enforcer::Guard for EgressGuard {
+    fn attach(&mut self, cgroup: &str, tcp: u16, dns: u16) -> Result<()> {
+        self.ports
+            .set(0, tcp, 0)
+            .context("setting the guard's ports")?;
+        self.ports
+            .set(1, dns, 0)
+            .context("setting the guard's ports")?;
+        let dir = std::fs::File::open(cgroup).with_context(|| format!("opening {cgroup}"))?;
+        let mut e = self.ebpf.lock().unwrap_or_else(|e| e.into_inner());
+        let p: &mut CgroupSkb = prog(&mut e, "aegis_guard")?;
+        let id = p
+            .attach(dir, CgroupSkbAttachType::Egress, CgroupAttachMode::Single)
+            .with_context(|| format!("attaching the egress guard to {cgroup}"))?;
+        if let Some(old) = self.links.insert(cgroup.into(), id) {
+            let _ = p.detach(old);
+        }
+        Ok(())
+    }
+
+    fn detach(&mut self, cgroup: &str) -> Result<()> {
+        let Some(id) = self.links.remove(cgroup) else {
+            return Ok(());
+        };
+        let mut e = self.ebpf.lock().unwrap_or_else(|e| e.into_inner());
+        let p: &mut CgroupSkb = prog(&mut e, "aegis_guard")?;
+        p.detach(id)
+            .with_context(|| format!("detaching the egress guard from {cgroup}"))
+    }
 }
 
 /// `BPF_EXIST`: update an entry only if it is still there, so a process
@@ -131,7 +180,6 @@ impl Holds {
     /// Opens `k`'s hold to sockets created in cgroup `cgroup_id`, and has
     /// the kernel hold its new processes the same way. `k` must already
     /// be held.
-    #[allow(dead_code)] // the honeypot enforcer
     pub fn open(&mut self, k: ProcKey, cgroup_id: u64) -> Result<()> {
         anyhow::ensure!(cgroup_id != 0, "opening {}: no cgroup id", k.tgid);
         anyhow::ensure!(
@@ -153,7 +201,6 @@ impl Holds {
     /// The walk is not atomic: an open-held process that forks while it
     /// runs can add an entry the walk misses. Freeze the scope first, so
     /// the set is stable, or freeze and then call this a second time.
-    #[allow(dead_code)] // the honeypot enforcer
     pub fn close_scope(&mut self, cgroup_id: u64) -> Result<Vec<u32>> {
         let entries = self.entries()?;
         self.close(entries, cgroup_id)
@@ -175,10 +222,33 @@ impl Holds {
         Ok(tgids)
     }
 
+    /// Takes the network back from `k`'s hold unless it is open to
+    /// `keep`. `hold` leaves an open entry alone, so a process another
+    /// incident caught while it was observed needs this. True if it
+    /// closed one.
+    pub fn close_one(&mut self, k: ProcKey, keep: u64) -> Result<bool> {
+        match self.get(k.tgid)? {
+            Some(h)
+                if h.start_time_ns == k.start_time_ns
+                    && h.net_cgroup != 0
+                    && h.net_cgroup != keep =>
+            {
+                let closed = Hold { net_cgroup: 0, ..h };
+                self.set(k.tgid, closed, BPF_EXIST)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// The start time `tgid`'s hold carries, if it has one.
+    pub fn start_time(&self, tgid: u32) -> Result<Option<u64>> {
+        Ok(self.get(tgid)?.map(|h| h.start_time_ns))
+    }
+
     /// Releases every hold opened to `cgroup_id`. Returns their tgids.
     /// Like `close_scope`, it can miss entries added during the walk, so
     /// call it on a frozen scope.
-    #[allow(dead_code)] // the honeypot enforcer
     pub fn release_scope(&mut self, cgroup_id: u64) -> Result<Vec<u32>> {
         let mut tgids = Vec::new();
         for (tgid, h) in self.entries()? {
@@ -394,6 +464,7 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
         )?),
         mem: BTreeMap::new(),
     };
+    let ports = Array::try_from(ebpf.take_map("GUARD_PORTS").context("no GUARD_PORTS map")?)?;
     let dropped = PerCpuArray::try_from(ebpf.take_map("DROPPED").context("no DROPPED map")?)?;
     let ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("no EVENTS map")?)?;
     // SAFETY: the ring buffer owns its map fd, and it moves into the
@@ -435,12 +506,19 @@ pub fn start(cfg: &Config) -> Result<(EbpfHandle, mpsc::Receiver<Event>)> {
         }
     });
 
+    let ebpf = Arc::new(Mutex::new(ebpf));
+    let guard = EgressGuard {
+        ebpf: ebpf.clone(),
+        ports,
+        links: Default::default(),
+    };
     Ok((
         EbpfHandle {
             _ebpf: ebpf,
             dropped,
             probes,
             holds,
+            guard: Some(guard),
         },
         rx,
     ))

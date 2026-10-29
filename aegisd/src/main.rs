@@ -30,7 +30,9 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{Config, ConfigHandle};
-use crate::enforce::enforcer::{spawn_enforcer, EnforceJob, EnforcerHandle};
+use crate::enforce::enforcer::{
+    spawn_enforcer, Backends, EnforceJob, EnforcerHandle, Honeypot, HoneypotParts,
+};
 use crate::enforce::nft::Nft;
 use crate::enforce::systemd::{Limits, Systemd};
 use crate::incident::{IncidentId, IncidentStore};
@@ -264,17 +266,25 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
     };
     // Runs in audit mode too, idle: the pipeline only queues jobs in
     // enforce mode, and a reload can switch modes.
+    let honeypot = Arc::new(std::sync::Mutex::new(Honeypot::from_config(&c)));
+    let guard = handle.guard.take().context("no egress guard")?;
     let enforcer = spawn_enforcer(
         store.clone(),
-        std::mem::take(&mut handle.holds),
-        Systemd::new(),
-        Nft::new(),
+        Backends {
+            holds: std::mem::take(&mut handle.holds),
+            sys: Systemd::new(),
+            nft: Nft::new(),
+        },
         Limits {
             cpu_quota_percent: c.throttle.cpu_quota_percent,
             memory_high_bytes: u64::from(c.throttle.memory_high_mb) << 20,
         },
         pipe.sinks.clone(),
         pipe.enforcing.clone(),
+        HoneypotParts {
+            settings: honeypot.clone(),
+            guard: Box::new(guard),
+        },
     );
     let (call_tx, mut calls) = mpsc::channel::<ipc::Call>(16);
     let server = tokio::spawn(ipc::serve(listener, call_tx, 0));
@@ -357,6 +367,8 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                         }
                         let c = cfg.current();
                         pipe.set_config(&c);
+                        *honeypot.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Honeypot::from_config(&c);
                         // Pins may have changed, and the cache holds verdicts
                         // made with the old ones. A verification already in
                         // flight still lands with its old-pin verdict.
