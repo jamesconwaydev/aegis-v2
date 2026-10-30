@@ -219,6 +219,35 @@ pub struct DnsQuery {
     pub answer: Option<Ipv4Addr>,
 }
 
+/// Lines `incidents show` lists per protocol; the rest are counted.
+pub const MAX_SHOWN: usize = 20;
+
+/// One protocol's sessions, as `incidents show` lists them. aegisd puts
+/// a list of these under `honeypot` in the incident it answers with,
+/// when the incident has filed sessions. Every string came from the
+/// honeypot, so from whatever was observed: escape it before printing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShowHoneypot {
+    /// As in `session.json`; a string, so an older aegisctl still reads
+    /// a protocol added later.
+    pub protocol: String,
+    pub sessions: u64,
+    /// What those sessions saw, each line once, first seen first; at
+    /// most `MAX_SHOWN`.
+    pub lines: Vec<ShowLine>,
+    /// Other lines, not sent.
+    #[serde(default)]
+    pub more: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShowLine {
+    /// `dst`, `name`, `query`, `sni`, `ja4`, `login`, `command`,
+    /// `request`, `header`, `upload`, `helo`, `mail` or `payload`.
+    pub kind: String,
+    pub value: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +328,16 @@ mod tests {
         v.as_object_mut().unwrap().remove("extra");
         v.as_object_mut().unwrap().remove("dst");
         assert!(serde_json::from_value::<Session>(v).is_err());
+    }
+
+    #[test]
+    fn a_show_summary_from_another_version_still_parses() {
+        let j = r#"{"protocol":"gopher","sessions":2,"later":1,
+            "lines":[{"kind":"dst","value":"1.2.3.4:70","x":0}]}"#;
+        let s: ShowHoneypot = serde_json::from_str(j).unwrap();
+        assert_eq!(
+            (s.protocol.as_str(), s.more, s.lines.len()),
+            ("gopher", 0, 1)
+        );
     }
 }

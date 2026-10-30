@@ -1,0 +1,172 @@
+{
+  "id": "bundle--d12aa8d1-2812-5b96-9f72-b9adb0f1495d",
+  "objects": [
+    {
+      "created": "2026-10-29T12:00:00.000Z",
+      "id": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
+      "identity_class": "system",
+      "modified": "2026-10-29T12:00:00.000Z",
+      "name": "web01",
+      "spec_version": "2.1",
+      "type": "identity"
+    },
+    {
+      "id": "directory--30cd6b30-d22c-597c-b9f9-35bd71fe489d",
+      "path": "/tmp/x",
+      "type": "directory"
+    },
+    {
+      "id": "file--77aeb5ff-7d9b-520b-98c2-884e72bdc66d",
+      "name": "dropper",
+      "parent_directory_ref": "directory--30cd6b30-d22c-597c-b9f9-35bd71fe489d",
+      "type": "file"
+    },
+    {
+      "id": "process--7b9569a3-04ef-574d-9cd2-bcfacfe0f7f7",
+      "image_ref": "file--77aeb5ff-7d9b-520b-98c2-884e72bdc66d",
+      "pid": 4242,
+      "type": "process"
+    },
+    {
+      "id": "directory--1cf2baba-bf48-53a3-9423-f91c51bf0d62",
+      "path": "/usr/bin",
+      "type": "directory"
+    },
+    {
+      "id": "file--3dfcc661-2091-55a2-9e94-435a1214ee28",
+      "name": "curl",
+      "parent_directory_ref": "directory--1cf2baba-bf48-53a3-9423-f91c51bf0d62",
+      "type": "file"
+    },
+    {
+      "id": "process--eca4af8c-0f9d-560f-bff5-c83228685e11",
+      "image_ref": "file--3dfcc661-2091-55a2-9e94-435a1214ee28",
+      "pid": 4243,
+      "type": "process"
+    },
+    {
+      "id": "ipv4-addr--49311dc6-7bca-5667-92d2-66553e828bdd",
+      "type": "ipv4-addr",
+      "value": "198.18.0.53"
+    },
+    {
+      "dst_byte_count": 20,
+      "dst_port": 53,
+      "dst_ref": "ipv4-addr--49311dc6-7bca-5667-92d2-66553e828bdd",
+      "end": "2026-10-29T12:01:01.500Z",
+      "id": "network-traffic--f99e5dda-5ba5-50fc-961a-31fcbf8c5227",
+      "is_active": false,
+      "protocols": [
+        "ipv4",
+        "udp",
+        "dns"
+      ],
+      "src_byte_count": 10,
+      "start": "2026-10-29T12:01:00.000Z",
+      "type": "network-traffic"
+    },
+    {
+      "id": "domain-name--5d320d0e-fb60-5405-a879-7d9ad145f546",
+      "type": "domain-name",
+      "value": "c2.example"
+    },
+    {
+      "id": "ipv4-addr--1a105c2d-edb3-51f0-b0f0-1f9b7c6a4db1",
+      "type": "ipv4-addr",
+      "value": "198.18.0.1"
+    },
+    {
+      "dst_byte_count": 20,
+      "dst_port": 443,
+      "dst_ref": "ipv4-addr--1a105c2d-edb3-51f0-b0f0-1f9b7c6a4db1",
+      "end": "2026-10-29T12:01:02.500Z",
+      "id": "network-traffic--6fddb421-69a0-5290-b406-d223e9653c77",
+      "is_active": false,
+      "protocols": [
+        "ipv4",
+        "tcp",
+        "https"
+      ],
+      "src_byte_count": 10,
+      "start": "2026-10-29T12:01:00.000Z",
+      "type": "network-traffic",
+      "x_aegis_ja4": "t13d1516h2_8daaf6152771_e5627efa2ab1"
+    },
+    {
+      "id": "domain-name--1c046282-d438-524c-a70c-681fba293b88",
+      "type": "domain-name",
+      "value": "it's\\odd.example"
+    },
+    {
+      "hashes": {
+        "SHA-256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "id": "file--c1513f37-3788-565a-a7a5-e46bc42cdaba",
+      "type": "file"
+    },
+    {
+      "created": "2026-10-29T12:00:00.000Z",
+      "created_by_ref": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
+      "first_observed": "2026-10-29T12:01:00.000Z",
+      "id": "observed-data--24cacd25-64e1-55a5-ba21-c50f01dcbb79",
+      "last_observed": "2026-10-29T12:01:02.500Z",
+      "modified": "2026-10-29T12:00:00.000Z",
+      "number_observed": 1,
+      "object_refs": [
+        "directory--30cd6b30-d22c-597c-b9f9-35bd71fe489d",
+        "file--77aeb5ff-7d9b-520b-98c2-884e72bdc66d",
+        "process--7b9569a3-04ef-574d-9cd2-bcfacfe0f7f7",
+        "directory--1cf2baba-bf48-53a3-9423-f91c51bf0d62",
+        "file--3dfcc661-2091-55a2-9e94-435a1214ee28",
+        "process--eca4af8c-0f9d-560f-bff5-c83228685e11",
+        "ipv4-addr--49311dc6-7bca-5667-92d2-66553e828bdd",
+        "network-traffic--f99e5dda-5ba5-50fc-961a-31fcbf8c5227",
+        "domain-name--5d320d0e-fb60-5405-a879-7d9ad145f546",
+        "ipv4-addr--1a105c2d-edb3-51f0-b0f0-1f9b7c6a4db1",
+        "network-traffic--6fddb421-69a0-5290-b406-d223e9653c77",
+        "domain-name--1c046282-d438-524c-a70c-681fba293b88",
+        "file--c1513f37-3788-565a-a7a5-e46bc42cdaba"
+      ],
+      "spec_version": "2.1",
+      "type": "observed-data",
+      "x_aegis_incident": "AEG-20261029-120000-0123456789abcdef"
+    },
+    {
+      "created": "2026-10-29T12:00:00.000Z",
+      "created_by_ref": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
+      "id": "indicator--bcd922ab-c2a5-5bae-a118-721d40296169",
+      "modified": "2026-10-29T12:00:00.000Z",
+      "name": "Domain name seen in AEG-20261029-120000-0123456789abcdef",
+      "pattern": "[domain-name:value = 'c2.example']",
+      "pattern_type": "stix",
+      "spec_version": "2.1",
+      "type": "indicator",
+      "valid_from": "2026-10-29T12:00:00.000Z"
+    },
+    {
+      "created": "2026-10-29T12:00:00.000Z",
+      "created_by_ref": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
+      "id": "indicator--6d219521-4b09-50ee-b8c0-42bd40f0fb35",
+      "modified": "2026-10-29T12:00:00.000Z",
+      "name": "Domain name seen in AEG-20261029-120000-0123456789abcdef",
+      "pattern": "[domain-name:value = 'it\\'s\\\\odd.example']",
+      "pattern_type": "stix",
+      "spec_version": "2.1",
+      "type": "indicator",
+      "valid_from": "2026-10-29T12:00:00.000Z"
+    },
+    {
+      "created": "2026-10-29T12:00:00.000Z",
+      "created_by_ref": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
+      "id": "indicator--3e10ec3a-a674-597c-9fe5-05a17a9b4576",
+      "modified": "2026-10-29T12:00:00.000Z",
+      "name": "Payload sent to the honeypot in AEG-20261029-120000-0123456789abcdef",
+      "pattern": "[file:hashes.'SHA-256' = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855']",
+      "pattern_type": "stix",
+      "spec_version": "2.1",
+      "type": "indicator",
+      "valid_from": "2026-10-29T12:00:00.000Z"
+    }
+  ],
+  "type": "bundle"
+}

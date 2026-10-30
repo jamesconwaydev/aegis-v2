@@ -190,6 +190,13 @@ pub fn now_ns() -> u64 {
         .map_or(0, |d| d.as_nanos() as u64)
 }
 
+/// This host's name, or `unknown`.
+pub fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_else(|_| "unknown".into())
+}
+
 /// Standard base64 with padding.
 pub fn b64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

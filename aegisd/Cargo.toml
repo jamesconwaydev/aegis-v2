@@ -18,6 +18,8 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# Already in the lock through russh; UUIDv5 for STIX ids needs SHA-1.
+sha1 = { version = "0.11", default-features = false }
 toml = { workspace = true, features = ["display"] }
 ureq = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }

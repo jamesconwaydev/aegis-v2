@@ -9,11 +9,13 @@
 pub mod config;
 pub mod ebpf;
 pub mod enforce;
+pub mod filed;
 pub mod incident;
 pub mod ipc;
 pub mod pipeline;
 pub mod proctable;
 pub mod scoring;
 pub mod spool;
+pub mod stix;
 pub mod telemetry;
 pub mod verify;

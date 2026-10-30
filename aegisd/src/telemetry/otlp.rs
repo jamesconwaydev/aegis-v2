@@ -200,9 +200,7 @@ fn kv_list(k: &str, v: &[String]) -> Value {
 }
 
 fn resource() -> Value {
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|h| h.trim().to_string())
-        .unwrap_or_else(|_| "unknown".into());
+    let host = super::hostname();
     json!({"attributes": [
         kv("service.name", "aegisd".into()),
         kv("service.version", env!("CARGO_PKG_VERSION").into()),
