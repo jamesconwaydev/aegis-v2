@@ -132,6 +132,39 @@ pub struct Session {
     /// Each HTTP request, in order. The honeypot stops adding them before
     /// this record reaches 40 KiB, and sets `truncated`.
     pub requests: Vec<HttpRequest>,
+    /// Each login tried, in order. The honeypot stops adding them before
+    /// this record reaches 40 KiB, or at 32, and sets `truncated`.
+    pub credentials: Vec<Credential>,
+    /// Each shell command run, split at `;`, `&&`, `||` and `|`, as
+    /// printable text (see `sni`), at most 1 KiB each. Bounded like
+    /// `credentials`, and at 256.
+    pub commands: Vec<String>,
+    /// Each file sent up by scp or sftp. Bounded like `credentials`.
+    pub uploads: Vec<Upload>,
+}
+
+/// One login. Printable text (see `sni`), at most 256 bytes each.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Credential {
+    pub user: String,
+    /// The password as typed.
+    pub password: Option<String>,
+    /// A public key offered: its algorithm and SHA-256 fingerprint, as
+    /// `ssh-keygen -l` prints them (`ssh-ed25519 SHA256:...`).
+    pub key: Option<String>,
+}
+
+/// One uploaded file.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upload {
+    /// The name the client gave it, as printable text (see `sni`), at
+    /// most 255 bytes. Never used as a path.
+    pub name: String,
+    /// SHA-256 (hex) of the contents kept, one of `payloads`; None when
+    /// they couldn't be kept.
+    pub payload: Option<String>,
 }
 
 /// One HTTP request as the client sent it, as printable text (see `sni`).
@@ -193,6 +226,16 @@ mod tests {
                 headers: vec!["Host: c2.example".into()],
                 body: None,
             }],
+            credentials: vec![Credential {
+                user: "root".into(),
+                password: Some("123456".into()),
+                key: None,
+            }],
+            commands: vec!["uname -a".into()],
+            uploads: vec![Upload {
+                name: "x.sh".into(),
+                payload: Some("ab".into()),
+            }],
         }
     }
 
@@ -204,6 +247,12 @@ mod tests {
         assert!(j.contains("\"dst\":\"1.2.3.4:6667\""), "{j}");
         assert!(j.contains("\"answer\":\"198.18.0.1\""), "{j}");
         assert!(j.contains("\"headers\":[\"Host: c2.example\"]"), "{j}");
+        assert!(j.contains("\"commands\":[\"uname -a\"]"), "{j}");
+        assert!(j.contains("\"password\":\"123456\",\"key\":null"), "{j}");
+        assert!(
+            j.contains("\"uploads\":[{\"name\":\"x.sh\",\"payload\":\"ab\"}]"),
+            "{j}"
+        );
         assert_eq!(serde_json::from_str::<Session>(&j).unwrap(), s);
     }
 

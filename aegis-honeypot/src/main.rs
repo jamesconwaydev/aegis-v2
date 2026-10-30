@@ -13,7 +13,10 @@ mod http;
 mod pcap;
 mod serve;
 mod session;
+mod shell;
+mod ssh;
 mod udp;
+mod upload;
 mod web;
 
 use std::os::fd::{FromRawFd, RawFd};
@@ -135,6 +138,18 @@ fn state(dirs: Option<&str>) -> PathBuf {
     PathBuf::from(first.unwrap_or(STATE))
 }
 
+/// What the fake shell says the host is: the real one, its name in
+/// short form as a prompt shows it.
+fn shell_host(hostname: &str, release: &str, version: &str) -> shell::Host {
+    let name = hostname.trim();
+    shell::Host {
+        name: name.split('.').next().unwrap_or(name).to_string(),
+        release: release.trim().to_string(),
+        version: version.trim().to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+    }
+}
+
 /// Why a task that should run for good stopped; never, for no task.
 async fn ended(task: Option<tokio::task::JoinHandle<()>>) -> String {
     match task {
@@ -193,8 +208,16 @@ fn run() -> Result<()> {
         .mode(0o750)
         .create(&spool)
         .with_context(|| spool.display().to_string())?;
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").context("hostname")?;
+    let kernel = |f: &str| {
+        let p = format!("/proc/sys/kernel/{f}");
+        std::fs::read_to_string(&p).with_context(|| p)
+    };
+    let host = kernel("hostname")?;
     let tls = ca::config(ca::Certs::load(&state, host.trim())?)?;
+    let ssh = ssh::Ssh::load(
+        &state,
+        shell_host(&host, &kernel("osrelease")?, &kernel("version")?),
+    )?;
     let srv = Rc::new(Server {
         spool,
         max_bytes: cfg.max_session_bytes,
@@ -204,6 +227,8 @@ fn run() -> Result<()> {
         udp_slots: udp::slots(),
         names: Default::default(),
         tls,
+        ssh,
+        ssh_slots: ssh::slots(),
     });
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -363,6 +388,16 @@ mod tests {
                     .is_err());
             })
             .await;
+    }
+
+    #[test]
+    fn the_shell_names_the_host_in_short_form() {
+        let h = shell_host("web1.example.com\n", "6.12.0\n", "#1 SMP\n");
+        assert_eq!(
+            (h.name.as_str(), h.release.as_str(), h.version.as_str()),
+            ("web1", "6.12.0", "#1 SMP")
+        );
+        assert_eq!(shell_host("web1", "", "").name, "web1");
     }
 
     #[test]

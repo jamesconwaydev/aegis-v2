@@ -346,6 +346,8 @@ mod tests {
             udp_slots: slots(),
             names: RefCell::default(),
             tls: crate::ca::tests::tls(name).0,
+            ssh: crate::ssh::tests::ssh(name),
+            ssh_slots: crate::ssh::slots(),
         }
     }
 
