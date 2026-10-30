@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aegis_proto::honeypot::{self, Credential, DnsQuery, HttpRequest, Protocol, Upload};
+use aegis_proto::honeypot::{self, Credential, DnsQuery, HttpRequest, Mail, Protocol, Upload};
 use sha2::{Digest, Sha256};
 
 use crate::pcap::{Pcap, DATAGRAM_COST, MAX_DATAGRAM, SEGMENT, SEGMENT_COST};
@@ -76,6 +76,7 @@ const MAX_REQUESTS: usize = 64;
 const MAX_CREDENTIALS: usize = 32;
 const MAX_COMMANDS: usize = 256;
 const MAX_UPLOADS: usize = 32;
+const MAX_MAILS: usize = 32;
 const RECORD_JSON: usize = 40 * 1024;
 
 /// The most of one body or upload held in memory, and so kept as its
@@ -230,6 +231,8 @@ impl Session {
                 credentials: Vec::new(),
                 commands: Vec::new(),
                 uploads: Vec::new(),
+                helo: None,
+                mails: Vec::new(),
             },
             dir,
             pcap,
@@ -328,6 +331,35 @@ impl Session {
 
     pub fn upload(&mut self, u: Upload) {
         self.add(u, MAX_UPLOADS, |r| &mut r.uploads);
+    }
+
+    pub fn mail(&mut self, m: Mail) {
+        self.add(m, MAX_MAILS, |r| &mut r.mails);
+    }
+
+    /// Whether `m` would be added by `mail`. The record is left as it
+    /// was.
+    pub fn mail_fits(&mut self, m: Mail) -> bool {
+        if self.rec.mails.len() >= MAX_MAILS {
+            return false;
+        }
+        self.rec.mails.push(m);
+        let size = serde_json::to_vec_pretty(&self.rec).map_or(usize::MAX, |j| j.len());
+        self.rec.mails.pop();
+        size <= RECORD_JSON
+    }
+
+    /// At most `max` bytes of `b`, as printable text, and `truncated` if
+    /// that cut something.
+    pub fn note(&mut self, b: &[u8], max: usize) -> String {
+        let mut t = crate::hello::text(&b[..b.len().min(max)]);
+        let mut n = t.len().min(max);
+        while !t.is_char_boundary(n) {
+            n -= 1;
+        }
+        self.rec.truncated |= b.len() > max || n < t.len();
+        t.truncate(n);
+        t
     }
 
     /// What the cap has left for more bytes or payloads.
@@ -854,6 +886,71 @@ pub(crate) mod tests {
             ),
             (MAX_CREDENTIALS, MAX_UPLOADS, true)
         );
+        std::fs::remove_dir_all(sp).unwrap();
+    }
+
+    #[test]
+    fn mail_stops_before_the_record_outgrows_what_aegisd_reads() {
+        let sp = spool("mails");
+        let w = |n: usize| "\u{fffd}".repeat(n / 3);
+        let worst = Mail {
+            from: w(crate::smtp::MAX_ADDR),
+            to: vec![w(crate::smtp::MAX_ADDR); crate::smtp::MAX_RCPT],
+            message: Some("ab".repeat(32)),
+        };
+        // Everything else SMTP records at its worst too: two logins (one
+        // before STARTTLS, one after, since TLS starts the state over),
+        // the name, SNI and a DNS name.
+        let mut s = open(&sp, 1 << 30);
+        s.rec.dns_name = Some("\\377".repeat(250));
+        s.rec.sni = Some("\u{fffd}".repeat(255));
+        s.rec.helo = Some(w(crate::smtp::MAX_ADDR));
+        for _ in 0..2 {
+            s.credential(Credential {
+                user: w(crate::smtp::MAX_ADDR),
+                password: Some(w(crate::smtp::MAX_ADDR)),
+                key: None,
+            });
+        }
+        // The first always fits.
+        s.mail(worst.clone());
+        assert_eq!(s.rec.mails.len(), 1);
+        assert!(!s.rec.truncated);
+        while !s.rec.truncated {
+            s.mail(worst.clone());
+        }
+        for i in 0..MAX_PAYLOADS as u32 {
+            s.payload(&i.to_be_bytes()).unwrap();
+        }
+        let done = s.close().unwrap();
+        let json = std::fs::metadata(done.join("session.json")).unwrap().len();
+        assert!(json < 64 * 1024, "{json}");
+        // Small ones stop at their count.
+        let mut t = open(&sp, 1 << 30);
+        let small = Mail {
+            from: String::new(),
+            to: vec!["a@b".into()],
+            message: None,
+        };
+        for _ in 0..MAX_MAILS {
+            t.mail(small.clone());
+        }
+        assert!(!t.rec.truncated);
+        t.mail(small);
+        assert!(t.rec.truncated);
+        assert_eq!(t.rec.mails.len(), MAX_MAILS);
+        std::fs::remove_dir_all(sp).unwrap();
+    }
+
+    #[test]
+    fn a_note_is_printable_and_cut_at_its_bound() {
+        let sp = spool("note");
+        let mut s = open(&sp, 100);
+        assert_eq!(s.note(b"ok\r\nRCPT", 64), "ok\u{fffd}\u{fffd}RCPT");
+        assert!(!s.rec.truncated);
+        // A cut never splits a character.
+        assert_eq!(s.note(&[0xff; 10], 7), "\u{fffd}\u{fffd}");
+        assert!(s.rec.truncated);
         std::fs::remove_dir_all(sp).unwrap();
     }
 

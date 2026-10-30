@@ -19,6 +19,7 @@ use tokio::time::timeout;
 
 use crate::dispatch::{by_bytes, by_port, PEEK};
 use crate::dns::{self, Names};
+use crate::mail::Smtp;
 use crate::pcap::FIXED_COST;
 use crate::session::{Conn, Floor, Session, Slots, Transport};
 use crate::ssh::Ssh;
@@ -96,8 +97,11 @@ pub struct Server {
     pub udp_slots: Slots,
     /// Shared by DNS and the TCP side, which labels connections from it.
     pub names: RefCell<Names>,
-    /// HTTPS, with a leaf from the host's CA for each name asked.
+    /// HTTPS and SMTP's TLS, with a leaf from the host's CA for each
+    /// name asked.
     pub tls: Arc<ServerConfig>,
+    /// What SMTP calls itself: `mail.<short hostname>`.
+    pub mail: String,
     pub ssh: Ssh,
     /// SSH sessions' own count, within TCP's; see `ssh::slots`.
     pub ssh_slots: Slots,
@@ -240,7 +244,6 @@ async fn run(
         .names
         .borrow_mut()
         .label(addr, *dst.ip(), std::time::Instant::now());
-    // The rest are answered as catch-all until their own handlers land.
     let served = match protocol {
         Protocol::Ssh => {
             let served;
@@ -250,7 +253,16 @@ async fn run(
         Protocol::Dns => timeout(srv.max_time, Dns(&srv.names).serve(&mut s, io)).await,
         Protocol::Http => timeout(srv.max_time, Http.serve(&mut s, io)).await,
         Protocol::Https => timeout(srv.max_time, Https(&srv.tls).serve(&mut s, io)).await,
-        _ => timeout(srv.max_time, CatchAll.serve(&mut s, io)).await,
+        Protocol::Smtp | Protocol::Smtps => {
+            let smtp = Smtp {
+                tls: &srv.tls,
+                mail: &srv.mail,
+                implicit: protocol == Protocol::Smtps,
+                until: tokio::time::Instant::now() + srv.max_time,
+            };
+            timeout(srv.max_time, smtp.serve(&mut s, io)).await
+        }
+        Protocol::Raw => timeout(srv.max_time, CatchAll.serve(&mut s, io)).await,
     };
     match served {
         Ok(Ok(())) => {}
@@ -313,6 +325,7 @@ pub(crate) mod tests {
             udp_slots: crate::udp::slots(),
             names: RefCell::default(),
             tls,
+            mail: "mail.web1".into(),
             ssh: crate::ssh::tests::ssh(name),
             ssh_slots: crate::ssh::slots(),
         });
@@ -565,6 +578,7 @@ pub(crate) mod tests {
             udp_slots: crate::udp::slots(),
             names: RefCell::default(),
             tls: crate::ca::tests::tls("hreserve").0,
+            mail: "mail.web1".into(),
             ssh: crate::ssh::tests::ssh("hreserve"),
             ssh_slots: crate::ssh::slots(),
         });

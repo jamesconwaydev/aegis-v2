@@ -103,3 +103,10 @@ path = "fuzz_targets/sftp_packet.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "smtp_command"
+path = "fuzz_targets/smtp_command.rs"
+test = false
+doc = false
+bench = false

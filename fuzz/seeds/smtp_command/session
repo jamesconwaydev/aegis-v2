@@ -1,0 +1,10 @@
+EHLO bot.example
+AUTH PLAIN AHJvb3QAaHVudGVyMg==
+MAIL FROM:<a@b.example> SIZE=10
+RCPT TO:<c@d.example>
+DATA
+Subject: x
+
+..dot
+.
+QUIT

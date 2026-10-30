@@ -10,10 +10,12 @@ mod dispatch;
 mod dns;
 mod hello;
 mod http;
+mod mail;
 mod pcap;
 mod serve;
 mod session;
 mod shell;
+mod smtp;
 mod ssh;
 mod udp;
 mod upload;
@@ -214,10 +216,9 @@ fn run() -> Result<()> {
     };
     let host = kernel("hostname")?;
     let tls = ca::config(ca::Certs::load(&state, host.trim())?)?;
-    let ssh = ssh::Ssh::load(
-        &state,
-        shell_host(&host, &kernel("osrelease")?, &kernel("version")?),
-    )?;
+    let shell = shell_host(&host, &kernel("osrelease")?, &kernel("version")?);
+    let mail = format!("mail.{}", shell.name);
+    let ssh = ssh::Ssh::load(&state, shell)?;
     let srv = Rc::new(Server {
         spool,
         max_bytes: cfg.max_session_bytes,
@@ -227,6 +228,7 @@ fn run() -> Result<()> {
         udp_slots: udp::slots(),
         names: Default::default(),
         tls,
+        mail,
         ssh,
         ssh_slots: ssh::slots(),
     });
