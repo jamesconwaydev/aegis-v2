@@ -51,6 +51,8 @@ pub struct MetricsSnapshot {
     pub enforce_actions_ok: u64,
     pub enforce_actions_failed: u64,
     pub telemetry_dropped: u64,
+    /// Honeypot sessions filed, unmatched and rejected.
+    pub honeypot_sessions: [u64; 3],
 }
 
 pub struct Otlp {
@@ -238,7 +240,7 @@ fn metrics_body(resource: &Value, start_ns: u64, now_ns: u64, s: &MetricsSnapsho
         .iter()
         .map(|(v, n)| point(*n, vec![kv("verdict", v.clone())]))
         .collect();
-    let metrics = vec![
+    let mut metrics = vec![
         sum("aegis.events", vec![point(s.events_total, vec![])]),
         sum(
             "aegis.events.dropped",
@@ -264,6 +266,16 @@ fn metrics_body(resource: &Value, start_ns: u64, now_ns: u64, s: &MetricsSnapsho
         ),
         gauge("aegis.incidents", by_verdict),
     ];
+    // Only once there is one: drop mode's metrics stay as they were.
+    if s.honeypot_sessions != [0; 3] {
+        let results = ["filed", "unmatched", "rejected"];
+        let points = results
+            .iter()
+            .zip(s.honeypot_sessions)
+            .map(|(r, n)| point(n, vec![kv("result", (*r).into())]))
+            .collect();
+        metrics.push(sum("aegis.honeypot.sessions", points));
+    }
     json!({"resourceMetrics": [{
         "resource": resource,
         "scopeMetrics": [{"scope": {"name": "aegisd"}, "metrics": metrics}],
@@ -408,6 +420,7 @@ mod tests {
             enforce_actions_ok: 3,
             enforce_actions_failed: 4,
             telemetry_dropped: 5,
+            honeypot_sessions: [0; 3],
         });
         let (head, body) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(head.starts_with("POST /v1/metrics "), "{head}");
@@ -594,5 +607,35 @@ mod tests {
             3
         );
         assert_eq!(sink.dropped_records(), 0);
+    }
+
+    #[test]
+    fn honeypot_sessions_are_a_metric_only_once_there_are_some() {
+        let mut s = MetricsSnapshot {
+            events_total: 0,
+            dropped_events: 0,
+            incidents_open: 0,
+            incidents_by_verdict: BTreeMap::new(),
+            enforce_actions_ok: 0,
+            enforce_actions_failed: 0,
+            telemetry_dropped: 0,
+            honeypot_sessions: [0; 3],
+        };
+        let names = |s: &MetricsSnapshot| -> Vec<Value> {
+            metrics_body(&json!({}), 0, 0, s)["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let drop_mode = names(&s);
+        assert!(!drop_mode
+            .iter()
+            .any(|m| m["name"] == "aegis.honeypot.sessions"));
+        s.honeypot_sessions = [3, 2, 1];
+        let all = names(&s);
+        assert_eq!(all.len(), drop_mode.len() + 1);
+        let pts = &all.last().unwrap()["sum"]["dataPoints"];
+        assert_eq!(pts[0]["asInt"], "3");
+        assert_eq!(pts[2]["attributes"][0]["value"]["stringValue"], "rejected");
     }
 }

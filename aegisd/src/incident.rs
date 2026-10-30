@@ -542,20 +542,43 @@ impl IncidentStore {
         acts: Vec<ActionRecord>,
         verdict: Option<&'static str>,
     ) -> Result<()> {
+        self.update(id, |inc, ts| {
+            inc.actions.extend(acts.iter().cloned());
+            if let Some(v) = verdict {
+                if verdict_rank(v) > verdict_rank(&inc.verdict) {
+                    inc.verdict = v.into();
+                }
+            }
+            json!({"ts": ts, "actions": acts, "verdict": inc.verdict})
+        })
+    }
+
+    /// Appends `{"ts": .., <key>: ev}` to the incident's timeline,
+    /// written like `add_actions`.
+    pub fn add_event(&self, id: &IncidentId, key: &str, ev: serde_json::Value) -> Result<()> {
+        self.update(id, |_, ts| json!({"ts": ts, key: ev}))
+    }
+
+    /// The incident's directory, for files filed into it.
+    pub fn dir_of(&self, id: &IncidentId) -> Option<PathBuf> {
+        valid_id(&id.0).then(|| self.dir.join(&id.0))
+    }
+
+    /// One read-modify-write of an incident: `change` edits it and gives
+    /// the timeline line.
+    fn update(
+        &self,
+        id: &IncidentId,
+        change: impl FnOnce(&mut Incident, &str) -> serde_json::Value,
+    ) -> Result<()> {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let mut inc = self.get(id).with_context(|| format!("no incident {id}"))?;
         let now = now_ns();
         let ts = rfc3339(now);
-        inc.actions.extend(acts.iter().cloned());
-        if let Some(v) = verdict {
-            if verdict_rank(v) > verdict_rank(&inc.verdict) {
-                inc.verdict = v.into();
-            }
-        }
-        inc.updated = ts.clone();
+        let line = change(&mut inc, &ts);
+        inc.updated = ts;
         inc.updated_ns = now;
-        let line = (inc.timeline_lines < MAX_TIMELINE)
-            .then(|| json!({"ts": ts, "actions": acts, "verdict": inc.verdict}));
+        let line = (inc.timeline_lines < MAX_TIMELINE).then_some(line);
         if line.is_some() {
             inc.timeline_lines += 1;
         }

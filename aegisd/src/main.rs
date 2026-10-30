@@ -7,6 +7,7 @@ mod ipc;
 mod pipeline;
 mod proctable;
 mod scoring;
+mod spool;
 mod telemetry;
 mod verify;
 
@@ -459,6 +460,7 @@ fn metrics_snapshot(
         *by_verdict.entry(i.verdict.clone()).or_insert(0u64) += 1;
     }
     let d = pipe.sinks.dropped();
+    let f = &enforcer.filing;
     telemetry::otlp::MetricsSnapshot {
         events_total: pipe.events_total,
         dropped_events: probes.dropped_events(),
@@ -472,6 +474,7 @@ fn metrics_snapshot(
             + d.otlp_disconnected
             + d.webhook_queue_full
             + d.webhook_failed,
+        honeypot_sessions: [&f.filed, &f.unmatched, &f.rejected].map(|c| c.load(Ordering::Relaxed)),
     }
 }
 

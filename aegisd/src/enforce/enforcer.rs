@@ -93,6 +93,8 @@ pub struct EnforcerHandle {
     fork_drops_logged: AtomicBool,
     /// A reassert is queued and hasn't started; the enforcer clears it.
     reassert_pending: Arc<AtomicBool>,
+    /// Honeypot sessions filed and deleted.
+    pub filing: Arc<crate::spool::Counts>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -107,6 +109,7 @@ impl EnforcerHandle {
             sinks,
             fork_drops_logged: AtomicBool::new(false),
             reassert_pending: Arc::default(),
+            filing: Arc::default(),
             thread: None,
         }
     }
@@ -253,6 +256,9 @@ pub fn spawn_enforcer(
         cgroup_id: honeypot::cgroup_id,
         observing: HashMap::new(),
         marks: Some(honeypot::MARKS.into()),
+        spool: Some(crate::spool::SPOOL.into()),
+        closed: HashMap::new(),
+        filing: h.filing.clone(),
     };
     let t = std::thread::Builder::new()
         .name("aegis-enforce".into())
@@ -483,6 +489,13 @@ pub struct Enforcer {
     /// Where each observed scope is named for the unit's ExecStopPost,
     /// which freezes them if aegisd stops; None in tests.
     marks: Option<std::path::PathBuf>,
+    /// The honeypot's spool; None in tests that don't file.
+    spool: Option<std::path::PathBuf>,
+    /// Addresses whose observation ended, with the incident and when:
+    /// their late sessions still file there for `Honeypot::grace`.
+    closed: HashMap<std::net::Ipv4Addr, (String, std::time::Instant)>,
+    /// Shared with the handle, for the metrics.
+    filing: Arc<crate::spool::Counts>,
 }
 
 impl Enforcer {
@@ -1046,9 +1059,11 @@ impl Enforcer {
     /// only restores a rule enforce mode added; a tree whose first rule
     /// failed gets one late only in enforce mode.
     /// Observed trees are checked too, with their honeypot rules, and
-    /// any whose window has passed is closed first.
+    /// any whose window has passed is closed first; then the honeypot's
+    /// finished sessions are filed.
     fn reassert(&mut self) {
         self.expire_observations();
+        self.file_sessions();
         let enforcing = self.enforcing.load(Ordering::Relaxed);
         let ids: Vec<String> = self
             .store
@@ -1524,6 +1539,9 @@ mod tests {
             cgroup_id: |_| Ok(99),
             observing: HashMap::new(),
             marks: None,
+            spool: None,
+            closed: HashMap::new(),
+            filing: Arc::default(),
         };
         Fx { e, id, dir }
     }
@@ -2182,6 +2200,9 @@ mod tests {
             cgroup_id: |_| Ok(99),
             observing: HashMap::new(),
             marks: None,
+            spool: None,
+            closed: HashMap::new(),
+            filing: Arc::default(),
         };
         let r = run_reply(&mut e2, |reply| EnforceJob::Release {
             id: id.clone(),
@@ -3323,6 +3344,8 @@ mod tests {
             max_tasks: 256,
             max_incidents: 32,
             window: Duration::from_secs(3600),
+            max_session_bytes: 4096,
+            session_seconds: 300,
         })));
         f.e.marks = Some(f.dir.join("observing"));
         f
@@ -3359,6 +3382,103 @@ mod tests {
                     .unwrap_or(("out".into(), format!("drop {cg}")))
             })
             .collect()
+    }
+
+    /// `hp`, filing from a spool beside the store's incidents.
+    fn hp_spool(name: &str) -> (Fx, PathBuf) {
+        let mut f = hp(name, ok);
+        let sp = f.dir.join("spool");
+        std::fs::create_dir(&sp).unwrap();
+        crate::spool::tests::own(&sp);
+        f.e.spool = Some(sp.clone());
+        (f, sp)
+    }
+
+    const S1: &str = crate::spool::tests::ID;
+    const S2: &str = "1761696000001-0badf00d";
+
+    fn filed(f: &Fx) -> [u64; 3] {
+        let c = &f.e.filing;
+        [&c.filed, &c.unmatched, &c.rejected].map(|n| n.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn filing_maps_addr_to_incident() {
+        let (mut f, sp) = hp_spool("file-map");
+        observe(&mut f, &[10]);
+        let addr = f.e.observing[&f.id].addr.to_string();
+        let fake = crate::spool::tests::fake;
+        let mine = fake(&sp, &addr, S1, &[b"p"]);
+        let other = fake(&sp, "127.77.9.9", S2, &[]);
+        f.e.run(EnforceJob::Reassert);
+        assert!(!mine.exists() && !other.exists());
+        let home = f.dir.join(&f.id).join("honeypot").join(S1);
+        assert!(home.join("session.json").exists());
+        assert!(!f.dir.join(&f.id).join("honeypot").join(S2).exists());
+        let tl = f.e.store.timeline(&IncidentId(f.id.clone())).unwrap();
+        let ev = tl
+            .iter()
+            .find_map(|l| l.get("honeypot_session"))
+            .expect("a honeypot_session line");
+        assert_eq!(ev["session"], S1);
+        assert_eq!(ev["payloads"], 1);
+        assert!(
+            f.log()
+                .contains(&format!("honeypot_session {S1}: http to 1.2.3.4:80")),
+            "{}",
+            f.log()
+        );
+        assert_eq!(filed(&f), [1, 1, 0]);
+    }
+
+    #[test]
+    fn filing_grace_after_close() {
+        let (mut f, sp) = hp_spool("file-grace");
+        let fake = crate::spool::tests::fake;
+        observe(&mut f, &[10]);
+        let addr = f.e.observing[&f.id].addr;
+        if let Some(h) = f.e.honeypot.lock().unwrap().as_mut() {
+            h.window = Duration::ZERO;
+        }
+        f.e.run(EnforceJob::Reassert);
+        assert_eq!(last_act(&f).kind, "honeypot_close");
+        // Closed by the honeypot after the observation ended.
+        let late = fake(&sp, &addr.to_string(), S1, &[]);
+        f.e.run(EnforceJob::Reassert);
+        assert!(!late.exists());
+        assert_eq!(filed(&f), [1, 0, 0]);
+        // Not handed to another tree while its late sessions may come.
+        assert_ne!(f.e.plan("AEG-next").unwrap().1, addr);
+        // Past the grace, the address is anyone's and its sessions go.
+        let Some(long_ago) = std::time::Instant::now().checked_sub(Duration::from_secs(361)) else {
+            return;
+        };
+        f.e.closed.get_mut(&addr).unwrap().1 = long_ago;
+        let gone = fake(&sp, &addr.to_string(), S2, &[]);
+        f.e.run(EnforceJob::Reassert);
+        assert!(!gone.exists());
+        assert_eq!(filed(&f), [1, 1, 0]);
+        assert_eq!(f.e.plan("AEG-next").unwrap().1, addr);
+    }
+
+    #[test]
+    fn drop_mode_never_touches_the_spool() {
+        let (mut f, sp) = hp_spool("file-drop");
+        let s = crate::spool::tests::fake(&sp, "127.77.0.1", S1, &[]);
+        let hp = f.e.honeypot.lock().unwrap().take();
+        // Even with an address on record from before a reload to drop.
+        f.e.closed.insert(
+            "127.77.0.1".parse().unwrap(),
+            (f.id.clone(), std::time::Instant::now()),
+        );
+        f.e.run(EnforceJob::Reassert);
+        assert!(s.join("session.json").exists());
+        assert_eq!(filed(&f), [0, 0, 0]);
+        // The same spool in honeypot mode is filed: the test can see it.
+        *f.e.honeypot.lock().unwrap() = hp;
+        f.e.run(EnforceJob::Reassert);
+        assert!(!s.exists());
+        assert_eq!(filed(&f), [1, 0, 0]);
     }
 
     #[test]
@@ -3721,6 +3841,7 @@ mod tests {
     fn start_closes_observing_incidents() {
         let mut f = hp("hp-start", ok);
         observe(&mut f, &[10]);
+        let addr = f.e.observing[&f.id].addr;
         let unit = q_unit(&f.id);
         assert!(f.dir.join("observing").join(&unit).exists());
         // A new aegisd: nothing in memory, a fresh map.
@@ -3735,6 +3856,8 @@ mod tests {
         assert_eq!(kinds.iter().filter(|k| k.0 == "nft_remove").count(), 4);
         assert_eq!(last_act(&f).kind, "honeypot_close");
         assert_eq!(last_act(&f).detail.as_deref(), Some("aegisd restarted"));
+        // Its late sessions still file: the record says where it was.
+        assert_eq!(f.e.closed[&addr].0, f.id);
         assert_eq!(summary(&f).as_deref(), Some("quarantined"));
         assert!(!f.dir.join("observing").exists());
         // Run twice, nothing more.
