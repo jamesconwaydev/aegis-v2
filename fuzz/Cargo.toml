@@ -110,3 +110,10 @@ path = "fuzz_targets/smtp_command.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "spool_session"
+path = "fuzz_targets/spool_session.rs"
+test = false
+doc = false
+bench = false

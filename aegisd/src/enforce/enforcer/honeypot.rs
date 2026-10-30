@@ -6,10 +6,12 @@
 //! drop rule, the redirect rules and a listener are all in place. Any
 //! step that fails leaves it frozen, as in drop mode.
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -17,8 +19,10 @@ use super::{act, q_unit, Enforcer, QUARANTINE_SLICE};
 use crate::config::{Config, NetworkMode};
 use crate::enforce::nft::{Nft, NAT};
 use crate::enforce::systemd::Systemd;
-use crate::incident::ActionRecord;
+use crate::incident::{ActionRecord, IncidentId};
 use crate::proctable::ProcKey;
+use crate::spool;
+use crate::telemetry::unix_secs;
 
 /// One file per observed scope, named after it. The unit's
 /// ExecStopPost freezes what is listed here, and nothing else in the
@@ -50,6 +54,8 @@ pub struct Honeypot {
     pub max_incidents: u32,
     /// `quarantine.auto_expire_seconds`.
     pub window: Duration,
+    pub max_session_bytes: u64,
+    pub session_seconds: u64,
 }
 
 impl Honeypot {
@@ -61,7 +67,22 @@ impl Honeypot {
             max_tasks: c.honeypot.max_tasks,
             max_incidents: c.honeypot.max_incidents,
             window: Duration::from_secs(c.quarantine.auto_expire_seconds),
+            max_session_bytes: c.honeypot.max_session_bytes,
+            session_seconds: c.honeypot.session_seconds,
         })
+    }
+
+    /// How long sessions on an address still file into its incident
+    /// after the observation ends: one open then can run to its time
+    /// cap before the honeypot closes it, and filing waits for a tick.
+    pub fn grace(&self) -> Duration {
+        Duration::from_secs(self.session_seconds.saturating_add(60))
+    }
+
+    /// Whether an observation that closed at `t` is still in its grace.
+    /// A clock set back keeps it there longer, never shorter.
+    pub fn in_grace(&self, t: SystemTime) -> bool {
+        t.elapsed().unwrap_or_default() < self.grace()
     }
 }
 
@@ -121,6 +142,27 @@ pub fn pick_addr(open: &[Ipv4Addr]) -> Option<Ipv4Addr> {
         .find(|a| !open.contains(a))
 }
 
+/// The address the last `honeypot_open` recorded.
+fn open_addr(acts: &[ActionRecord]) -> Option<Ipv4Addr> {
+    acts.iter()
+        .rev()
+        .find(|a| a.ok && a.kind == "honeypot_open")?
+        .detail
+        .as_deref()?
+        .parse()
+        .ok()
+}
+
+/// When the last `honeypot_open` was recorded, in Unix ms. The record
+/// keeps whole seconds, so this is never later than the open itself.
+fn opened_ms(acts: &[ActionRecord]) -> u64 {
+    acts.iter()
+        .rev()
+        .find(|a| a.ok && a.kind == "honeypot_open")
+        .and_then(|a| unix_secs(&a.ts))
+        .map_or(0, |s| s.saturating_mul(1000))
+}
+
 /// One action per rule `Nft::redirect` added, in its order.
 fn redirect_acts(unit: &str, handles: Vec<u64>, why: Option<&str>) -> Vec<ActionRecord> {
     let kinds = ["nft_accept", "nft_accept", "nft_dnat", "nft_dnat"];
@@ -158,7 +200,19 @@ impl Enforcer {
             );
             return None;
         }
-        let taken: Vec<Ipv4Addr> = self.observing.values().map(|o| o.addr).collect();
+        // An address in its grace isn't reused: its late sessions must
+        // reach the incident that had it.
+        let taken: Vec<Ipv4Addr> = self
+            .observing
+            .values()
+            .map(|o| o.addr)
+            .chain(
+                self.closed
+                    .iter()
+                    .filter(|(_, (_, t))| hp.in_grace(*t))
+                    .map(|(a, _)| *a),
+            )
+            .collect();
         let addr = pick_addr(&taken);
         if addr.is_none() {
             eprintln!(
@@ -384,8 +438,17 @@ impl Enforcer {
     pub(super) fn unobserve(&mut self, id: &str, why: &str, keep: bool) -> Vec<ActionRecord> {
         let unit = q_unit(id);
         let mut acts = Vec::new();
-        // At start the record alone says it was observed.
-        let was = self.observing.remove(id).is_some() || super::observing(&self.actions(id));
+        // At start the record alone says it was observed, and where.
+        let (was, addr) = match self.observing.remove(id) {
+            Some(o) => (true, Some(o.addr)),
+            None => {
+                let rec = self.actions(id);
+                (super::observing(&rec), open_addr(&rec))
+            }
+        };
+        if let (true, Some(a)) = (was, addr) {
+            self.closed.insert(a, (id.into(), SystemTime::now()));
+        }
         // Also when the record no longer says observing: a marker kept
         // after a failed freeze must not outlive a release or kill.
         if !keep {
@@ -428,6 +491,86 @@ impl Enforcer {
             eprintln!("aegisd: {id}: {why}; frozen");
             let acts = self.close_observation(&id, why);
             self.finish(&id, acts, None);
+        }
+    }
+
+    /// Files the honeypot's finished sessions into the incidents whose
+    /// addresses they were on: observed now, or within their grace.
+    /// Nothing in drop mode, where the spool isn't even looked up.
+    pub(super) fn file_sessions(&mut self) {
+        let Some(hp) = *self.honeypot.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return;
+        };
+        self.closed.retain(|_, (_, t)| hp.in_grace(*t));
+        if !self.closed.is_empty() {
+            self.keep_local_rule();
+        }
+        let Some(dir) = self.spool.clone() else {
+            return;
+        };
+        let mut by_addr: HashMap<Ipv4Addr, String> = self
+            .closed
+            .iter()
+            .map(|(a, (id, _))| (*a, id.clone()))
+            .collect();
+        by_addr.extend(self.observing.iter().map(|(id, o)| (o.addr, id.clone())));
+        let lim = spool::Limits {
+            max_session_bytes: hp.max_session_bytes,
+            // Ruled: twice the time cap and a minute.
+            stale: Duration::from_secs(hp.session_seconds.saturating_mul(2).saturating_add(60)),
+        };
+        let targets: HashMap<Ipv4Addr, (String, std::path::PathBuf, u64)> = by_addr
+            .into_iter()
+            .filter_map(|(a, id)| {
+                let dir = self.store.dir_of(&IncidentId(id.clone()))?;
+                spool::tidy(&dir);
+                let opened = opened_ms(&self.actions(&id));
+                Some((a, (id, dir, opened)))
+            })
+            .collect();
+        let find = |a: Ipv4Addr| targets.get(&a).cloned();
+        let r = match spool::sweep(&dir, lim, &find) {
+            Ok(r) => r,
+            Err(e) => return eprintln!("aegisd: honeypot spool {}: {e}", dir.display()),
+        };
+        let c = &self.filing;
+        c.filed.fetch_add(r.filed.len() as u64, Ordering::Relaxed);
+        c.unmatched.fetch_add(r.unmatched, Ordering::Relaxed);
+        c.rejected.fetch_add(r.rejected, Ordering::Relaxed);
+        if r.rejected > 0 {
+            eprintln!(
+                "aegisd: honeypot spool: {} sessions rejected and deleted, first {}",
+                r.rejected,
+                r.why.unwrap_or_default()
+            );
+        }
+        if r.unmatched > 0 {
+            eprintln!(
+                "aegisd: honeypot spool: {} sessions for no observed address deleted",
+                r.unmatched
+            );
+        }
+        if r.stale > 0 {
+            eprintln!(
+                "aegisd: honeypot spool: {} unfinished sessions a stopped honeypot left deleted",
+                r.stale
+            );
+        }
+        if let Some(e) = &r.io {
+            eprintln!("aegisd: honeypot spool: filing stopped for this tick, {e}");
+        }
+        for (id, s) in r.filed {
+            let iid = IncidentId(id.clone());
+            if let Err(e) = self
+                .store
+                .add_event(&iid, "honeypot_session", spool::event(&s))
+            {
+                eprintln!(
+                    "aegisd: {id}: honeypot session {} filed, not on the timeline: {e:#}",
+                    s.id
+                );
+            }
+            self.report(&id, spool::reason(&s));
         }
     }
 
@@ -497,6 +640,7 @@ impl Enforcer {
     /// ExecStopPost froze the tree; this records that and frees the
     /// address and rules.
     pub fn close_observing(&mut self) {
+        self.regrace();
         let ids: Vec<String> = self
             .store
             .list()
@@ -510,6 +654,52 @@ impl Enforcer {
         }
         if let Some(d) = &self.marks {
             let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Puts back the rule keeping everyone but observed trees off the
+    /// honeypot addresses, if a flush took it while nothing is observed
+    /// (`restore_redirects` does it while something is): late sessions
+    /// on an address in its grace still file.
+    fn keep_local_rule(&self) {
+        let r = self.nft.list().and_then(|l| match l {
+            Some(l) if Nft::has_local_rule(&l) => Ok(()),
+            Some(_) => self.nft.ensure_nat(),
+            None => self.nft.ensure_table().and_then(|()| self.nft.ensure_nat()),
+        });
+        if let Err(e) = r {
+            eprintln!("aegisd: putting back the honeypot address rule: {e:#}");
+        }
+    }
+
+    /// At start: puts back the grace of each address whose observation
+    /// ended lately, from the record, so it isn't handed to a new tree
+    /// while its late sessions may still come; and removes what a crash
+    /// mid-filing left. Honeypot mode only.
+    fn regrace(&mut self) {
+        let Some(hp) = *self.honeypot.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return;
+        };
+        for s in self.store.list() {
+            if let Some(d) = self.store.dir_of(&IncidentId(s.id.clone())) {
+                spool::tidy(&d);
+            }
+            let acts = self.actions(&s.id);
+            let last = acts
+                .iter()
+                .rev()
+                .find(|a| a.ok && matches!(a.kind.as_str(), "honeypot_open" | "honeypot_close"));
+            let Some(close) = last.filter(|a| a.kind == "honeypot_close") else {
+                continue;
+            };
+            let (Some(addr), Some(secs)) = (open_addr(&acts), unix_secs(&close.ts)) else {
+                continue;
+            };
+            // A clock set back must not stretch the grace past its length.
+            let t = (SystemTime::UNIX_EPOCH + Duration::from_secs(secs)).min(SystemTime::now());
+            if hp.in_grace(t) {
+                self.closed.insert(addr, (s.id, t));
+            }
         }
     }
 

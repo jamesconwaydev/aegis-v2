@@ -14,5 +14,6 @@ pub mod ipc;
 pub mod pipeline;
 pub mod proctable;
 pub mod scoring;
+pub mod spool;
 pub mod telemetry;
 pub mod verify;

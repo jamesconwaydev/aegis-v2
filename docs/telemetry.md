@@ -232,6 +232,10 @@ are the value at that moment.
 - `aegis.incidents.open` (gauge): incidents currently open.
 - `aegis.incidents` (gauge): open incidents, with a `verdict` attribute
   such as `would_throttle`.
+- `aegis.honeypot.sessions` (sum): honeypot sessions, with a `result`
+  attribute: `filed` into their incident, `unmatched` (no incident had
+  the address) or `rejected` (the spool entry failed a check). Both of
+  the last two are deleted. It only appears once there's been one.
 
 ## Webhooks
 

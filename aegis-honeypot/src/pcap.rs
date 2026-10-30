@@ -30,6 +30,8 @@ pub const MAX_DATAGRAM: usize = 65535 - 28;
 /// The file header, the handshake and the close: the same in every
 /// session, and not charged to its cap.
 pub const FIXED_COST: u64 = 24 + 6 * SEGMENT_COST;
+// aegisd sizes what it files by this; the two must not drift apart.
+const _: () = assert!(FIXED_COST == aegis_proto::honeypot::PCAP_FIXED);
 
 pub struct Pcap {
     f: File,

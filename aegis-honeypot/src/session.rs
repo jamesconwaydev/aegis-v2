@@ -50,6 +50,32 @@ fn session_id() -> String {
     format!("{}-{:08x}", now_ms(), u32::from_ne_bytes(r))
 }
 
+/// A spool directory, made if missing: 0770 whatever the umask, so
+/// aegisd, in this user's group, can delete what it has filed.
+/// Its parent is made too, for a run without systemd's StateDirectory.
+pub fn shared_dir(p: &Path) -> io::Result<()> {
+    let make = || DirBuilder::new().mode(0o770).create(p);
+    let r = match make() {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Some(up) = p.parent() {
+                DirBuilder::new().recursive(true).mode(0o750).create(up)?;
+            }
+            make()
+        }
+        r => r,
+    };
+    match r {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    set_shared(p)
+}
+
+fn set_shared(p: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o770))
+}
+
 /// A new file the honeypot user can write and aegisd's group can read.
 fn create(path: &Path) -> io::Result<File> {
     OpenOptions::new()
@@ -197,13 +223,12 @@ impl Session {
             return Ok(None);
         }
         let base = spool.join(addr.to_string());
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o750)
-            .create(base.join("done"))?;
+        shared_dir(&base)?;
+        shared_dir(&base.join("done"))?;
         let id = session_id();
         let dir = base.join(&id);
-        DirBuilder::new().mode(0o750).create(&dir)?;
+        DirBuilder::new().mode(0o770).create(&dir)?;
+        set_shared(&dir)?;
         let mut pcap = Pcap::new(create(&dir.join("stream.pcap"))?, src, dst)?;
         if transport == Transport::Tcp {
             pcap.syn()?;
@@ -491,11 +516,21 @@ pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn a_spool_root_is_made_with_its_parent() {
+        let base = std::env::temp_dir().join(format!("aegis-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sp = base.join("state").join("spool");
+        shared_dir(&sp).unwrap();
+        assert_eq!(mode(&sp), 0o770);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// An empty spool root, as main creates it at start.
     pub fn spool(name: &str) -> PathBuf {
         let r = std::env::temp_dir().join(format!("aegis-spool-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&r);
-        DirBuilder::new().mode(0o750).create(&r).unwrap();
+        shared_dir(&r).unwrap();
         r
     }
 
@@ -573,8 +608,9 @@ pub(crate) mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["session.json", "stream.pcap"]);
+        // Group-writable, umask or not: aegisd deletes in them.
         for d in [&sp, &addr, &addr.join("done"), &done] {
-            assert_eq!(mode(d), 0o750, "{}", d.display());
+            assert_eq!(mode(d), 0o770, "{}", d.display());
         }
         for n in &names {
             assert_eq!(mode(&done.join(n)), 0o640, "{n}");

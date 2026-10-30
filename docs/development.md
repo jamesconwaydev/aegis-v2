@@ -303,6 +303,7 @@ whatever bytes it's handed:
 | `scp_sink` | a honeypot scp upload into the sink, whole and in two |
 | `sftp_packet` | honeypot SFTP packets into the server, whole and in two |
 | `smtp_command` | honeypot SMTP lines and AUTH answers; the end of a message |
+| `spool_session` | a `session.json` from the honeypot's spool into `parse` |
 
 The fuzz crate sits outside the workspace, because cargo-fuzz needs
 nightly. Its `rust-toolchain.toml` pins the same nightly the image

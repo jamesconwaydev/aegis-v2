@@ -87,6 +87,11 @@ pub enum Protocol {
     Raw,
 }
 
+/// What a TCP session's pcap holds beyond its cap: the file header, the
+/// handshake and the close (six segments of 56 bytes). aegisd refuses a
+/// session whose files outgrow the cap by more.
+pub const PCAP_FIXED: u64 = 24 + 6 * (16 + 20 + 20);
+
 /// `spool/<addr>/done/<id>/session.json`. Written by the honeypot when a
 /// session closes; aegisd reads it through a size cap and nothing else.
 ///
