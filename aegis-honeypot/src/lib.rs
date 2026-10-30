@@ -7,3 +7,5 @@
 
 pub mod dispatch;
 pub mod dns;
+pub mod hello;
+pub mod http;

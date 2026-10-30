@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aegis_proto::honeypot::{self, DnsQuery, Protocol};
+use aegis_proto::honeypot::{self, DnsQuery, HttpRequest, Protocol};
 use sha2::{Digest, Sha256};
 
 use crate::pcap::{Pcap, DATAGRAM_COST, MAX_DATAGRAM, SEGMENT, SEGMENT_COST};
@@ -55,6 +55,13 @@ const MAX_PAYLOADS: usize = 256;
 /// DNS questions one session records. Even at the longest a name can
 /// be written out, 32 keep `session.json` under aegisd's 64 KiB read.
 const MAX_QUERIES: usize = 32;
+
+/// HTTP requests one session records, and the most `session.json` may
+/// be once they're in. Header values are as long as the client likes,
+/// so the size is what's bounded; the count bounds the work of checking
+/// it. What's left of aegisd's 64 KiB read holds 256 payload hashes.
+const MAX_REQUESTS: usize = 64;
+const REQUESTS_JSON: usize = 40 * 1024;
 
 /// How a session's bytes are framed in its pcap.
 #[derive(Clone, Copy, PartialEq)]
@@ -167,6 +174,9 @@ impl Session {
                 payloads: Vec::new(),
                 dns_name: None,
                 queries: Vec::new(),
+                sni: None,
+                ja4: None,
+                requests: Vec::new(),
             },
             dir,
             pcap,
@@ -235,11 +245,30 @@ impl Session {
         }
     }
 
+    /// Adds one HTTP request to the record, while the record stays
+    /// under `REQUESTS_JSON` and `MAX_REQUESTS`; past either, only
+    /// `truncated` says there were more.
+    pub fn request(&mut self, r: HttpRequest) {
+        if self.rec.requests.len() < MAX_REQUESTS {
+            self.rec.requests.push(r);
+            let size = serde_json::to_vec_pretty(&self.rec).map_or(usize::MAX, |j| j.len());
+            if size <= REQUESTS_JSON {
+                return;
+            }
+            self.rec.requests.pop();
+        }
+        self.rec.truncated = true;
+    }
+
+    /// What the cap has left for more bytes or payloads.
+    pub fn room(&self) -> u64 {
+        self.cap - self.used
+    }
+
     /// Keeps `data` as a payload file named by its SHA-256, once, and
     /// charges it to the cap. None, and `truncated`, when it doesn't fit
     /// or the session already holds `MAX_PAYLOADS`. Protocol handlers
     /// store bodies, mail and uploads this way.
-    #[allow(dead_code)]
     pub fn payload(&mut self, data: &[u8]) -> io::Result<Option<String>> {
         let d: [u8; 32] = Sha256::digest(data).into();
         let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
@@ -627,6 +656,53 @@ pub(crate) mod tests {
         let done = s.close().unwrap();
         let json = std::fs::metadata(done.join("session.json")).unwrap().len();
         assert!(json < 64 * 1024, "{json}");
+        std::fs::remove_dir_all(sp).unwrap();
+    }
+
+    #[test]
+    fn requests_stop_before_the_record_outgrows_what_aegisd_reads() {
+        let sp = spool("requests");
+        let mut s = open(&sp, 1 << 30);
+        // The worst a client can do: an 8 KiB head of bytes that are
+        // each recorded as U+FFFD, three bytes of JSON apiece.
+        let nasty = "\u{fffd}".repeat(75);
+        let r = HttpRequest {
+            method: "GET".into(),
+            path: nasty.clone(),
+            headers: vec![format!("X: {nasty}"); crate::http::MAX_HEADERS],
+            body: None,
+        };
+        s.request(r.clone());
+        assert_eq!(s.rec.requests.len(), 1);
+        assert!(!s.rec.truncated);
+        while !s.rec.truncated {
+            s.request(r.clone());
+            assert!(s.rec.requests.len() <= MAX_REQUESTS);
+        }
+        // Many small ones stop at the count.
+        let mut t = open(&sp, 1 << 30);
+        let small = HttpRequest {
+            headers: vec![],
+            path: "/".into(),
+            ..r
+        };
+        for _ in 0..MAX_REQUESTS {
+            t.request(small.clone());
+        }
+        assert!(!t.rec.truncated);
+        t.request(small);
+        assert!(t.rec.truncated);
+        assert_eq!(t.rec.requests.len(), MAX_REQUESTS);
+        // With the rest of the record at its worst too, it still fits.
+        s.rec.dns_name = Some("\\377".repeat(250));
+        s.rec.sni = Some("\u{fffd}".repeat(255));
+        for i in 0..MAX_PAYLOADS as u32 {
+            s.payload(&i.to_be_bytes()).unwrap();
+        }
+        let done = s.close().unwrap();
+        let json = std::fs::metadata(done.join("session.json")).unwrap().len();
+        assert!(json < 64 * 1024, "{json}");
+        t.close().unwrap();
         std::fs::remove_dir_all(sp).unwrap();
     }
 

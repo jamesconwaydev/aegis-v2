@@ -123,6 +123,29 @@ pub struct Session {
     /// Each DNS question asked in this session and what it was told; at
     /// most 32.
     pub queries: Vec<DnsQuery>,
+    /// The server name a TLS client asked for. Printable text: bytes
+    /// that aren't valid UTF-8, and control characters, are U+FFFD.
+    pub sni: Option<String>,
+    /// The client's JA4 TLS fingerprint (FoxIO), from its ClientHello,
+    /// whether or not the handshake went on to complete.
+    pub ja4: Option<String>,
+    /// Each HTTP request, in order. The honeypot stops adding them before
+    /// this record reaches 40 KiB, and sets `truncated`.
+    pub requests: Vec<HttpRequest>,
+}
+
+/// One HTTP request as the client sent it, as printable text (see `sni`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRequest {
+    pub method: String,
+    /// The request target, query string included.
+    pub path: String,
+    /// `Name: value`, in the order sent.
+    pub headers: Vec<String>,
+    /// SHA-256 (hex) of the body, one of `payloads`; None when there was
+    /// no body or it couldn't be kept.
+    pub body: Option<String>,
 }
 
 /// One DNS question and its answer.
@@ -162,6 +185,14 @@ mod tests {
                 qtype: "A".into(),
                 answer: Some(Ipv4Addr::new(198, 18, 0, 1)),
             }],
+            sni: Some("c2.example".into()),
+            ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".into()),
+            requests: vec![HttpRequest {
+                method: "GET".into(),
+                path: "/x".into(),
+                headers: vec!["Host: c2.example".into()],
+                body: None,
+            }],
         }
     }
 
@@ -172,6 +203,7 @@ mod tests {
         assert!(j.contains("\"protocol\":\"raw\""), "{j}");
         assert!(j.contains("\"dst\":\"1.2.3.4:6667\""), "{j}");
         assert!(j.contains("\"answer\":\"198.18.0.1\""), "{j}");
+        assert!(j.contains("\"headers\":[\"Host: c2.example\"]"), "{j}");
         assert_eq!(serde_json::from_str::<Session>(&j).unwrap(), s);
     }
 
