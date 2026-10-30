@@ -1,0 +1,1 @@
+uname -a; id && cat /etc/os-release | head -1

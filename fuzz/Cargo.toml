@@ -82,3 +82,24 @@ path = "fuzz_targets/http_head.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "shell_split"
+path = "fuzz_targets/shell_split.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scp_sink"
+path = "fuzz_targets/scp_sink.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sftp_packet"
+path = "fuzz_targets/sftp_packet.rs"
+test = false
+doc = false
+bench = false

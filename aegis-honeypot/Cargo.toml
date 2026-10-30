@@ -14,6 +14,7 @@ anyhow = { workspace = true, features = ["std"] }
 libc = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+russh = { version = "0.65", default-features = false, features = ["ring"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

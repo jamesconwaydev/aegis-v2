@@ -17,7 +17,7 @@ use crate::dispatch::{by_bytes, partial_method};
 use crate::hello::{self, Parsed as HelloParsed};
 use crate::http::{self, Body, Head, Parsed};
 use crate::serve::Handler;
-use crate::session::Session;
+use crate::session::{Held, Session, MAX_HELD};
 
 /// One read's worth.
 const CHUNK: usize = 16 * 1024;
@@ -44,40 +44,6 @@ fn answer(status: &str, kind: &str, body: &[u8], close: bool, head_only: bool) -
         out.extend_from_slice(body);
     }
     out
-}
-
-/// The most of one body held in memory, and so kept as its payload.
-const MAX_HELD: usize = 256 * 1024;
-
-/// The start of a body, up to its limit; never more in memory.
-struct Held {
-    data: Vec<u8>,
-    limit: usize,
-    /// More came than was kept.
-    cut: bool,
-}
-
-impl Held {
-    fn new(limit: usize) -> Self {
-        Self {
-            data: Vec::new(),
-            limit,
-            cut: false,
-        }
-    }
-
-    fn keep(&mut self, b: &[u8]) {
-        let len = self.data.len();
-        let n = b.len().min(self.limit - len);
-        // Double, as Vec would, so a drip doesn't reallocate per byte,
-        // but never past the limit.
-        if self.data.capacity() - len < n {
-            self.data
-                .reserve_exact((len + n).max(len * 2).min(self.limit) - len);
-        }
-        self.data.extend_from_slice(&b[..n]);
-        self.cut |= n < b.len();
-    }
 }
 
 /// `t` as an HTTP Date (RFC 9110 5.6.7).

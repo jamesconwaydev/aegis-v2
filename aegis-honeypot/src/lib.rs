@@ -9,3 +9,5 @@ pub mod dispatch;
 pub mod dns;
 pub mod hello;
 pub mod http;
+pub mod shell;
+pub mod upload;

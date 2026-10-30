@@ -21,6 +21,7 @@ use crate::dispatch::{by_bytes, by_port, PEEK};
 use crate::dns::{self, Names};
 use crate::pcap::FIXED_COST;
 use crate::session::{Conn, Floor, Session, Slots, Transport};
+use crate::ssh::Ssh;
 use crate::web::{Http, Https};
 
 /// How long a client on an unknown port gets to speak first. A client
@@ -97,6 +98,7 @@ pub struct Server {
     pub names: RefCell<Names>,
     /// HTTPS, with a leaf from the host's CA for each name asked.
     pub tls: Arc<ServerConfig>,
+    pub ssh: Ssh,
 }
 
 impl Server {
@@ -126,13 +128,19 @@ pub fn incident_addr(ip: Ipv4Addr) -> bool {
     ip.octets()[..2] == [127, 77]
 }
 
-/// How plenty of clients say goodbye, or fail TLS (scanners, clients
-/// that won't trust the cert); not worth a log line each.
+/// How plenty of clients say goodbye, or fail TLS or SSH (scanners,
+/// clients that won't trust the cert); not worth a log line each. An
+/// I/O error russh passes on is judged as the I/O error it is.
 fn quiet(e: &anyhow::Error) -> bool {
     use std::io::ErrorKind::{BrokenPipe, ConnectionReset, UnexpectedEof};
+    let ssh = e.downcast_ref::<russh::Error>();
+    let io = match ssh {
+        Some(russh::Error::IO(e)) => Some(e),
+        _ => e.downcast_ref::<std::io::Error>(),
+    };
     e.downcast_ref::<rustls::Error>().is_some()
-        || e.downcast_ref::<std::io::Error>()
-            .is_some_and(|e| matches!(e.kind(), ConnectionReset | BrokenPipe | UnexpectedEof))
+        || ssh.is_some_and(|e| !matches!(e, russh::Error::IO(_)))
+        || io.is_some_and(|e| matches!(e.kind(), ConnectionReset | BrokenPipe | UnexpectedEof))
 }
 
 /// Where the tree was connecting before the redirect. None when the
@@ -224,6 +232,11 @@ async fn run(
         .label(addr, *dst.ip(), std::time::Instant::now());
     // The rest are answered as catch-all until their own handlers land.
     let served = match protocol {
+        Protocol::Ssh => {
+            let served;
+            (s, served) = srv.ssh.serve(s, io, srv.max_time).await;
+            served
+        }
         Protocol::Dns => timeout(srv.max_time, Dns(&srv.names).serve(&mut s, io)).await,
         Protocol::Http => timeout(srv.max_time, Http.serve(&mut s, io)).await,
         Protocol::Https => timeout(srv.max_time, Https(&srv.tls).serve(&mut s, io)).await,
@@ -290,6 +303,7 @@ pub(crate) mod tests {
             udp_slots: crate::udp::slots(),
             names: RefCell::default(),
             tls,
+            ssh: crate::ssh::tests::ssh(name),
         });
         (srv, ca)
     }
@@ -311,7 +325,11 @@ pub(crate) mod tests {
 
     /// Runs `client` against one handled connection to an incident
     /// address, and returns the filed session.
-    async fn one<F, Fut>(srv: &Rc<Server>, forced: Option<Protocol>, client: F) -> honeypot::Session
+    pub async fn one<F, Fut>(
+        srv: &Rc<Server>,
+        forced: Option<Protocol>,
+        client: F,
+    ) -> honeypot::Session
     where
         F: FnOnce(TcpStream) -> Fut,
         Fut: Future<Output = ()>,
@@ -394,7 +412,15 @@ pub(crate) mod tests {
             assert!(quiet(&Error::from(k).into()), "{k:?}");
         }
         assert!(quiet(&rustls::Error::NoCertificatesPresented.into()));
+        assert!(quiet(&russh::Error::Disconnect.into()));
+        assert!(quiet(
+            &russh::Error::IO(ErrorKind::ConnectionReset.into()).into()
+        ));
         assert!(!quiet(&Error::from(ErrorKind::PermissionDenied).into()));
+        // A full disk under the SSH session is still worth a line.
+        assert!(!quiet(
+            &russh::Error::IO(ErrorKind::StorageFull.into()).into()
+        ));
         assert!(!quiet(&anyhow::anyhow!("disk full")));
     }
 
@@ -511,6 +537,7 @@ pub(crate) mod tests {
             udp_slots: crate::udp::slots(),
             names: RefCell::default(),
             tls: crate::ca::tests::tls("hreserve").0,
+            ssh: crate::ssh::tests::ssh("hreserve"),
         });
         let other = srv.slots.take(Ipv4Addr::new(127, 77, 0, 9)).unwrap();
         refused(&srv, INCIDENT).await;

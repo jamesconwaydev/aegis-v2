@@ -299,6 +299,9 @@ whatever bytes it's handed:
 | `dns_message` | a honeypot DNS message into `answer`, asked twice |
 | `client_hello` | a honeypot TLS hello into the hello parser and JA4 |
 | `http_head` | a honeypot HTTP request into `head` and `chunk_size` |
+| `shell_split` | a line typed at the honeypot shell into `split` and `run` |
+| `scp_sink` | a honeypot scp upload into the sink, whole and in two |
+| `sftp_packet` | honeypot SFTP packets into the server, whole and in two |
 
 The fuzz crate sits outside the workspace, because cargo-fuzz needs
 nightly. Its `rust-toolchain.toml` pins the same nightly the image
