@@ -598,6 +598,9 @@ fn answer_disk(req: Request, store: &IncidentStore) -> Response {
             if let Some(dir) = store.dir_of(&id) {
                 filed::add_show(&mut v, &dir);
             }
+            if cap_reached(store, &id) {
+                v["honeypot_cap_reached"] = true.into();
+            }
             Response::Incident(v)
         }
         Request::IncidentTimeline { id } => store
@@ -606,16 +609,23 @@ fn answer_disk(req: Request, store: &IncidentStore) -> Response {
         Request::IncidentStix { id } => {
             let id = IncidentId(id);
             match (store.get(&id), store.dir_of(&id)) {
-                (Some(inc), Some(dir)) => Response::Stix(stix::bundle(
-                    &inc,
-                    &filed::sessions(&dir),
-                    &telemetry::hostname(),
-                )),
+                (Some(inc), Some(dir)) => {
+                    let mut b = stix::Bundle::new(&inc, &telemetry::hostname());
+                    let unread = filed::each(&dir, |s| b.session(&s));
+                    Response::Stix(b.finish(unread, cap_reached(store, &id)))
+                }
                 _ => missing(),
             }
         }
         _ => Response::Error("internal: wrong handler".into()),
     }
+}
+
+/// Whether filing stopped at its cap for this incident.
+fn cap_reached(store: &IncidentStore, id: &IncidentId) -> bool {
+    store
+        .timeline(id)
+        .is_some_and(|t| t.iter().any(|l| l.get("honeypot_cap_reached").is_some()))
 }
 
 /// `IncidentPcap`: the reply line and the merged pcap to stream after it.
@@ -628,11 +638,12 @@ fn answer_pcap(req: Request, store: &IncidentStore) -> (Response, Option<ipc::Bo
         return (Response::Error("no such incident".into()), None);
     };
     match filed::pcap(&dir) {
-        Ok(m) => (
+        Ok(mut m) => (
             Response::Pcap {
                 bytes: m.bytes,
                 sessions: m.sessions,
                 left_out: m.left_out,
+                notes: std::mem::take(&mut m.notes),
             },
             Some((m.bytes, Box::new(m))),
         ),
@@ -827,7 +838,8 @@ mod tests {
             Response::Pcap {
                 bytes: p.len() as u64,
                 sessions: 1,
-                left_out: 0
+                left_out: 0,
+                notes: vec![],
             }
         );
         let mut out = Vec::new();
@@ -835,5 +847,28 @@ mod tests {
         assert_eq!(out, p);
         let Response::Stix(b) = stix() else { panic!() };
         assert!(b.to_string().contains("network-traffic--"));
+        assert!(v.get("honeypot_cap_reached").is_none());
+        assert!(!b.to_string().contains("x_aegis_truncated"));
+
+        // Filing stopped at its cap: both say so.
+        std::fs::write(
+            inc.join("timeline.jsonl"),
+            "{\"ts\":\"t\",\"honeypot_cap_reached\":{\"sessions\":4096}}\n",
+        )
+        .unwrap();
+        let Response::Incident(v) = show() else {
+            panic!()
+        };
+        assert_eq!(v["honeypot_cap_reached"], true);
+        let Response::Stix(b) = stix() else { panic!() };
+        let od = b["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["type"] == "observed-data")
+            .unwrap()
+            .clone();
+        assert_eq!(od["x_aegis_truncated"], true);
+        assert!(od["x_aegis_note"].as_str().unwrap().contains("4096"));
     }
 }

@@ -85,6 +85,8 @@ pub struct Swept {
     pub why: Option<String>,
     /// Unfinished session dirs deleted.
     pub stale: u64,
+    /// Incidents that refused a session for being full, once each.
+    pub capped: Vec<String>,
     /// An error on the incident side that stopped the walk early.
     pub io: Option<io::Error>,
 }
@@ -613,6 +615,9 @@ impl Walk {
             })
         });
         if held >= self.lim.max_filed {
+            if !self.out.capped.contains(&inc) {
+                self.out.capped.push(inc.clone());
+            }
             return bad(format!(
                 "the incident already holds {} sessions",
                 self.lim.max_filed
@@ -1339,6 +1344,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!((r.filed.len(), r.rejected), (2, 1), "{r:?}");
         assert!(r.why.unwrap().contains("holds 2 sessions"));
+        assert_eq!(r.capped, [INC]);
         assert!(!filed(&t, ids[2]).exists());
         assert!(fs::read_dir(t.spool().join(ADDR).join("done"))
             .unwrap()

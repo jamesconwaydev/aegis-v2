@@ -538,6 +538,24 @@ impl Enforcer {
         c.filed.fetch_add(r.filed.len() as u64, Ordering::Relaxed);
         c.unmatched.fetch_add(r.unmatched, Ordering::Relaxed);
         c.rejected.fetch_add(r.rejected, Ordering::Relaxed);
+        // Once per incident, restarts included: the timeline says so.
+        for id in &r.capped {
+            let iid = IncidentId(id.clone());
+            let noted = self
+                .store
+                .timeline(&iid)
+                .is_some_and(|t| t.iter().any(|l| l.get("honeypot_cap_reached").is_some()));
+            if !noted {
+                let ev = serde_json::json!({ "sessions": spool::MAX_FILED });
+                if let Err(e) = self.store.add_event(&iid, "honeypot_cap_reached", ev) {
+                    eprintln!("aegisd: {id}: recording the filing cap: {e:#}");
+                }
+                eprintln!(
+                    "aegisd: {id}: {} honeypot sessions filed; later ones are deleted",
+                    spool::MAX_FILED
+                );
+            }
+        }
         if r.rejected > 0 {
             eprintln!(
                 "aegisd: honeypot spool: {} sessions rejected and deleted, first {}",

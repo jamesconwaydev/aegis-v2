@@ -101,11 +101,14 @@ pub enum Response {
     Done(String),
     /// The answer to `IncidentPcap`: exactly `bytes` bytes of pcap follow
     /// this line on the socket, then the next reply. `sessions` were
-    /// merged; `left_out` more didn't fit under the size cap.
+    /// merged and `left_out` were not; `notes` says why, one reason a
+    /// line.
     Pcap {
         bytes: u64,
         sessions: u64,
         left_out: u64,
+        #[serde(default)]
+        notes: Vec<String>,
     },
     /// The answer to `IncidentStix`.
     Stix(Value),
@@ -196,6 +199,19 @@ fn unsafe_char(c: char) -> bool {
                 | '\u{2028}'..='\u{202e}'
                 | '\u{2060}'..='\u{2069}'
                 | '\u{feff}'
+                // Soft hyphen, Mongolian and other variation selectors,
+                // interlinear annotation and tags: all print as nothing.
+                | '\u{ad}'
+                | '\u{180b}'..='\u{180d}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e007f}'
+                | '\u{e0100}'..='\u{e01ef}'
+                // Hangul fillers, blank but not whitespace.
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{3164}'
+                | '\u{ffa0}'
         )
 }
 
@@ -207,8 +223,11 @@ pub fn clean_json(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
         if c != '\n' && unsafe_char(c) {
-            // All of them are in the BMP, so one escape each.
-            o += &format!("\\u{:04x}", c as u32);
+            // JSON escapes UTF-16 units: one in the BMP, a pair past it.
+            let mut u = [0u16; 2];
+            for unit in c.encode_utf16(&mut u) {
+                o += &format!("\\u{unit:04x}");
+            }
         } else {
             o.push(c);
         }
@@ -270,10 +289,19 @@ mod tests {
             bytes: 24,
             sessions: 2,
             left_out: 1,
+            notes: vec!["1 newer session past the cap".into()],
         };
         let line = serde_json::to_string(&head).unwrap();
-        assert_eq!(line, r#"{"Pcap":{"bytes":24,"sessions":2,"left_out":1}}"#);
+        assert_eq!(
+            line,
+            r#"{"Pcap":{"bytes":24,"sessions":2,"left_out":1,"notes":["1 newer session past the cap"]}}"#
+        );
         assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), head);
+        let bare = r#"{"Pcap":{"bytes":24,"sessions":2,"left_out":0}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Response>(bare).unwrap(),
+            Response::Pcap { notes, .. } if notes.is_empty()
+        ));
         let line = serde_json::to_string(&Response::Stix(serde_json::json!({"type": "bundle"})));
         assert_eq!(line.unwrap(), r#"{"Stix":{"type":"bundle"}}"#);
     }
@@ -294,6 +322,39 @@ mod tests {
         );
         assert!(out.contains('ü'));
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), v);
+    }
+
+    #[test]
+    fn hidden_marks_are_escaped_and_non_bmp_becomes_a_surrogate_pair() {
+        for c in [
+            '\u{e0041}',
+            '\u{e007f}',
+            '\u{e0000}',
+            '\u{fff9}',
+            '\u{fffb}',
+            '\u{ad}',
+            '\u{180b}',
+            '\u{180d}',
+            '\u{fe00}',
+            '\u{fe0f}',
+            '\u{e0100}',
+            '\u{e01ef}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{ffa0}',
+        ] {
+            let want = match c as u32 {
+                n @ ..0x100 => format!("\\x{n:02x}"),
+                n => format!("\\u{{{n:x}}}"),
+            };
+            assert_eq!(clean(&c.to_string()), want);
+        }
+        let v = serde_json::json!({"k": "a\u{e0041}b\u{fe0f}"});
+        let out = clean_json(&serde_json::to_string(&v).unwrap());
+        assert_eq!(out, r#"{"k":"a\udb40\udc41b\ufe0f"}"#);
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), v);
+        assert_eq!(clean("emoji \u{1f600} stays"), "emoji \u{1f600} stays");
     }
 
     #[test]

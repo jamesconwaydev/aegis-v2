@@ -36,6 +36,8 @@ pub type Body = (u64, Box<dyn Read + Send>);
 /// reading its replies.
 const IDLE: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 16;
+/// Pcap exports at once: each holds an index of up to about 24 MiB.
+const MAX_EXPORTS: usize = 2;
 
 /// Binds `path`, mode 0600, holding a lock that keeps a second aegisd
 /// out. The returned `File` owns that lock: keep it for the daemon's
@@ -121,6 +123,7 @@ pub async fn serve(
     streams: Streamer,
 ) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let exports = Arc::new(Semaphore::new(MAX_EXPORTS));
     loop {
         let mut s = match listener.accept().await {
             Ok((s, _)) => s,
@@ -136,9 +139,10 @@ pub async fn serve(
         };
         let calls = calls.clone();
         let streams = streams.clone();
+        let exports = exports.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            let _ = connection(s, calls, allowed_uid, streams).await;
+            let _ = connection(s, calls, allowed_uid, streams, exports).await;
         });
     }
 }
@@ -205,6 +209,7 @@ async fn connection(
     calls: mpsc::Sender<Call>,
     allowed_uid: u32,
     streams: Streamer,
+    exports: Arc<Semaphore>,
 ) -> std::io::Result<()> {
     if s.peer_cred()?.uid() != allowed_uid {
         return reply(&mut s, &err("permission denied")).await;
@@ -236,6 +241,12 @@ async fn connection(
         }
         let resp = match serde_json::from_slice::<Request>(&line) {
             Ok(req @ Request::IncidentPcap { .. }) => {
+                // Held from the index the opener builds to the last byte.
+                let Ok(_export) = exports.clone().try_acquire_owned() else {
+                    let busy = format!("busy: {MAX_EXPORTS} pcap exports are running; try again");
+                    reply(&mut wr, &err(&busy)).await?;
+                    continue;
+                };
                 let f = streams.clone();
                 let (resp, body) = tokio::task::spawn_blocking(move || f(req))
                     .await
@@ -457,6 +468,7 @@ mod tests {
                         bytes: N,
                         sessions: 1,
                         left_out: 0,
+                        notes: vec![],
                     },
                     Some((
                         N,
@@ -469,6 +481,7 @@ mod tests {
                         bytes: N,
                         sessions: 1,
                         left_out: 0,
+                        notes: vec![],
                     },
                     Some((
                         N,
@@ -486,7 +499,7 @@ mod tests {
         r.read_line(&mut head).await.unwrap();
         assert_eq!(
             head,
-            "{\"Pcap\":{\"bytes\":300000,\"sessions\":1,\"left_out\":0}}\n"
+            "{\"Pcap\":{\"bytes\":300000,\"sessions\":1,\"left_out\":0,\"notes\":[]}}\n"
         );
         let mut body = vec![0u8; N as usize];
         r.read_exact(&mut body).await.unwrap();
@@ -505,6 +518,146 @@ mod tests {
         let mut rest = Vec::new();
         let _ = r.read_to_end(&mut rest).await;
         assert_eq!(rest.len(), 1000);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    use std::sync::atomic::AtomicBool;
+    static GATE: AtomicBool = AtomicBool::new(false);
+    static GATE2: AtomicBool = AtomicBool::new(false);
+
+    /// `n` bytes of 7, once its gate opens.
+    struct Gated(u64, &'static AtomicBool);
+    impl std::io::Read for Gated {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            while !self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Sevens(self.0, false)
+                .read(b)
+                .inspect(|k| self.0 -= *k as u64)
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_runs_two_pcap_exports_at_once_and_refuses_a_third() {
+        let p = sock("busy");
+        start_streaming(
+            &p,
+            me(),
+            Arc::new(|_| {
+                let head = Response::Pcap {
+                    bytes: 10,
+                    sessions: 1,
+                    left_out: 0,
+                    notes: vec![],
+                };
+                (
+                    head,
+                    Some((
+                        10,
+                        Box::new(Gated(10, &GATE)) as Box<dyn std::io::Read + Send>,
+                    )),
+                )
+            }),
+        );
+        let ask = || async {
+            let mut s = UnixStream::connect(&p).await.unwrap();
+            s.write_all(b"{\"IncidentPcap\":{\"id\":\"x\"}}\n\"Status\"\n")
+                .await
+                .unwrap();
+            let mut r = BufReader::new(s);
+            let mut head = String::new();
+            r.read_line(&mut head).await.unwrap();
+            (r, head)
+        };
+        let (mut a, ha) = ask().await;
+        let (mut b, hb) = ask().await;
+        let (_, hc) = ask().await;
+        // Open before asserting: a gated reader left waiting would hang
+        // the runtime's shutdown.
+        GATE.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            ha.starts_with("{\"Pcap\"") && hb.starts_with("{\"Pcap\""),
+            "{ha}{hb}"
+        );
+        assert!(hc.starts_with("{\"error\":\"busy"), "{hc}");
+        for r in [&mut a, &mut b] {
+            let mut body = [0u8; 10];
+            r.read_exact(&mut body).await.unwrap();
+            // The next reply comes once the export is over.
+            let mut next = String::new();
+            r.read_line(&mut next).await.unwrap();
+            assert!(next.starts_with("{\"Status\""), "{next}");
+        }
+        let (_, hd) = ask().await;
+        assert!(hd.starts_with("{\"Pcap\""), "{hd}");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_export_slot_comes_back_after_an_error_or_a_hang_up() {
+        let p = sock("slots");
+        start_streaming(
+            &p,
+            me(),
+            Arc::new(|req| {
+                let Request::IncidentPcap { id } = req else {
+                    unreachable!()
+                };
+                let (n, r): (u64, Box<dyn std::io::Read + Send>) = match id.as_str() {
+                    "err" => return (err("nothing to export"), None),
+                    "big" => (64 << 20, Box::new(Sevens(64 << 20, false))),
+                    "small" => (10, Box::new(Sevens(10, false))),
+                    _ => (10, Box::new(Gated(10, &GATE2))),
+                };
+                let head = Response::Pcap {
+                    bytes: n,
+                    sessions: 1,
+                    left_out: 0,
+                    notes: vec![],
+                };
+                (head, Some((n, r)))
+            }),
+        );
+        let ask = |id: &'static str| {
+            let p = p.clone();
+            async move {
+                let mut s = UnixStream::connect(&p).await.unwrap();
+                let req = format!("{{\"IncidentPcap\":{{\"id\":\"{id}\"}}}}\n");
+                s.write_all(req.as_bytes()).await.unwrap();
+                let mut r = BufReader::new(s);
+                let mut head = String::new();
+                r.read_line(&mut head).await.unwrap();
+                (r, head)
+            }
+        };
+        for _ in 0..3 {
+            assert!(ask("err").await.1.contains("nothing to export"));
+        }
+        // Gone mid-stream: the server's next write fails.
+        for _ in 0..3 {
+            let (r, head) = ask("big").await;
+            assert!(head.starts_with("{\"Pcap\""), "{head}");
+            drop(r);
+        }
+        // Each hung-up export ends when its write fails; wait for that.
+        let mut free = false;
+        for _ in 0..200 {
+            if ask("small").await.1.starts_with("{\"Pcap\"") {
+                free = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Both slots: two exports held open at once.
+        let (_a, ha) = ask("gated").await;
+        let (_b, hb) = ask("gated").await;
+        GATE2.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(free);
+        assert!(
+            ha.starts_with("{\"Pcap\"") && hb.starts_with("{\"Pcap\""),
+            "{ha}{hb}"
+        );
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

@@ -169,30 +169,32 @@ fn copy_exact(r: impl Read, w: &mut impl Write, n: u64) -> Result<(), String> {
     }
 }
 
-/// The merged pcap of incident `id`, to `out`.
-fn pcap(socket: &Path, id: &str, out: &mut impl Write) -> Result<(), String> {
+/// The merged pcap of incident `id`, to `out`; why any sessions were
+/// left out of it.
+fn pcap(socket: &Path, id: &str, out: &mut impl Write) -> Result<Vec<String>, String> {
     let mut s = send(socket, &Request::IncidentPcap { id: id.into() })?;
     let (line, rest) = read_reply(&mut s)?;
     let Response::Pcap {
         bytes,
         sessions,
-        left_out,
+        notes,
+        ..
     } = parse_reply(&line)?
     else {
         return Err("aegisd sent a reply this aegisctl doesn't understand".into());
     };
+    // A header and nothing else is no capture: say so, write nothing.
+    if sessions == 0 {
+        let why: Vec<String> = notes.iter().map(|n| render::clean(n)).collect();
+        return Err(format!("nothing to export: {}", why.join("; ")));
+    }
     // Each read may wait this long; the whole pcap may take longer.
     s.set_read_timeout(Some(DEADLINE))
         .map_err(|e| e.to_string())?;
     copy_exact(std::io::Cursor::new(rest).chain(s), out, bytes)?;
     out.flush()
         .map_err(|e| format!("pcap not written whole: {e}"))?;
-    if left_out > 0 {
-        eprintln!(
-            "aegisctl: wrote {sessions} sessions; {left_out} newer ones did not fit under 256 MiB"
-        );
-    }
-    Ok(())
+    Ok(notes)
 }
 
 /// JSON for stdout: pretty, and with nothing a terminal would act on.
@@ -252,7 +254,9 @@ fn run(cli: &Cli) -> Result<(String, u8), String> {
         Cmd::Incidents(Inc::Pcap { id }) => {
             pcap_target(std::io::stdout().is_terminal())?;
             let out = std::io::stdout().lock();
-            pcap(&cli.socket, id, &mut std::io::BufWriter::new(out))?;
+            for n in pcap(&cli.socket, id, &mut std::io::BufWriter::new(out))? {
+                eprintln!("aegisctl: left out of the pcap: {}", render::clean(&n));
+            }
             return Ok((String::new(), 0));
         }
         Cmd::Incidents(Inc::Timeline { id: i }) => {
@@ -332,8 +336,32 @@ mod tests {
         r.push(b'\n');
         r.extend(&body);
         let mut out = Vec::new();
-        pcap(&fake("pcap", r), "AEG-x", &mut out).unwrap();
+        assert!(pcap(&fake("pcap", r), "AEG-x", &mut out)
+            .unwrap()
+            .is_empty());
         assert_eq!(out, body);
+    }
+
+    #[test]
+    fn pcap_passes_on_why_sessions_were_left_out() {
+        let mut r = br#"{"Pcap":{"bytes":3,"sessions":1,"left_out":2,"notes":["2 newer sessions past the 256 MiB or 1048576-record cap"]}}"#.to_vec();
+        r.extend(b"\nabc");
+        let notes = pcap(&fake("notes", r), "AEG-x", &mut Vec::new()).unwrap();
+        assert_eq!(
+            notes,
+            ["2 newer sessions past the 256 MiB or 1048576-record cap"]
+        );
+    }
+
+    #[test]
+    fn a_pcap_of_no_sessions_is_an_error_and_writes_nothing() {
+        let mut r = br#"{"Pcap":{"bytes":24,"sessions":0,"left_out":1,"notes":["x"]}}"#.to_vec();
+        r.push(b'\n');
+        r.extend([0u8; 24]);
+        let mut out = Vec::new();
+        let e = pcap(&fake("zero", r), "AEG-x", &mut out).unwrap_err();
+        assert!(e.contains("nothing to export") && e.contains('x'), "{e}");
+        assert!(out.is_empty());
     }
 
     #[test]

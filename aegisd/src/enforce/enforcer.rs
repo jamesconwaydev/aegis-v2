@@ -3466,6 +3466,30 @@ mod tests {
     }
 
     #[test]
+    fn the_filing_cap_is_put_on_the_timeline_once() {
+        let (mut f, sp) = hp_spool("file-cap");
+        let fake = crate::spool::tests::fake;
+        observe(&mut f, &[10]);
+        let addr = f.e.observing[&f.id].addr.to_string();
+        let hp = f.dir.join(&f.id).join("honeypot");
+        for i in 0..crate::spool::MAX_FILED {
+            std::fs::create_dir_all(hp.join(format!("4102444700000-{i:08x}"))).unwrap();
+        }
+        for id in [S1, S2] {
+            fake(&sp, &addr, id, &[]);
+            f.e.run(EnforceJob::Reassert);
+        }
+        assert_eq!(filed(&f), [0, 0, 2]);
+        let tl = f.e.store.timeline(&IncidentId(f.id.clone())).unwrap();
+        let caps: Vec<_> = tl
+            .iter()
+            .filter_map(|l| l.get("honeypot_cap_reached"))
+            .collect();
+        assert_eq!(caps.len(), 1, "{tl:?}");
+        assert_eq!(caps[0]["sessions"], crate::spool::MAX_FILED);
+    }
+
+    #[test]
     fn filing_keeps_what_it_filed_when_a_later_session_fails() {
         let (mut f, sp) = hp_spool("file-ioerr");
         let fake = crate::spool::tests::fake;
