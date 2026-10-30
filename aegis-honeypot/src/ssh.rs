@@ -75,19 +75,6 @@ fn with<T>(sh: &Shared, f: impl FnOnce(&mut Session) -> io::Result<T>) -> io::Re
     }
 }
 
-/// At most `max` bytes of `b`, as printable text, and `truncated` if
-/// that cut something.
-fn note(s: &mut Session, b: &[u8], max: usize) -> String {
-    let mut t = hello::text(&b[..b.len().min(max)]);
-    let mut n = t.len().min(max);
-    while !t.is_char_boundary(n) {
-        n -= 1;
-    }
-    s.rec.truncated |= b.len() > max || n < t.len();
-    t.truncate(n);
-    t
-}
-
 /// The host key: made on first start, kept after. One that won't parse
 /// is never replaced; the start fails until an operator moves it.
 fn host_key(dir: &Path) -> Result<PrivateKey> {
@@ -366,7 +353,7 @@ fn on_file(file: &mut Option<File>, sh: &Shared, busy: bool, e: Event<'_>) -> io
                 (false, Some(n)) => n.min(MAX_HELD as u64),
                 (false, None) => MAX_HELD as u64,
             };
-            let (name, room) = with(sh, |s| Ok((note(s, name, MAX_NAME), s.hold(want))))?;
+            let (name, room) = with(sh, |s| Ok((s.note(name, MAX_NAME), s.hold(want))))?;
             *file = Some(File {
                 name,
                 room,
@@ -393,12 +380,12 @@ fn on_file(file: &mut Option<File>, sh: &Shared, busy: bool, e: Event<'_>) -> io
 
 /// Runs a line, recording each command in it.
 fn run(sh: &Shared, host: &Host, cwd: &mut String, line: &[u8]) -> io::Result<shell::Ran> {
-    let line = with(sh, |s| Ok(note(s, line, MAX_LINE)))?;
+    let line = with(sh, |s| Ok(s.note(line, MAX_LINE)))?;
     let mut res = Ok(());
     let ran = shell::run(&line, host, cwd, |cmd: &str| {
         if res.is_ok() {
             res = with(sh, |s| {
-                let c = note(s, cmd.as_bytes(), MAX_COMMAND);
+                let c = s.note(cmd.as_bytes(), MAX_COMMAND);
                 s.command(c);
                 Ok(())
             });
@@ -425,10 +412,10 @@ impl Client {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         with(&self.s, |s| {
             let c = Credential {
-                user: note(s, user.as_bytes(), MAX_FIELD),
-                password: password.map(|p| note(s, p.as_bytes(), MAX_FIELD)),
+                user: s.note(user.as_bytes(), MAX_FIELD),
+                password: password.map(|p| s.note(p.as_bytes(), MAX_FIELD)),
                 // The algorithm's name is the client's to choose.
-                key: key.map(|k| note(s, k.as_bytes(), MAX_FIELD)),
+                key: key.map(|k| s.note(k.as_bytes(), MAX_FIELD)),
             };
             s.credential(c);
             Ok(())
@@ -615,7 +602,7 @@ impl server::Handler for Client {
         // scp's sink: what `scp file host:` runs at the far end.
         if words.next() == Some("scp") && words.any(|w| w.starts_with('-') && w.contains('t')) {
             with(&self.s, |s| {
-                let cmd = note(s, line.as_bytes(), MAX_COMMAND);
+                let cmd = s.note(line.as_bytes(), MAX_COMMAND);
                 s.command(cmd);
                 Ok(())
             })?;

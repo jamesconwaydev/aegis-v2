@@ -141,6 +141,26 @@ pub struct Session {
     pub commands: Vec<String>,
     /// Each file sent up by scp or sftp. Bounded like `credentials`.
     pub uploads: Vec<Upload>,
+    /// The name an SMTP client gave in its first HELO or EHLO, as
+    /// printable text (see `sni`), at most 256 bytes.
+    pub helo: Option<String>,
+    /// Each message handed over by SMTP. Bounded like `credentials`, and
+    /// at 32.
+    pub mails: Vec<Mail>,
+}
+
+/// One message handed over by SMTP, never relayed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mail {
+    /// The MAIL FROM address, empty for the null sender. Printable text
+    /// (see `sni`), at most 256 bytes, like each of `to`.
+    pub from: String,
+    /// Each RCPT TO address, at most 100.
+    pub to: Vec<String>,
+    /// SHA-256 (hex) of the message as received, dot-stuffing undone,
+    /// one of `payloads`; None when it was empty or couldn't be kept.
+    pub message: Option<String>,
 }
 
 /// One login. Printable text (see `sni`), at most 256 bytes each.
@@ -236,6 +256,12 @@ mod tests {
                 name: "x.sh".into(),
                 payload: Some("ab".into()),
             }],
+            helo: Some("bot".into()),
+            mails: vec![Mail {
+                from: String::new(),
+                to: vec!["a@example.com".into()],
+                message: Some("ab".into()),
+            }],
         }
     }
 
@@ -251,6 +277,10 @@ mod tests {
         assert!(j.contains("\"password\":\"123456\",\"key\":null"), "{j}");
         assert!(
             j.contains("\"uploads\":[{\"name\":\"x.sh\",\"payload\":\"ab\"}]"),
+            "{j}"
+        );
+        assert!(
+            j.contains("\"mails\":[{\"from\":\"\",\"to\":[\"a@example.com\"],\"message\":\"ab\"}]"),
             "{j}"
         );
         assert_eq!(serde_json::from_str::<Session>(&j).unwrap(), s);

@@ -77,19 +77,19 @@ enum End {
 
 /// The client, plain or through TLS. Every byte on the wire is recorded
 /// in the session as it passes.
-struct Wire {
-    io: TcpStream,
-    tls: Option<ServerConnection>,
+pub struct Wire {
+    pub io: TcpStream,
+    pub tls: Option<ServerConnection>,
     /// Off the socket and recorded, not yet through TLS.
     raw: Vec<u8>,
     /// Plaintext not yet parsed.
-    buf: Vec<u8>,
+    pub buf: Vec<u8>,
     /// The byte cap is reached: what's read already is the last.
     full: bool,
 }
 
 impl Wire {
-    fn new(io: TcpStream, tls: Option<ServerConnection>, raw: Vec<u8>) -> Self {
+    pub fn new(io: TcpStream, tls: Option<ServerConnection>, raw: Vec<u8>) -> Self {
         Self {
             io,
             tls,
@@ -156,7 +156,7 @@ impl Wire {
         self.send(s, &out).await
     }
 
-    async fn write(&mut self, s: &mut Session, data: &[u8]) -> Result<()> {
+    pub async fn write(&mut self, s: &mut Session, data: &[u8]) -> Result<()> {
         match &mut self.tls {
             Some(c) => {
                 c.writer().write_all(data)?;
@@ -167,7 +167,7 @@ impl Wire {
     }
 
     /// One more read onto `buf`; false when there's no more.
-    async fn fill(&mut self, s: &mut Session) -> Result<bool> {
+    pub async fn fill(&mut self, s: &mut Session) -> Result<bool> {
         let mut b = std::mem::take(&mut self.buf);
         let at = b.len();
         b.resize(at + CHUNK, 0);
@@ -337,39 +337,50 @@ impl Handler for Http {
 /// TLS with a leaf for whatever name was asked, then HTTP inside.
 pub struct Https<'a>(pub &'a Arc<ServerConfig>);
 
-impl Handler for Https<'_> {
-    async fn serve(&self, s: &mut Session, mut io: TcpStream) -> Result<()> {
-        // The ClientHello first, recorded and fingerprinted before rustls
-        // sees it, so a handshake that fails still leaves both.
-        let mut raw = Vec::new();
-        let mut buf = vec![0u8; CHUNK];
-        let hello = loop {
-            match hello::parse(&raw) {
-                HelloParsed::More if raw.len() < hello::MAX => {}
-                HelloParsed::Hello(h) => break Some(h),
-                // "DELET": not TLS, and not yet a method either.
-                HelloParsed::Bad if partial_method(&raw) => {}
-                _ => break None,
-            }
-            let n = io.read(&mut buf).await?;
-            if n == 0 {
-                return Ok(());
-            }
-            raw.extend_from_slice(&buf[..n]);
-            if !s.record(true, &buf[..n])? {
-                return Ok(());
-            }
-        };
-        match hello {
-            Some(h) => {
+/// Reads and records the client's bytes until they hold a whole
+/// ClientHello, and puts its SNI and JA4 on the session: before rustls
+/// sees it, so a handshake that fails still leaves both. Returns the
+/// bytes read, for rustls; None when the client went or the cap was
+/// reached first. `wait`: bytes that aren't a hello but could still
+/// become something worth reading on.
+pub async fn hello(
+    s: &mut Session,
+    io: &mut TcpStream,
+    wait: fn(&[u8]) -> bool,
+) -> Result<Option<Vec<u8>>> {
+    let mut raw = Vec::new();
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        match hello::parse(&raw) {
+            HelloParsed::More if raw.len() < hello::MAX => {}
+            HelloParsed::Hello(h) => {
                 s.rec.sni = h.sni;
                 s.rec.truncated |= h.cut;
                 s.rec.ja4 = Some(h.ja4);
+                return Ok(Some(raw));
             }
-            None if by_bytes(&raw) == Protocol::Http => {
-                return exchange(s, Wire::new(io, None, raw), true).await
-            }
-            None => {}
+            HelloParsed::Bad if wait(&raw) => {}
+            _ => return Ok(Some(raw)),
+        }
+        let n = io.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if !s.record(true, &buf[..n])? {
+            return Ok(None);
+        }
+    }
+}
+
+impl Handler for Https<'_> {
+    async fn serve(&self, s: &mut Session, mut io: TcpStream) -> Result<()> {
+        // "DELET": not TLS, and not yet a method either.
+        let Some(raw) = hello(s, &mut io, partial_method).await? else {
+            return Ok(());
+        };
+        if s.rec.ja4.is_none() && by_bytes(&raw) == Protocol::Http {
+            return exchange(s, Wire::new(io, None, raw), true).await;
         }
         let tls = ServerConnection::new(self.0.clone())?;
         exchange(s, Wire::new(io, Some(tls), raw), false).await
@@ -377,7 +388,7 @@ impl Handler for Https<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -392,7 +403,7 @@ mod tests {
 
     /// One connection forced to `p`, the client run by `client`; the
     /// filed session and its directory, which the caller removes.
-    async fn session<F, Fut>(
+    pub async fn session<F, Fut>(
         srv: &std::rc::Rc<Server>,
         p: Protocol,
         client: F,
@@ -416,7 +427,7 @@ mod tests {
         (rec, dir)
     }
 
-    fn sha(b: &[u8]) -> String {
+    pub fn sha(b: &[u8]) -> String {
         Sha256::digest(b)
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -443,7 +454,7 @@ mod tests {
         (head, body)
     }
 
-    fn cleanup(p: &Path) {
+    pub fn cleanup(p: &Path) {
         std::fs::remove_dir_all(p).unwrap();
     }
 
@@ -641,7 +652,7 @@ mod tests {
         cleanup(&srv.spool);
     }
 
-    type Tls = rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>;
+    pub type Tls = rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>;
 
     /// Sends one request that asks for a close, and returns all that
     /// comes back.
@@ -662,26 +673,36 @@ mod tests {
         ca: Vec<u8>,
         talk: fn(&mut Tls) -> std::io::Result<T>,
     ) -> std::io::Result<T> {
+        let c = std_stream(c);
+        tokio::task::spawn_blocking(move || talk(&mut tls_client(c, name, &ca)))
+            .await
+            .unwrap()
+    }
+
+    /// The client end as a blocking socket, for a client on a thread of
+    /// its own.
+    pub fn std_stream(c: TcpStream) -> std::net::TcpStream {
         let c = c.into_std().unwrap();
         c.set_nonblocking(false).unwrap();
-        let name = ServerName::try_from(name).unwrap();
-        tokio::task::spawn_blocking(move || {
-            let mut roots = rustls::RootCertStore::empty();
-            roots
-                .add(CertificateDer::from_pem_slice(&ca).unwrap())
-                .unwrap();
-            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-            let conn = rustls::ClientConnection::new(Arc::new(cfg), name).unwrap();
-            talk(&mut rustls::StreamOwned::new(conn, c))
-        })
-        .await
+        c
+    }
+
+    /// A rustls client over `c`, trusting only `ca`, asking for `name`.
+    pub fn tls_client(c: std::net::TcpStream, name: &'static str, ca: &[u8]) -> Tls {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(ca).unwrap())
+            .unwrap();
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
         .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let name = ServerName::try_from(name).unwrap();
+        let conn = rustls::ClientConnection::new(Arc::new(cfg), name).unwrap();
+        rustls::StreamOwned::new(conn, c)
     }
 
     #[tokio::test]
