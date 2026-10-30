@@ -220,12 +220,22 @@ async fn auth(
 /// The message after DATA, kept up to `MAX_HELD`, and filed with its
 /// envelope. False when the client went, or a cap came, before its end.
 async fn data(w: &mut Wire, s: &mut Session, st: &mut State, until: Instant) -> Result<bool> {
+    // A mail the record has no room for keeps no payload either, or the
+    // file would be one nothing points to. A hash is as long as any.
+    let fits = s.mail_fits(Mail {
+        from: st.from.clone().unwrap_or_default(),
+        to: st.to.clone(),
+        message: Some("0".repeat(64)),
+    });
     // Set aside first, so the pcap can't use up what the message needs.
     // Every byte kept is charged twice, in the pcap and the payload, so
     // half the room is what a message can use.
-    let room = s.hold((MAX_HELD as u64).min(s.room() / 2));
+    let want = if fits { MAX_HELD as u64 } else { 0 };
+    let room = s.hold(want.min(s.room() / 2));
     let mut held = Held::new(usize::try_from(room).unwrap_or(0));
     let mut dot = Dot::default();
+    // A read error (a reset, a bad TLS record) still files what came.
+    let mut err = None;
     let ended = loop {
         if let Some(n) = dot.feed(&w.buf, &mut |b| held.keep(b)) {
             w.buf.drain(..n);
@@ -233,10 +243,11 @@ async fn data(w: &mut Wire, s: &mut Session, st: &mut State, until: Instant) -> 
         }
         w.buf.clear();
         match timeout_at(until, w.fill(s)).await {
-            Ok(more) => {
-                if !more? {
-                    break false;
-                }
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => break false,
+            Ok(Err(e)) => {
+                err = Some(e);
+                break false;
             }
             Err(_) => {
                 s.rec.timed_out = true;
@@ -257,6 +268,9 @@ async fn data(w: &mut Wire, s: &mut Session, st: &mut State, until: Instant) -> 
         to: std::mem::take(&mut st.to),
         message,
     });
+    if let Some(e) = err {
+        return Err(e);
+    }
     if ended {
         say(w, s, &format!("250 2.0.0 Ok: queued as {}\r\n", queue_id())).await?;
     }
@@ -821,6 +835,10 @@ mod tests {
             let e = ask(&mut t, "EHLO bot.example");
             assert!(e.contains("250-AUTH PLAIN LOGIN\r\n"), "{e}");
             assert!(!e.contains("STARTTLS"), "{e}");
+            assert_eq!(
+                ask(&mut t, "STARTTLS"),
+                "554 5.5.1 Error: TLS already active\r\n"
+            );
             queued(&send(&mut t, b"over 465\r\n.\r\n"));
         })
         .await;
@@ -846,6 +864,109 @@ mod tests {
             rec.ja4.as_deref(),
             Some("t13d1715h2_5b57614c22b0_3d5424432f57")
         );
+        cleanup(&srv.spool);
+    }
+
+    #[tokio::test]
+    async fn a_failed_handshake_after_starttls_is_still_fingerprinted() {
+        let srv = server("mhs2", 100_000, Duration::from_secs(5));
+        let (rec, _) = smtp(&srv, Protocol::Smtp, |mut c| {
+            said(&mut c);
+            ask(&mut c, "EHLO x");
+            assert!(ask(&mut c, "STARTTLS").starts_with("220 "));
+            c.write_all(include_bytes!("testdata/ja4/tls12.bin"))
+                .unwrap();
+            c.shutdown(std::net::Shutdown::Write).unwrap();
+            rest(&mut c);
+        })
+        .await;
+        assert_eq!(rec.sni.as_deref(), Some("contile.services.mozilla.com"));
+        assert_eq!(
+            rec.ja4.as_deref(),
+            Some("t13d1715h2_5b57614c22b0_3d5424432f57")
+        );
+        cleanup(&srv.spool);
+    }
+
+    /// Makes closing `c` send a reset instead of a FIN, as a client that
+    /// leaves with data unread does.
+    fn reset_on_close(c: &Std) {
+        use std::os::fd::AsRawFd;
+        let l = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: setsockopt reads `size_of::<linger>()` bytes of `l`.
+        let r = unsafe {
+            libc::setsockopt(
+                c.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&raw const l).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(r, 0);
+    }
+
+    #[tokio::test]
+    async fn a_message_cut_off_by_a_reset_is_kept() {
+        let srv = server("mrst", 100_000, Duration::from_secs(5));
+        let (rec, dir) = smtp(&srv, Protocol::Smtp, |mut c| {
+            said(&mut c);
+            ask(&mut c, "EHLO x");
+            ask(&mut c, "MAIL FROM:<a@b>");
+            ask(&mut c, "RCPT TO:<c@d>");
+            ask(&mut c, "DATA");
+            c.write_all(b"reset mid-way").unwrap();
+            // Read before the reset, which would throw it away.
+            std::thread::sleep(Duration::from_millis(200));
+            reset_on_close(&c);
+        })
+        .await;
+        assert_eq!(rec.mails[0].message, Some(sha(b"reset mid-way")));
+        assert!(dir.join(sha(b"reset mid-way")).is_file());
+        assert!(rec.truncated);
+        cleanup(&srv.spool);
+    }
+
+    #[tokio::test]
+    async fn a_message_cut_off_by_a_reset_inside_tls_is_kept() {
+        let (srv, ca) = server_with_ca("mrsttls", 100_000, Duration::from_secs(5));
+        let (rec, _) = smtp(&srv, Protocol::Smtps, move |c| {
+            let mut t = tls_client(c, "smtp.corp.example", &ca);
+            said(&mut t);
+            ask(&mut t, "EHLO x");
+            ask(&mut t, "MAIL FROM:<a@b>");
+            ask(&mut t, "RCPT TO:<c@d>");
+            ask(&mut t, "DATA");
+            t.write_all(b"reset in tls").unwrap();
+            t.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            reset_on_close(&t.sock);
+        })
+        .await;
+        assert_eq!(rec.mails[0].message, Some(sha(b"reset in tls")));
+        assert!(rec.truncated);
+        cleanup(&srv.spool);
+    }
+
+    #[tokio::test]
+    async fn a_mail_past_the_record_bound_keeps_no_payload() {
+        let srv = server("mmany", 1_000_000, Duration::from_secs(5));
+        let (rec, dir) = smtp(&srv, Protocol::Smtp, |mut c| {
+            said(&mut c);
+            ask(&mut c, "EHLO x");
+            for i in 0..33 {
+                queued(&send(&mut c, format!("m{i}\r\n.\r\n").as_bytes()));
+            }
+        })
+        .await;
+        assert_eq!(rec.mails.len(), 32);
+        assert!(rec.truncated);
+        // Only the 32 filed messages are on disk: no orphan for the 33rd.
+        assert_eq!(rec.payloads.len(), 32);
+        assert!(!dir.join(sha(b"m32\r\n")).exists());
         cleanup(&srv.spool);
     }
 

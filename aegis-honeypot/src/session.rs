@@ -337,6 +337,18 @@ impl Session {
         self.add(m, MAX_MAILS, |r| &mut r.mails);
     }
 
+    /// Whether `m` would be added by `mail`. The record is left as it
+    /// was.
+    pub fn mail_fits(&mut self, m: Mail) -> bool {
+        if self.rec.mails.len() >= MAX_MAILS {
+            return false;
+        }
+        self.rec.mails.push(m);
+        let size = serde_json::to_vec_pretty(&self.rec).map_or(usize::MAX, |j| j.len());
+        self.rec.mails.pop();
+        size <= RECORD_JSON
+    }
+
     /// At most `max` bytes of `b`, as printable text, and `truncated` if
     /// that cut something.
     pub fn note(&mut self, b: &[u8], max: usize) -> String {
@@ -886,17 +898,20 @@ pub(crate) mod tests {
             to: vec![w(crate::smtp::MAX_ADDR); crate::smtp::MAX_RCPT],
             message: Some("ab".repeat(32)),
         };
-        // Everything else SMTP records at its worst too: one login (a
-        // session may authenticate once), the name, SNI and a DNS name.
+        // Everything else SMTP records at its worst too: two logins (one
+        // before STARTTLS, one after, since TLS starts the state over),
+        // the name, SNI and a DNS name.
         let mut s = open(&sp, 1 << 30);
         s.rec.dns_name = Some("\\377".repeat(250));
         s.rec.sni = Some("\u{fffd}".repeat(255));
         s.rec.helo = Some(w(crate::smtp::MAX_ADDR));
-        s.credential(Credential {
-            user: w(crate::smtp::MAX_ADDR),
-            password: Some(w(crate::smtp::MAX_ADDR)),
-            key: None,
-        });
+        for _ in 0..2 {
+            s.credential(Credential {
+                user: w(crate::smtp::MAX_ADDR),
+                password: Some(w(crate::smtp::MAX_ADDR)),
+                key: None,
+            });
+        }
         // The first always fits.
         s.mail(worst.clone());
         assert_eq!(s.rec.mails.len(), 1);
