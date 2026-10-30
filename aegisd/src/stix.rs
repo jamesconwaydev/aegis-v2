@@ -284,14 +284,14 @@ pub(crate) mod tests {
     }
 
     fn sessions() -> Vec<Session> {
-        let mut dns = session("1761739200000-0000000a", Protocol::Dns);
+        let mut dns = session("1793275200000-0000000a", Protocol::Dns);
         dns.dst = "198.18.0.53:53".parse().unwrap();
         dns.queries = vec![DnsQuery {
             name: "c2.example".into(),
             qtype: "A".into(),
             answer: Some(Ipv4Addr::new(198, 18, 0, 1)),
         }];
-        let mut https = session("1761739201000-0000000b", Protocol::Https);
+        let mut https = session("1793275201000-0000000b", Protocol::Https);
         https.dst = "198.18.0.1:443".parse().unwrap();
         https.dns_name = Some("c2.example".into());
         https.sni = Some("it's\\odd.example".into());
@@ -409,7 +409,7 @@ pub(crate) mod tests {
         let many: Vec<Session> = (0..60)
             .map(|i| {
                 let mut s = s.clone();
-                s.id = format!("17617392{i:05}-0000000b");
+                s.id = format!("17932752{i:05}-0000000b");
                 s.payloads = (0..256).map(|j| format!("{:064x}", i * 1000 + j)).collect();
                 s
             })

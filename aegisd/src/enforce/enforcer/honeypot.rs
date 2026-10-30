@@ -518,6 +518,7 @@ impl Enforcer {
             max_session_bytes: hp.max_session_bytes,
             // Ruled: twice the time cap and a minute.
             stale: Duration::from_secs(hp.session_seconds.saturating_mul(2).saturating_add(60)),
+            max_filed: spool::MAX_FILED,
         };
         let targets: HashMap<Ipv4Addr, (String, std::path::PathBuf, u64)> = by_addr
             .into_iter()

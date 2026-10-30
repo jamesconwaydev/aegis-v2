@@ -53,8 +53,8 @@
       "dst_byte_count": 20,
       "dst_port": 53,
       "dst_ref": "ipv4-addr--49311dc6-7bca-5667-92d2-66553e828bdd",
-      "end": "2026-10-29T12:01:01.500Z",
-      "id": "network-traffic--f99e5dda-5ba5-50fc-961a-31fcbf8c5227",
+      "end": "2026-10-29T12:00:01.500Z",
+      "id": "network-traffic--aa5920b8-4685-5f7e-8b90-1c227f7157de",
       "is_active": false,
       "protocols": [
         "ipv4",
@@ -62,7 +62,7 @@
         "dns"
       ],
       "src_byte_count": 10,
-      "start": "2026-10-29T12:01:00.000Z",
+      "start": "2026-10-29T12:00:00.000Z",
       "type": "network-traffic"
     },
     {
@@ -79,8 +79,8 @@
       "dst_byte_count": 20,
       "dst_port": 443,
       "dst_ref": "ipv4-addr--1a105c2d-edb3-51f0-b0f0-1f9b7c6a4db1",
-      "end": "2026-10-29T12:01:02.500Z",
-      "id": "network-traffic--6fddb421-69a0-5290-b406-d223e9653c77",
+      "end": "2026-10-29T12:00:03.500Z",
+      "id": "network-traffic--2e9af11d-2e8f-5a66-bdcb-9cd96bd4603c",
       "is_active": false,
       "protocols": [
         "ipv4",
@@ -88,7 +88,7 @@
         "https"
       ],
       "src_byte_count": 10,
-      "start": "2026-10-29T12:01:00.000Z",
+      "start": "2026-10-29T12:00:01.000Z",
       "type": "network-traffic",
       "x_aegis_ja4": "t13d1516h2_8daaf6152771_e5627efa2ab1"
     },
@@ -107,9 +107,9 @@
     {
       "created": "2026-10-29T12:00:00.000Z",
       "created_by_ref": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
-      "first_observed": "2026-10-29T12:01:00.000Z",
+      "first_observed": "2026-10-29T12:00:00.000Z",
       "id": "observed-data--24cacd25-64e1-55a5-ba21-c50f01dcbb79",
-      "last_observed": "2026-10-29T12:01:02.500Z",
+      "last_observed": "2026-10-29T12:00:03.500Z",
       "modified": "2026-10-29T12:00:00.000Z",
       "number_observed": 1,
       "object_refs": [
@@ -120,10 +120,10 @@
         "file--3dfcc661-2091-55a2-9e94-435a1214ee28",
         "process--eca4af8c-0f9d-560f-bff5-c83228685e11",
         "ipv4-addr--49311dc6-7bca-5667-92d2-66553e828bdd",
-        "network-traffic--f99e5dda-5ba5-50fc-961a-31fcbf8c5227",
+        "network-traffic--aa5920b8-4685-5f7e-8b90-1c227f7157de",
         "domain-name--5d320d0e-fb60-5405-a879-7d9ad145f546",
         "ipv4-addr--1a105c2d-edb3-51f0-b0f0-1f9b7c6a4db1",
-        "network-traffic--6fddb421-69a0-5290-b406-d223e9653c77",
+        "network-traffic--2e9af11d-2e8f-5a66-bdcb-9cd96bd4603c",
         "domain-name--1c046282-d438-524c-a70c-681fba293b88",
         "file--c1513f37-3788-565a-a7a5-e46bc42cdaba"
       ],

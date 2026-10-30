@@ -382,8 +382,8 @@ pub(crate) mod tests {
             addr: Ipv4Addr::new(127, 77, 0, 1),
             src: "10.0.0.2:40000".parse().unwrap(),
             dst: "1.2.3.4:80".parse().unwrap(),
-            started_ms: 1_793_275_260_000,
-            ended_ms: 1_793_275_261_500,
+            started_ms: spool::id_ms(id).unwrap_or(0),
+            ended_ms: spool::id_ms(id).unwrap_or(0) + 1500,
             bytes_in: 10,
             bytes_out: 20,
             truncated: false,
@@ -428,9 +428,9 @@ pub(crate) mod tests {
         }
     }
 
-    const A: &str = "1761739200000-0000000a";
-    const B: &str = "1761739201000-0000000b";
-    const C: &str = "1761739202000-0000000c";
+    const A: &str = "1793275200000-0000000a";
+    const B: &str = "1793275201000-0000000b";
+    const C: &str = "1793275202000-0000000c";
 
     #[test]
     fn sessions_are_read_oldest_first_and_junk_is_skipped() {
@@ -441,14 +441,14 @@ pub(crate) mod tests {
         // one for another session, and a link.
         file(
             &d.0,
-            &session(".1761739200000-0000000c", Protocol::Raw),
+            &session(".1793275200000-0000000c", Protocol::Raw),
             None,
         );
         fs::create_dir_all(d.0.join("honeypot/junk")).unwrap();
         fs::create_dir_all(d.0.join("honeypot").join(C)).unwrap();
         fs::write(d.0.join("honeypot").join(C).join("session.json"), b"{").unwrap();
         file(&d.0, &session(A, Protocol::Ssh), None);
-        let other = "1761739203000-0000000d";
+        let other = "1793275203000-0000000d";
         fs::create_dir_all(d.0.join("honeypot").join(other)).unwrap();
         std::os::unix::fs::symlink(
             d.0.join("honeypot").join(A).join("session.json"),

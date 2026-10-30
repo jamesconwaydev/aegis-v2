@@ -41,13 +41,14 @@ pub fn random(buf: &mut [u8]) -> io::Result<()> {
     }
 }
 
-/// `<unix-ms>-<8 hex random>`: sorts by time, and two sessions in the
-/// same millisecond still differ.
-fn session_id() -> String {
+/// `<ms>-<8 hex random>`, `ms` being when it started: sorts by time, and
+/// two sessions in the same millisecond still differ. aegisd refuses a
+/// session whose `started_ms` isn't the one in its id.
+fn session_id(ms: u64) -> String {
     let mut r = [0u8; 4];
     // A zero suffix only costs uniqueness within one millisecond.
     let _ = random(&mut r);
-    format!("{}-{:08x}", now_ms(), u32::from_ne_bytes(r))
+    format!("{ms}-{:08x}", u32::from_ne_bytes(r))
 }
 
 /// A spool directory, made if missing: 0770 whatever the umask, so
@@ -225,7 +226,8 @@ impl Session {
         let base = spool.join(addr.to_string());
         shared_dir(&base)?;
         shared_dir(&base.join("done"))?;
-        let id = session_id();
+        let started_ms = now_ms();
+        let id = session_id(started_ms);
         let dir = base.join(&id);
         DirBuilder::new().mode(0o770).create(&dir)?;
         set_shared(&dir)?;
@@ -241,7 +243,7 @@ impl Session {
                 addr,
                 src,
                 dst,
-                started_ms: now_ms(),
+                started_ms,
                 ended_ms: 0,
                 bytes_in: 0,
                 bytes_out: 0,
@@ -432,7 +434,8 @@ impl Session {
         if self.transport == Transport::Tcp {
             self.pcap.fin()?;
         }
-        self.rec.ended_ms = now_ms();
+        // A clock stepped back must not end it before it began.
+        self.rec.ended_ms = now_ms().max(self.rec.started_ms);
         let json = serde_json::to_vec_pretty(&self.rec).map_err(io::Error::other)?;
         create(&self.dir.join("session.json"))?.write_all(&json)?;
         std::fs::rename(&self.dir, &self.done)?;
@@ -577,7 +580,7 @@ pub(crate) mod tests {
 
     #[test]
     fn ids_sort_by_time_and_differ() {
-        let (a, b) = (session_id(), session_id());
+        let (a, b) = (session_id(now_ms()), session_id(now_ms()));
         assert_ne!(a, b);
         let (ms, rand) = a.split_once('-').unwrap();
         assert!(ms.parse::<u64>().unwrap().abs_diff(now_ms()) < 60_000);
@@ -620,6 +623,8 @@ pub(crate) mod tests {
         assert_eq!(rec.id, id);
         assert_eq!((rec.bytes_in, rec.bytes_out, rec.truncated), (2, 0, false));
         assert!(rec.started_ms <= rec.ended_ms);
+        // aegisd refuses a session whose start isn't its id's.
+        assert_eq!(id.split_once('-').unwrap().0, rec.started_ms.to_string());
         let pkts = crate::pcap::tests::read(&std::fs::read(done.join("stream.pcap")).unwrap());
         assert_eq!(pkts.len(), 3 + 1 + 3);
         assert_eq!(pkts[3].data, b"hi");

@@ -3401,7 +3401,7 @@ mod tests {
 
     const S1: &str = crate::spool::tests::ID;
     const SLICE_RULE: &str = "ip daddr 127.77.0.0/16 counter drop";
-    const S2: &str = "1761696000001-0badf00d";
+    const S2: &str = "4102444800001-0badf00d";
 
     fn filed(f: &Fx) -> [u64; 3] {
         let c = &f.e.filing;
@@ -3471,9 +3471,9 @@ mod tests {
         let fake = crate::spool::tests::fake;
         observe(&mut f, &[10]);
         let addr = f.e.observing[&f.id].addr.to_string();
-        let first = "1761696000000-00000001";
+        let first = "4102444800000-00000001";
         fake(&sp, &addr, first, &[]);
-        let later = fake(&sp, &addr, "1761696000000-00000002", &[b"p"]);
+        let later = fake(&sp, &addr, "4102444800000-00000002", &[b"p"]);
         // The incident's payloads/ can't be made: the later one fails.
         std::fs::write(f.dir.join(&f.id).join("payloads"), b"").unwrap();
         f.e.run(EnforceJob::Reassert);
@@ -3553,12 +3553,12 @@ mod tests {
     fn a_copy_a_crash_left_is_removed() {
         let (mut f, _sp) = hp_spool("file-tidy");
         let hp = f.dir.join(&f.id).join("honeypot");
-        let left = hp.join(".1761696000000-0badf00d");
+        let left = hp.join(".4102444800000-0badf00d");
         let plant = || {
             std::fs::create_dir_all(&left).unwrap();
             std::fs::write(left.join("stream.pcap"), b"x").unwrap();
         };
-        let kept = hp.join("1761696000000-00000009");
+        let kept = hp.join("4102444800000-00000009");
         std::fs::create_dir_all(&kept).unwrap();
         // At start, for every incident.
         plant();
