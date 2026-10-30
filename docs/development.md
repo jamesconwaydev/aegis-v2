@@ -304,6 +304,7 @@ whatever bytes it's handed:
 | `sftp_packet` | honeypot SFTP packets into the server, whole and in two |
 | `smtp_command` | honeypot SMTP lines and AUTH answers; the end of a message |
 | `spool_session` | a `session.json` from the honeypot's spool into `parse` |
+| `pcap_index` | a filed `stream.pcap` into `index`, as `incidents pcap` does |
 
 The fuzz crate sits outside the workspace, because cargo-fuzz needs
 nightly. Its `rust-toolchain.toml` pins the same nightly the image

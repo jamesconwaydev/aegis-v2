@@ -10,6 +10,7 @@
 //! from the spool is used only once it has parsed into an address, a
 //! session id or a SHA-256.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -46,6 +47,13 @@ const MAX_VISITS: usize = 8192;
 const MAX_DEPTH: u32 = 4;
 /// Longest text from a session put in the timeline or telemetry.
 const MAX_TEXT: usize = 255;
+/// Sessions filed into one incident; past it they are deleted and
+/// counted as rejected, so a flood can't bury what came after it from
+/// the incident's readers, which read this many.
+pub const MAX_FILED: usize = 4096;
+/// 9999-12-31T23:59:59.999Z: no later time is a real one, and later
+/// ones overflow nanoseconds.
+pub const MAX_MS: u64 = 253_402_300_799_999;
 
 /// Counted for the metrics, as sessions.
 #[derive(Default)]
@@ -62,6 +70,8 @@ pub struct Limits {
     /// An unfinished session dir older than this was left by a honeypot
     /// that died: it can no longer be live.
     pub stale: Duration,
+    /// `MAX_FILED`, but for the tests.
+    pub max_filed: usize,
 }
 
 /// What one sweep did.
@@ -75,6 +85,8 @@ pub struct Swept {
     pub why: Option<String>,
     /// Unfinished session dirs deleted.
     pub stale: u64,
+    /// Incidents that refused a session for being full, once each.
+    pub capped: Vec<String>,
     /// An error on the incident side that stopped the walk early.
     pub io: Option<io::Error>,
 }
@@ -115,6 +127,11 @@ pub fn session_id(s: &str) -> bool {
         && r.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// The milliseconds a session id starts with.
+pub fn id_ms(id: &str) -> Option<u64> {
+    id.split_once('-')?.0.parse().ok()
+}
+
 fn sha_name(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -145,6 +162,11 @@ pub fn parse(json: &[u8]) -> Result<Session, String> {
     })?;
     if !session_id(&s.id) || !incident_addr(s.addr) {
         return Err("session.json has a bad id or address".into());
+    }
+    // The honeypot names a session by the ms it started; readers sort
+    // by that name, so it must not lie.
+    if id_ms(&s.id) != Some(s.started_ms) || s.ended_ms < s.started_ms || s.ended_ms > MAX_MS {
+        return Err("session.json has impossible times".into());
     }
     let mut p: Vec<&str> = s.payloads.iter().map(String::as_str).collect();
     p.sort_unstable();
@@ -353,6 +375,7 @@ pub fn sweep(spool: &Path, lim: Limits, find: Find) -> io::Result<Swept> {
         visits: 0,
         sessions: 0,
         bytes: 0,
+        filed_in: HashMap::new(),
         out: Swept::default(),
     };
     for n in names(&root)? {
@@ -384,6 +407,8 @@ struct Walk {
     visits: usize,
     sessions: usize,
     bytes: u64,
+    /// Sessions in each incident's `honeypot/`, counted once a tick.
+    filed_in: HashMap<PathBuf, usize>,
     out: Swept,
 }
 
@@ -582,6 +607,22 @@ impl Walk {
         if dest.exists() {
             return Err(Skip::Filed);
         }
+        let held = *self.filed_in.entry(hp.clone()).or_insert_with(|| {
+            fs::read_dir(&hp).map_or(0, |r| {
+                r.flatten()
+                    .filter(|e| e.file_name().to_str().is_some_and(session_id))
+                    .count()
+            })
+        });
+        if held >= self.lim.max_filed {
+            if !self.out.capped.contains(&inc) {
+                self.out.capped.push(inc.clone());
+            }
+            return bad(format!(
+                "the incident already holds {} sessions",
+                self.lim.max_filed
+            ));
+        }
         private_dir(&hp)?;
         let tmp = hp.join(format!(".{id}"));
         // Left by a crash mid-copy.
@@ -619,6 +660,8 @@ impl Walk {
         });
         if r.is_err() {
             let _ = fs::remove_dir_all(&tmp);
+        } else {
+            self.filed_in.insert(hp, held + 1);
         }
         r.map(|()| (inc, s))
     }
@@ -632,7 +675,7 @@ pub(crate) mod tests {
     /// The honeypot user, when the tests run as root and can chown.
     const HP: u32 = 4242;
     const ADDR: &str = "127.77.0.1";
-    pub(crate) const ID: &str = "1761696000000-0badf00d";
+    pub(crate) const ID: &str = "4102444800000-0badf00d";
     const INC: &str = "AEG-20261029-120000-0123456789abcdef";
 
     fn root() -> bool {
@@ -724,16 +767,10 @@ pub(crate) mod tests {
         own(p);
     }
 
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-    }
-
     const LIM: Limits = Limits {
         max_session_bytes: 4096,
         stale: Duration::from_secs(660),
+        max_filed: MAX_FILED,
     };
 
     /// A finished session at `<spool>/<addr>/done/<id>` with
@@ -761,11 +798,17 @@ pub(crate) mod tests {
         own(p);
     }
 
+    /// The ms an id starts with, as the honeypot's `started_ms`.
+    fn ms(id: &str) -> u64 {
+        id.split_once('-')
+            .map_or(0, |(m, _)| m.parse().unwrap_or(0))
+    }
+
     fn json_for(addr: &str, id: &str, payloads: &[String]) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "id": id, "protocol": "http", "addr": addr,
             "src": "10.0.0.2:40000", "dst": "1.2.3.4:80",
-            "started_ms": now_ms(), "ended_ms": now_ms(), "bytes_in": 3, "bytes_out": 4,
+            "started_ms": ms(id), "ended_ms": ms(id) + 5, "bytes_in": 3, "bytes_out": 4,
             "truncated": false, "timed_out": false, "payloads": payloads,
             "dns_name": "c2.example\u{1b}[31m", "queries": [], "sni": null, "ja4": null,
             "requests": [], "credentials": [{"user": "root", "password": "hunter2",
@@ -872,7 +915,7 @@ pub(crate) mod tests {
             ("session.json names another session", |_, d| {
                 write(
                     &d.join("session.json"),
-                    &json_for(ADDR, "1761696000001-0badf00d", &[sha(b"x")]),
+                    &json_for(ADDR, "4102444800001-0badf00d", &[sha(b"x")]),
                 );
             }),
             ("session.json names another address", |_, d| {
@@ -1062,7 +1105,7 @@ pub(crate) mod tests {
     #[test]
     fn a_payload_two_sessions_share_is_kept_once() {
         let t = T::new("dedup");
-        let other = "1761696000001-0badf00d";
+        let other = "4102444800001-0badf00d";
         t.session(ADDR, ID, &[b"same", b"one"]);
         t.session(ADDR, other, &[b"same"]);
         let r = t.sweep().unwrap();
@@ -1102,7 +1145,7 @@ pub(crate) mod tests {
         let d = t.session(ADDR, ID, &[]);
         let inc = t.inc();
         let r = sweep(&t.spool(), LIM, &|_| {
-            Some((INC.to_string(), inc.clone(), now_ms() + 60_000))
+            Some((INC.to_string(), inc.clone(), ms(ID) + 60_000))
         })
         .unwrap();
         assert_eq!((r.filed.len(), r.rejected), (0, 1), "{r:?}");
@@ -1116,7 +1159,7 @@ pub(crate) mod tests {
         let inc = t.inc();
         // The open is recorded after the holds open, in whole seconds.
         let r = sweep(&t.spool(), LIM, &|_| {
-            Some((INC.to_string(), inc.clone(), now_ms() + 1000))
+            Some((INC.to_string(), inc.clone(), ms(ID) + 1000))
         })
         .unwrap();
         assert_eq!(r.filed.len(), 1, "{r:?}");
@@ -1125,8 +1168,8 @@ pub(crate) mod tests {
     #[test]
     fn an_incident_side_error_stops_the_tick_but_keeps_what_was_filed() {
         let t = T::new("ioerr");
-        let first = "1761696000000-00000001";
-        let second = "1761696000000-00000002";
+        let first = "4102444800000-00000001";
+        let second = "4102444800000-00000002";
         t.session(ADDR, first, &[]);
         let d = t.session(ADDR, second, &[b"x"]);
         // payloads/ can't be made: the second session can't be filed.
@@ -1153,7 +1196,7 @@ pub(crate) mod tests {
             ..LIM
         };
         for i in 1..=2 {
-            let d = t.session(ADDR, &format!("1761696000000-0000000{i}"), &[]);
+            let d = t.session(ADDR, &format!("4102444800000-0000000{i}"), &[]);
             write(&d.join("stream.pcap"), &vec![0; 1 << 20]);
         }
         let inc = t.inc();
@@ -1191,9 +1234,9 @@ pub(crate) mod tests {
     #[test]
     fn only_old_unfinished_sessions_are_swept() {
         let t = T::new("stale");
-        let old = t.mkdir(&format!("{ADDR}/1761696000000-00000001"));
+        let old = t.mkdir(&format!("{ADDR}/4102444800000-00000001"));
         write(&old.join("stream.pcap"), b"x");
-        let young = t.mkdir(&format!("{ADDR}/1761696000000-00000002"));
+        let young = t.mkdir(&format!("{ADDR}/4102444800000-00000002"));
         write(&young.join("stream.pcap"), b"x");
         let past = SystemTime::now() - LIM.stale - Duration::from_secs(1);
         File::open(&old).unwrap().set_modified(past).unwrap();
@@ -1207,7 +1250,7 @@ pub(crate) mod tests {
     fn a_flood_is_handled_a_tick_at_a_time() {
         let t = T::new("flood");
         for i in 0..MAX_SESSIONS + 5 {
-            t.session("127.77.0.2", &format!("1761696000000-{i:08x}"), &[]);
+            t.session("127.77.0.2", &format!("4102444800000-{i:08x}"), &[]);
         }
         assert_eq!(t.sweep().unwrap().unmatched, MAX_SESSIONS as u64);
         assert_eq!(t.sweep().unwrap().unmatched, 5);
@@ -1221,7 +1264,7 @@ pub(crate) mod tests {
         for a in 1..=10 {
             let addr = format!("127.77.1.{a}");
             for i in 0..1000 {
-                t.mkdir(&format!("{addr}/1761696000000-{i:08x}"));
+                t.mkdir(&format!("{addr}/4102444800000-{i:08x}"));
             }
             t.session(&addr, ID, &[]);
         }
@@ -1256,14 +1299,75 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn parse_refuses_impossible_times_and_a_start_that_is_not_the_ids() {
+        let ok: Value = serde_json::from_slice(&json_for(ADDR, ID, &[])).unwrap();
+        assert!(parse(&serde_json::to_vec(&ok).unwrap()).is_ok());
+        let year_10000 = 253_402_300_800_000u64;
+        let other = format!("{year_10000}-0badf00d");
+        for (k, v) in [
+            ("started_ms", json!(ms(ID) + 1)),
+            ("ended_ms", json!(ms(ID) - 1)),
+            ("ended_ms", json!(year_10000)),
+            ("ended_ms", json!(u64::MAX)),
+        ] {
+            let mut j = ok.clone();
+            j[k] = v;
+            let e = parse(&serde_json::to_vec(&j).unwrap()).unwrap_err();
+            assert!(e.contains("time"), "{k}: {e}");
+        }
+        let mut j = ok.clone();
+        j["id"] = other.clone().into();
+        j["started_ms"] = year_10000.into();
+        j["ended_ms"] = year_10000.into();
+        assert!(parse(&serde_json::to_vec(&j).unwrap()).is_err());
+    }
+
+    #[test]
+    fn filing_stops_at_the_incident_cap() {
+        let t = T::new("cap");
+        let ids = [
+            "4102444800000-00000001",
+            "4102444800000-00000002",
+            "4102444800000-00000003",
+        ];
+        for id in ids {
+            t.session(ADDR, id, &[]);
+        }
+        let inc = t.inc();
+        let lim = Limits {
+            max_filed: 2,
+            ..LIM
+        };
+        let r = sweep(&t.spool(), lim, &|_| {
+            Some((INC.to_string(), inc.clone(), 0))
+        })
+        .unwrap();
+        assert_eq!((r.filed.len(), r.rejected), (2, 1), "{r:?}");
+        assert!(r.why.unwrap().contains("holds 2 sessions"));
+        assert_eq!(r.capped, [INC]);
+        assert!(!filed(&t, ids[2]).exists());
+        assert!(fs::read_dir(t.spool().join(ADDR).join("done"))
+            .unwrap()
+            .next()
+            .is_none());
+        // A later tick counts what is already filed.
+        t.session(ADDR, "4102444800000-00000004", &[]);
+        let r = sweep(&t.spool(), lim, &|_| {
+            Some((INC.to_string(), inc.clone(), 0))
+        })
+        .unwrap();
+        assert_eq!((r.filed.len(), r.rejected), (0, 1), "{r:?}");
+    }
+
+    #[test]
     fn names_are_checked_exactly() {
         assert!(session_id(ID));
         for bad in [
             "",
             "1-",
             "-0badf00d",
-            "1761696000000-0BADF00D",
-            "1761696000000-0badf00",
+            "4102444800000-0BADF00D",
+            "4102444800000-0badf00",
             "a-0badf00d",
             "1/2-0badf00d",
         ] {

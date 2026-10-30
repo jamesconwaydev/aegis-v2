@@ -41,6 +41,14 @@ pub enum Request {
     IncidentKill {
         id: String,
     },
+    /// Every honeypot session's packets as one pcap. From v0.3.0.
+    IncidentPcap {
+        id: String,
+    },
+    /// A STIX 2.1 bundle of what the incident saw. From v0.3.0.
+    IncidentStix {
+        id: String,
+    },
 }
 
 fn default_network() -> String {
@@ -91,6 +99,19 @@ pub enum Response {
     Timeline(Vec<Value>),
     /// What a release or kill did, one line.
     Done(String),
+    /// The answer to `IncidentPcap`: exactly `bytes` bytes of pcap follow
+    /// this line on the socket, then the next reply. `sessions` were
+    /// merged and `left_out` were not; `notes` says why, one reason a
+    /// line.
+    Pcap {
+        bytes: u64,
+        sessions: u64,
+        left_out: u64,
+        #[serde(default)]
+        notes: Vec<String>,
+    },
+    /// The answer to `IncidentStix`.
+    Stix(Value),
     #[serde(rename = "error")]
     Error(String),
 }
@@ -157,22 +178,58 @@ pub fn is_incident_id(id: &str) -> bool {
 pub fn clean(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
-        let bad = c.is_control()
-            || matches!(
-                c,
-                '\u{061c}'
-                    | '\u{180e}'
-                    | '\u{200b}'..='\u{200f}'
-                    | '\u{2028}'..='\u{202e}'
-                    | '\u{2060}'..='\u{2069}'
-                    | '\u{feff}'
-            );
-        if !bad {
+        if !unsafe_char(c) {
             o.push(c);
         } else if (c as u32) < 0x100 {
             o += &format!("\\x{:02x}", c as u32);
         } else {
             o += &format!("\\u{{{:x}}}", c as u32);
+        }
+    }
+    o
+}
+
+fn unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+                // Soft hyphen, Mongolian and other variation selectors,
+                // interlinear annotation and tags: all print as nothing.
+                | '\u{ad}'
+                | '\u{180b}'..='\u{180d}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e007f}'
+                | '\u{e0100}'..='\u{e01ef}'
+                // Hangul fillers, blank but not whitespace.
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{3164}'
+                | '\u{ffa0}'
+        )
+}
+
+/// `clean` for JSON text: the characters it would escape become `\uXXXX`
+/// instead, which leaves the same JSON. serde_json already escapes C0
+/// controls, but not DEL, C1 or the invisible marks. Newlines between
+/// tokens stay, so pretty output stays pretty.
+pub fn clean_json(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c != '\n' && unsafe_char(c) {
+            // JSON escapes UTF-16 units: one in the BMP, a pair past it.
+            let mut u = [0u16; 2];
+            for unit in c.encode_utf16(&mut u) {
+                o += &format!("\\u{unit:04x}");
+            }
+        } else {
+            o.push(c);
         }
     }
     o
@@ -220,6 +277,84 @@ mod tests {
             serde_json::to_string(&Response::Error("permission denied".into())).unwrap(),
             r#"{"error":"permission denied"}"#
         );
+    }
+
+    #[test]
+    fn honeypot_requests_and_replies_wire_format() {
+        let r: Request = serde_json::from_str(r#"{"IncidentPcap":{"id":"AEG-1"}}"#).unwrap();
+        assert_eq!(r, Request::IncidentPcap { id: "AEG-1".into() });
+        let r: Request = serde_json::from_str(r#"{"IncidentStix":{"id":"AEG-1"}}"#).unwrap();
+        assert_eq!(r, Request::IncidentStix { id: "AEG-1".into() });
+        let head = Response::Pcap {
+            bytes: 24,
+            sessions: 2,
+            left_out: 1,
+            notes: vec!["1 newer session past the cap".into()],
+        };
+        let line = serde_json::to_string(&head).unwrap();
+        assert_eq!(
+            line,
+            r#"{"Pcap":{"bytes":24,"sessions":2,"left_out":1,"notes":["1 newer session past the cap"]}}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), head);
+        let bare = r#"{"Pcap":{"bytes":24,"sessions":2,"left_out":0}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Response>(bare).unwrap(),
+            Response::Pcap { notes, .. } if notes.is_empty()
+        ));
+        let line = serde_json::to_string(&Response::Stix(serde_json::json!({"type": "bundle"})));
+        assert_eq!(line.unwrap(), r#"{"Stix":{"type":"bundle"}}"#);
+    }
+
+    #[test]
+    fn clean_json_escapes_like_clean_and_stays_the_same_json() {
+        let v = serde_json::json!({"k": "a\x1b]0;pwn\x07 \u{9b}2J \u{202e}x \u{7f} ü"});
+        let raw = serde_json::to_string_pretty(&v).unwrap();
+        let out = clean_json(&raw);
+        assert!(
+            !out.chars()
+                .any(|c| clean(&c.to_string()) != c.to_string() && c != '\n'),
+            "{out}"
+        );
+        assert!(
+            out.contains("\\u009b") && out.contains("\\u202e") && out.contains("\\u007f"),
+            "{out}"
+        );
+        assert!(out.contains('ü'));
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), v);
+    }
+
+    #[test]
+    fn hidden_marks_are_escaped_and_non_bmp_becomes_a_surrogate_pair() {
+        for c in [
+            '\u{e0041}',
+            '\u{e007f}',
+            '\u{e0000}',
+            '\u{fff9}',
+            '\u{fffb}',
+            '\u{ad}',
+            '\u{180b}',
+            '\u{180d}',
+            '\u{fe00}',
+            '\u{fe0f}',
+            '\u{e0100}',
+            '\u{e01ef}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{ffa0}',
+        ] {
+            let want = match c as u32 {
+                n @ ..0x100 => format!("\\x{n:02x}"),
+                n => format!("\\u{{{n:x}}}"),
+            };
+            assert_eq!(clean(&c.to_string()), want);
+        }
+        let v = serde_json::json!({"k": "a\u{e0041}b\u{fe0f}"});
+        let out = clean_json(&serde_json::to_string(&v).unwrap());
+        assert_eq!(out, r#"{"k":"a\udb40\udc41b\ufe0f"}"#);
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), v);
+        assert_eq!(clean("emoji \u{1f600} stays"), "emoji \u{1f600} stays");
     }
 
     #[test]

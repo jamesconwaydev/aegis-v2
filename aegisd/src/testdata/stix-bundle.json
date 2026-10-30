@@ -1,0 +1,174 @@
+{
+  "id": "bundle--d12aa8d1-2812-5b96-9f72-b9adb0f1495d",
+  "objects": [
+    {
+      "created": "2026-10-29T12:00:00.000Z",
+      "id": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
+      "identity_class": "system",
+      "modified": "2026-10-29T12:00:00.000Z",
+      "name": "web01",
+      "spec_version": "2.1",
+      "type": "identity"
+    },
+    {
+      "id": "directory--56441d86-7045-5ee0-afb9-96f764bc0015",
+      "path": "/tmp/x",
+      "type": "directory"
+    },
+    {
+      "id": "file--66bbbc5f-4504-57fc-86b5-600565b0d9b5",
+      "name": "dropper",
+      "parent_directory_ref": "directory--56441d86-7045-5ee0-afb9-96f764bc0015",
+      "type": "file"
+    },
+    {
+      "id": "process--7b9569a3-04ef-574d-9cd2-bcfacfe0f7f7",
+      "image_ref": "file--66bbbc5f-4504-57fc-86b5-600565b0d9b5",
+      "pid": 4242,
+      "type": "process"
+    },
+    {
+      "id": "directory--f4f0869b-430a-594d-b01d-307cd4d341a8",
+      "path": "/usr/bin",
+      "type": "directory"
+    },
+    {
+      "id": "file--7c92caf7-4315-5e38-bd75-7f14040fa160",
+      "name": "curl",
+      "parent_directory_ref": "directory--f4f0869b-430a-594d-b01d-307cd4d341a8",
+      "type": "file"
+    },
+    {
+      "id": "process--eca4af8c-0f9d-560f-bff5-c83228685e11",
+      "image_ref": "file--7c92caf7-4315-5e38-bd75-7f14040fa160",
+      "pid": 4243,
+      "type": "process"
+    },
+    {
+      "id": "ipv4-addr--663b0c31-04de-592d-babf-b49e9393b049",
+      "type": "ipv4-addr",
+      "value": "198.18.0.53"
+    },
+    {
+      "dst_byte_count": 20,
+      "dst_port": 53,
+      "dst_ref": "ipv4-addr--663b0c31-04de-592d-babf-b49e9393b049",
+      "end": "2026-10-29T12:00:01.5Z",
+      "id": "network-traffic--e043352d-1840-5963-bae3-9f4952ebde05",
+      "is_active": false,
+      "protocols": [
+        "ipv4",
+        "udp",
+        "dns"
+      ],
+      "src_byte_count": 10,
+      "src_port": 40000,
+      "start": "2026-10-29T12:00:00Z",
+      "type": "network-traffic"
+    },
+    {
+      "id": "domain-name--48a20b60-d03a-5e96-ad43-977ad0c63d84",
+      "type": "domain-name",
+      "value": "c2.example"
+    },
+    {
+      "id": "ipv4-addr--9b6503e8-3f22-58ad-a3b1-52235a5b12b7",
+      "type": "ipv4-addr",
+      "value": "198.18.0.1"
+    },
+    {
+      "dst_byte_count": 20,
+      "dst_port": 443,
+      "dst_ref": "ipv4-addr--9b6503e8-3f22-58ad-a3b1-52235a5b12b7",
+      "end": "2026-10-29T12:00:03.5Z",
+      "id": "network-traffic--76d5daab-ebad-59db-9c5e-8c83d763caa9",
+      "is_active": false,
+      "protocols": [
+        "ipv4",
+        "tcp",
+        "https"
+      ],
+      "src_byte_count": 10,
+      "src_port": 40000,
+      "start": "2026-10-29T12:00:01Z",
+      "type": "network-traffic",
+      "x_aegis_ja4": "t13d1516h2_8daaf6152771_e5627efa2ab1"
+    },
+    {
+      "id": "domain-name--c3c08d37-063b-56de-aba9-d64d1f215ae8",
+      "type": "domain-name",
+      "value": "it's\\odd.example"
+    },
+    {
+      "hashes": {
+        "SHA-256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "id": "file--22f8ff52-8f62-5f03-a53a-6f50f54fd74c",
+      "type": "file"
+    },
+    {
+      "created": "2026-10-29T12:00:00.000Z",
+      "created_by_ref": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
+      "first_observed": "2026-10-29T12:00:00.000Z",
+      "id": "observed-data--24cacd25-64e1-55a5-ba21-c50f01dcbb79",
+      "last_observed": "2026-10-29T12:05:00.000Z",
+      "modified": "2026-10-29T12:00:00.000Z",
+      "number_observed": 1,
+      "object_refs": [
+        "directory--56441d86-7045-5ee0-afb9-96f764bc0015",
+        "file--66bbbc5f-4504-57fc-86b5-600565b0d9b5",
+        "process--7b9569a3-04ef-574d-9cd2-bcfacfe0f7f7",
+        "directory--f4f0869b-430a-594d-b01d-307cd4d341a8",
+        "file--7c92caf7-4315-5e38-bd75-7f14040fa160",
+        "process--eca4af8c-0f9d-560f-bff5-c83228685e11",
+        "ipv4-addr--663b0c31-04de-592d-babf-b49e9393b049",
+        "network-traffic--e043352d-1840-5963-bae3-9f4952ebde05",
+        "domain-name--48a20b60-d03a-5e96-ad43-977ad0c63d84",
+        "ipv4-addr--9b6503e8-3f22-58ad-a3b1-52235a5b12b7",
+        "network-traffic--76d5daab-ebad-59db-9c5e-8c83d763caa9",
+        "domain-name--c3c08d37-063b-56de-aba9-d64d1f215ae8",
+        "file--22f8ff52-8f62-5f03-a53a-6f50f54fd74c"
+      ],
+      "spec_version": "2.1",
+      "type": "observed-data",
+      "x_aegis_incident": "AEG-20261029-120000-0123456789abcdef"
+    },
+    {
+      "created": "2026-10-29T12:00:00.000Z",
+      "created_by_ref": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
+      "id": "indicator--bcd922ab-c2a5-5bae-a118-721d40296169",
+      "modified": "2026-10-29T12:00:00.000Z",
+      "name": "Domain name seen in AEG-20261029-120000-0123456789abcdef",
+      "pattern": "[domain-name:value = 'c2.example']",
+      "pattern_type": "stix",
+      "spec_version": "2.1",
+      "type": "indicator",
+      "valid_from": "2026-10-29T12:00:00.000Z"
+    },
+    {
+      "created": "2026-10-29T12:00:00.000Z",
+      "created_by_ref": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
+      "id": "indicator--6d219521-4b09-50ee-b8c0-42bd40f0fb35",
+      "modified": "2026-10-29T12:00:00.000Z",
+      "name": "Domain name seen in AEG-20261029-120000-0123456789abcdef",
+      "pattern": "[domain-name:value = 'it\\'s\\\\odd.example']",
+      "pattern_type": "stix",
+      "spec_version": "2.1",
+      "type": "indicator",
+      "valid_from": "2026-10-29T12:00:00.000Z"
+    },
+    {
+      "created": "2026-10-29T12:00:00.000Z",
+      "created_by_ref": "identity--ba1aa144-ee44-5527-8bd0-ec07b28bb56e",
+      "id": "indicator--3e10ec3a-a674-597c-9fe5-05a17a9b4576",
+      "modified": "2026-10-29T12:00:00.000Z",
+      "name": "Payload sent to the honeypot in AEG-20261029-120000-0123456789abcdef",
+      "pattern": "[file:hashes.'SHA-256' = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855']",
+      "pattern_type": "stix",
+      "spec_version": "2.1",
+      "type": "indicator",
+      "valid_from": "2026-10-29T12:00:00.000Z"
+    }
+  ],
+  "type": "bundle"
+}

@@ -117,3 +117,10 @@ path = "fuzz_targets/spool_session.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "pcap_index"
+path = "fuzz_targets/pcap_index.rs"
+test = false
+doc = false
+bench = false

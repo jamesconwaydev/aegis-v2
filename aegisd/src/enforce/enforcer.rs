@@ -3401,7 +3401,7 @@ mod tests {
 
     const S1: &str = crate::spool::tests::ID;
     const SLICE_RULE: &str = "ip daddr 127.77.0.0/16 counter drop";
-    const S2: &str = "1761696000001-0badf00d";
+    const S2: &str = "4102444800001-0badf00d";
 
     fn filed(f: &Fx) -> [u64; 3] {
         let c = &f.e.filing;
@@ -3466,14 +3466,38 @@ mod tests {
     }
 
     #[test]
+    fn the_filing_cap_is_put_on_the_timeline_once() {
+        let (mut f, sp) = hp_spool("file-cap");
+        let fake = crate::spool::tests::fake;
+        observe(&mut f, &[10]);
+        let addr = f.e.observing[&f.id].addr.to_string();
+        let hp = f.dir.join(&f.id).join("honeypot");
+        for i in 0..crate::spool::MAX_FILED {
+            std::fs::create_dir_all(hp.join(format!("4102444700000-{i:08x}"))).unwrap();
+        }
+        for id in [S1, S2] {
+            fake(&sp, &addr, id, &[]);
+            f.e.run(EnforceJob::Reassert);
+        }
+        assert_eq!(filed(&f), [0, 0, 2]);
+        let tl = f.e.store.timeline(&IncidentId(f.id.clone())).unwrap();
+        let caps: Vec<_> = tl
+            .iter()
+            .filter_map(|l| l.get("honeypot_cap_reached"))
+            .collect();
+        assert_eq!(caps.len(), 1, "{tl:?}");
+        assert_eq!(caps[0]["sessions"], crate::spool::MAX_FILED);
+    }
+
+    #[test]
     fn filing_keeps_what_it_filed_when_a_later_session_fails() {
         let (mut f, sp) = hp_spool("file-ioerr");
         let fake = crate::spool::tests::fake;
         observe(&mut f, &[10]);
         let addr = f.e.observing[&f.id].addr.to_string();
-        let first = "1761696000000-00000001";
+        let first = "4102444800000-00000001";
         fake(&sp, &addr, first, &[]);
-        let later = fake(&sp, &addr, "1761696000000-00000002", &[b"p"]);
+        let later = fake(&sp, &addr, "4102444800000-00000002", &[b"p"]);
         // The incident's payloads/ can't be made: the later one fails.
         std::fs::write(f.dir.join(&f.id).join("payloads"), b"").unwrap();
         f.e.run(EnforceJob::Reassert);
@@ -3553,12 +3577,12 @@ mod tests {
     fn a_copy_a_crash_left_is_removed() {
         let (mut f, _sp) = hp_spool("file-tidy");
         let hp = f.dir.join(&f.id).join("honeypot");
-        let left = hp.join(".1761696000000-0badf00d");
+        let left = hp.join(".4102444800000-0badf00d");
         let plant = || {
             std::fs::create_dir_all(&left).unwrap();
             std::fs::write(left.join("stream.pcap"), b"x").unwrap();
         };
-        let kept = hp.join("1761696000000-00000009");
+        let kept = hp.join("4102444800000-00000009");
         std::fs::create_dir_all(&kept).unwrap();
         // At start, for every incident.
         plant();

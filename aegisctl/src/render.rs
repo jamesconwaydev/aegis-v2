@@ -3,6 +3,7 @@
 
 use std::io::IsTerminal;
 
+use aegis_proto::honeypot::{ShowHoneypot, MAX_SHOWN};
 use aegis_proto::{IncidentSummary, Response};
 use serde_json::Value;
 
@@ -344,6 +345,54 @@ pub fn incident(v: &Value, cur_boot: Option<&str>) -> String {
             .collect();
         o += &table(&rows);
     }
+    let groups = v
+        .get("honeypot")
+        .and_then(|h| serde_json::from_value::<Vec<ShowHoneypot>>(h.clone()).ok())
+        .unwrap_or_default();
+    let unread = v["honeypot_unread"].as_u64().unwrap_or(0);
+    if !groups.is_empty() || unread > 0 {
+        o += &honeypot(&groups, unread);
+    }
+    if v["honeypot_cap_reached"] == true {
+        o += "  filing stopped at its cap; later sessions were not kept\n";
+    }
+    o
+}
+
+fn sessions(n: u64) -> String {
+    format!("{n} session{}", if n == 1 { "" } else { "s" })
+}
+
+/// What the honeypot saw, by protocol. Every string is the observed
+/// tree's, so it goes through `table`, and only `MAX_SHOWN` lines a
+/// protocol, whatever the daemon sent.
+fn honeypot(groups: &[ShowHoneypot], unread: u64) -> String {
+    let all = groups.iter().map(|g| g.sessions).sum::<u64>() + unread;
+    let mut o = format!("\nhoneypot ({})\n", sessions(all));
+    for g in groups {
+        o += &format!("  {} ({})\n", clean(&g.protocol), sessions(g.sessions));
+        let rows: Vec<_> = g
+            .lines
+            .iter()
+            .take(MAX_SHOWN)
+            .map(|l| {
+                vec![
+                    String::new(),
+                    String::new(),
+                    l.kind.clone(),
+                    l.value.clone(),
+                ]
+            })
+            .collect();
+        o += &table(&rows);
+        let more = g.more + g.lines.len().saturating_sub(MAX_SHOWN) as u64;
+        if more > 0 {
+            o += &format!("    and {more} more\n");
+        }
+    }
+    if unread > 0 {
+        o += &format!("  and {unread} more sessions not read\n");
+    }
     o
 }
 
@@ -365,6 +414,31 @@ pub fn timeline(lines: &[Value], incident: Option<&Value>) -> String {
         .map(|l| {
             if l["truncated"] == true {
                 return vec![s(l, "ts").to_string(), s(l, "note").to_string()];
+            }
+            if let Some(n) = l
+                .get("honeypot_cap_reached")
+                .and_then(|c| c["sessions"].as_u64())
+            {
+                return vec![
+                    s(l, "ts").to_string(),
+                    "honeypot".into(),
+                    format!("filing stopped at {n} sessions"),
+                    "-".into(),
+                    "-".into(),
+                ];
+            }
+            if let Some(h) = l.get("honeypot_session").filter(|h| h.is_object()) {
+                let name = h["dns_name"]
+                    .as_str()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default();
+                return vec![
+                    s(l, "ts").to_string(),
+                    "honeypot".into(),
+                    format!("{} to {}{name}", s(h, "protocol"), s(h, "dst")),
+                    "-".into(),
+                    "-".into(),
+                ];
             }
             if let Some(acts) = l["actions"].as_array() {
                 let done: Vec<String> = acts
@@ -632,5 +706,110 @@ mod tests {
         let l = o.lines().find(|l| l.starts_with("verdict")).unwrap();
         let m = o.lines().find(|l| l.starts_with("created")).unwrap();
         assert_eq!(l.find("would"), m.rfind('c'));
+    }
+
+    const HOSTILE: [&str; 3] = ["\u{1b}]0;pwn\u{7}", "\u{1b}[2J", "\u{9b}31m"];
+
+    /// No control character but the newlines, no C1, no invisible mark.
+    fn assert_inert(o: &str) {
+        assert!(
+            !o.chars()
+                .any(|c| c != '\n' && clean(&c.to_string()) != c.to_string()),
+            "{o:?}"
+        );
+    }
+
+    fn honeypot_json() -> Value {
+        let kinds = [
+            "dst", "name", "query", "sni", "ja4", "login", "command", "request", "header",
+            "upload", "helo", "mail", "payload",
+        ];
+        let lines: Vec<Value> = kinds
+            .iter()
+            .flat_map(|k| {
+                HOSTILE.map(|h| json!({"kind": format!("{k}{h}"), "value": format!("v{h}\nFAKE")}))
+            })
+            .collect();
+        let mut v = incident_json();
+        v["honeypot"] = json!([
+            {"protocol": "ssh\u{1b}[2J", "sessions": 3, "lines": lines, "more": 4},
+            {"protocol": "dns", "sessions": 1, "lines": [{"kind": "name", "value": "c2.example"}]},
+        ]);
+        v
+    }
+
+    #[test]
+    fn honeypot_section_escapes_every_field_and_says_what_is_left() {
+        let o = incident(&honeypot_json(), Some("boot-a"));
+        assert_inert(&o);
+        assert!(o.contains("\nhoneypot (4 sessions)\n"), "{o}");
+        assert!(o.contains("  ssh\\x1b[2J (3 sessions)\n"), "{o}");
+        // 39 lines sent, MAX_SHOWN shown: the rest join the 4 not sent.
+        let more = 39 - MAX_SHOWN + 4;
+        assert!(o.contains(&format!("    and {more} more\n")), "{o}");
+        assert!(
+            o.contains("  dns (1 session)\n    name  c2.example\n"),
+            "{o}"
+        );
+        assert!(!o.lines().any(|l| l.trim_start().starts_with("FAKE")));
+    }
+
+    #[test]
+    fn an_incident_without_honeypot_sessions_shows_no_section() {
+        let o = incident(&incident_json(), Some("boot-a"));
+        assert!(!o.contains("honeypot"));
+        let mut v = incident_json();
+        v["honeypot"] = json!("from a daemon that means something else by it");
+        assert_eq!(incident(&v, Some("boot-a")), o);
+    }
+
+    #[test]
+    fn timeline_shows_honeypot_sessions() {
+        let t = timeline(
+            &[
+                json!({"ts":"t1","honeypot_session":{"session":"1-0000000a","protocol":"http",
+                "dst":"1.2.3.4:80","dns_name":"c2.example\u{1b}[2J","payloads":1}}),
+            ],
+            None,
+        );
+        assert_inert(&t);
+        let words = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            words,
+            "t1 honeypot http to 1.2.3.4:80 (c2.example\\x1b[2J) - -"
+        );
+    }
+
+    #[test]
+    fn a_filing_cap_is_said() {
+        let mut v = honeypot_json();
+        v["honeypot_cap_reached"] = json!(true);
+        let o = incident(&v, Some("boot-a"));
+        assert!(
+            o.ends_with("  filing stopped at its cap; later sessions were not kept\n"),
+            "{o}"
+        );
+        let t = timeline(
+            &[json!({"ts":"t1","honeypot_cap_reached":{"sessions":4096}})],
+            None,
+        );
+        let words = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(words, "t1 honeypot filing stopped at 4096 sessions - -");
+    }
+
+    #[test]
+    fn sessions_aegisd_could_not_read_are_counted() {
+        let mut v = honeypot_json();
+        v["honeypot_unread"] = json!(5);
+        let o = incident(&v, Some("boot-a"));
+        assert!(o.contains("\nhoneypot (9 sessions)\n"), "{o}");
+        assert!(o.ends_with("  and 5 more sessions not read\n"), "{o}");
+        let mut v = incident_json();
+        v["honeypot_unread"] = json!(2);
+        let o = incident(&v, Some("boot-a"));
+        assert!(
+            o.ends_with("\nhoneypot (2 sessions)\n  and 2 more sessions not read\n"),
+            "{o}"
+        );
     }
 }

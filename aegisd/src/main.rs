@@ -2,12 +2,14 @@
 mod config;
 mod ebpf;
 mod enforce;
+mod filed;
 mod incident;
 mod ipc;
 mod pipeline;
 mod proctable;
 mod scoring;
 mod spool;
+mod stix;
 mod telemetry;
 mod verify;
 
@@ -301,7 +303,13 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
         },
     );
     let (call_tx, mut calls) = mpsc::channel::<ipc::Call>(16);
-    let server = tokio::spawn(ipc::serve(listener, call_tx, 0));
+    let pcaps = store.clone();
+    let server = tokio::spawn(ipc::serve(
+        listener,
+        call_tx,
+        0,
+        Arc::new(move |req| answer_pcap(req, &pcaps)),
+    ));
     verifying.warm(&c);
     sd_notify("READY=1");
     eprintln!(
@@ -342,7 +350,9 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
             Some((job, env)) = env_done.recv() => pipe.env_read(job, env),
             Some((req, reply)) = calls.recv() => match req {
                 // Disk reads: answer off the loop.
-                Request::IncidentShow { .. } | Request::IncidentTimeline { .. } => {
+                Request::IncidentShow { .. }
+                | Request::IncidentTimeline { .. }
+                | Request::IncidentStix { .. } => {
                     let store = store.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ = reply.send(answer_disk(req, &store));
@@ -580,14 +590,64 @@ fn enforce_admin_in(
 fn answer_disk(req: Request, store: &IncidentStore) -> Response {
     let missing = || Response::Error("no such incident".into());
     match req {
-        Request::IncidentShow { id } => store
-            .get(&IncidentId(id))
-            .and_then(|i| serde_json::to_value(i).ok())
-            .map_or_else(missing, Response::Incident),
+        Request::IncidentShow { id } => {
+            let id = IncidentId(id);
+            let Some(mut v) = store.get(&id).and_then(|i| serde_json::to_value(i).ok()) else {
+                return missing();
+            };
+            if let Some(dir) = store.dir_of(&id) {
+                filed::add_show(&mut v, &dir);
+            }
+            if cap_reached(store, &id) {
+                v["honeypot_cap_reached"] = true.into();
+            }
+            Response::Incident(v)
+        }
         Request::IncidentTimeline { id } => store
             .timeline(&IncidentId(id))
             .map_or_else(missing, Response::Timeline),
+        Request::IncidentStix { id } => {
+            let id = IncidentId(id);
+            match (store.get(&id), store.dir_of(&id)) {
+                (Some(inc), Some(dir)) => {
+                    let mut b = stix::Bundle::new(&inc, &telemetry::hostname());
+                    let unread = filed::each(&dir, |s| b.session(&s));
+                    Response::Stix(b.finish(unread, cap_reached(store, &id)))
+                }
+                _ => missing(),
+            }
+        }
         _ => Response::Error("internal: wrong handler".into()),
+    }
+}
+
+/// Whether filing stopped at its cap for this incident.
+fn cap_reached(store: &IncidentStore, id: &IncidentId) -> bool {
+    store
+        .timeline(id)
+        .is_some_and(|t| t.iter().any(|l| l.get("honeypot_cap_reached").is_some()))
+}
+
+/// `IncidentPcap`: the reply line and the merged pcap to stream after it.
+fn answer_pcap(req: Request, store: &IncidentStore) -> (Response, Option<ipc::Body>) {
+    let Request::IncidentPcap { id } = req else {
+        return (Response::Error("internal: wrong handler".into()), None);
+    };
+    let id = IncidentId(id);
+    let Some(dir) = store.dir_of(&id).filter(|_| store.get(&id).is_some()) else {
+        return (Response::Error("no such incident".into()), None);
+    };
+    match filed::pcap(&dir) {
+        Ok(mut m) => (
+            Response::Pcap {
+                bytes: m.bytes,
+                sessions: m.sessions,
+                left_out: m.left_out,
+                notes: std::mem::take(&mut m.notes),
+            },
+            Some((m.bytes, Box::new(m))),
+        ),
+        Err(e) => (Response::Error(e), None),
     }
 }
 
@@ -731,5 +791,84 @@ mod tests {
             answer.await.unwrap(),
             Response::Done(format!("killed {ID}"))
         );
+    }
+
+    #[test]
+    fn honeypot_views_answer_from_the_incident_dir() {
+        use aegis_proto::honeypot::Protocol;
+        use filed::tests::{dir, file, pcap_of, rec, session};
+        use std::io::Read;
+        let id = stix::tests::ID;
+        let d = dir("views");
+        let store = IncidentStore::open_at(&d.0, None, 0).unwrap();
+        let pcap = |s: &IncidentStore| answer_pcap(Request::IncidentPcap { id: id.into() }, s);
+        let (r, body) = pcap(&store);
+        assert_eq!(
+            (r, body.is_none()),
+            (Response::Error("no such incident".into()), true)
+        );
+        let inc = d.0.join(id);
+        std::fs::create_dir_all(&inc).unwrap();
+        let json = serde_json::to_value(stix::tests::incident()).unwrap();
+        std::fs::write(inc.join("incident.json"), json.to_string()).unwrap();
+
+        // Drop mode: show is incident.json as before, pcap has nothing.
+        let show = || answer_disk(Request::IncidentShow { id: id.into() }, &store);
+        assert_eq!(show(), Response::Incident(json.clone()));
+        match pcap(&store) {
+            (Response::Error(e), None) => assert!(e.starts_with("nothing to export"), "{e}"),
+            r => panic!("{:?}", r.0),
+        }
+        let stix = || answer_disk(Request::IncidentStix { id: id.into() }, &store);
+        assert!(matches!(stix(), Response::Stix(b) if b["type"] == "bundle"));
+
+        let p = pcap_of(&[rec(5, 0, 40)]);
+        file(
+            &inc,
+            &session("1793275260000-0000000a", Protocol::Ssh),
+            Some(&p),
+        );
+        let Response::Incident(v) = show() else {
+            panic!()
+        };
+        assert_eq!(v["honeypot"][0]["protocol"], "ssh");
+        let (r, body) = pcap(&store);
+        assert_eq!(
+            r,
+            Response::Pcap {
+                bytes: p.len() as u64,
+                sessions: 1,
+                left_out: 0,
+                notes: vec![],
+            }
+        );
+        let mut out = Vec::new();
+        body.unwrap().1.read_to_end(&mut out).unwrap();
+        assert_eq!(out, p);
+        let Response::Stix(b) = stix() else { panic!() };
+        assert!(b.to_string().contains("network-traffic--"));
+        assert!(v.get("honeypot_cap_reached").is_none());
+        assert!(!b.to_string().contains("x_aegis_truncated"));
+
+        // Filing stopped at its cap: both say so.
+        std::fs::write(
+            inc.join("timeline.jsonl"),
+            "{\"ts\":\"t\",\"honeypot_cap_reached\":{\"sessions\":4096}}\n",
+        )
+        .unwrap();
+        let Response::Incident(v) = show() else {
+            panic!()
+        };
+        assert_eq!(v["honeypot_cap_reached"], true);
+        let Response::Stix(b) = stix() else { panic!() };
+        let od = b["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["type"] == "observed-data")
+            .unwrap()
+            .clone();
+        assert_eq!(od["x_aegis_truncated"], true);
+        assert!(od["x_aegis_note"].as_str().unwrap().contains("4096"));
     }
 }
