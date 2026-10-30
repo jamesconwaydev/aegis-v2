@@ -22,7 +22,6 @@ mod upload;
 mod web;
 
 use std::os::fd::{FromRawFd, RawFd};
-use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -205,11 +204,7 @@ fn run() -> Result<()> {
     // anything of its own.
     let state = state(env("STATE_DIRECTORY").as_deref());
     let spool = state.join("spool");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o750)
-        .create(&spool)
-        .with_context(|| spool.display().to_string())?;
+    session::shared_dir(&spool).with_context(|| spool.display().to_string())?;
     let kernel = |f: &str| {
         let p = format!("/proc/sys/kernel/{f}");
         std::fs::read_to_string(&p).with_context(|| p)

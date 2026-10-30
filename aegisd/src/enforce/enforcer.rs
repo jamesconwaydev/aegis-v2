@@ -493,7 +493,7 @@ pub struct Enforcer {
     spool: Option<std::path::PathBuf>,
     /// Addresses whose observation ended, with the incident and when:
     /// their late sessions still file there for `Honeypot::grace`.
-    closed: HashMap<std::net::Ipv4Addr, (String, std::time::Instant)>,
+    closed: HashMap<std::net::Ipv4Addr, (String, std::time::SystemTime)>,
     /// Shared with the handle, for the metrics.
     filing: Arc<crate::spool::Counts>,
 }
@@ -1332,8 +1332,13 @@ mod tests {
         if let Some(i) = added {
             let (verb, chain) = (a[i - 1], a[i + 3]);
             let (next, rules) = t.as_mut().ok_or_else(gone)?;
-            let at = a.iter().position(|x| *x == "level").unwrap() + 2;
-            let cg = if a[at] == "!=" { a[at + 1] } else { a[at] };
+            // The slice-wide rule matches no cgroup.
+            let at = a.iter().position(|x| *x == "level").map(|i| i + 2);
+            let cg = match at {
+                Some(at) if a[at] == "!=" => a[at + 1],
+                Some(at) => a[at],
+                None => "",
+            };
             let h = *next;
             *next += 1;
             if verb == "insert" {
@@ -1342,11 +1347,11 @@ mod tests {
                 rules.push((h, cg.into()));
             }
             let tail = &a[i + 4..];
-            if chain != "out" || tail.contains(&"accept") || a[at] == "!=" {
+            if chain != "out" || tail.contains(&"accept") || at.is_none_or(|at| a[at] == "!=") {
                 let text: Vec<String> = tail
                     .iter()
                     .map(|x| {
-                        if *x == cg {
+                        if *x == cg && !cg.is_empty() {
                             format!("\"{x}\"")
                         } else {
                             x.to_string()
@@ -3395,6 +3400,7 @@ mod tests {
     }
 
     const S1: &str = crate::spool::tests::ID;
+    const SLICE_RULE: &str = "ip daddr 127.77.0.0/16 counter drop";
     const S2: &str = "1761696000001-0badf00d";
 
     fn filed(f: &Fx) -> [u64; 3] {
@@ -3450,15 +3456,170 @@ mod tests {
         // Not handed to another tree while its late sessions may come.
         assert_ne!(f.e.plan("AEG-next").unwrap().1, addr);
         // Past the grace, the address is anyone's and its sessions go.
-        let Some(long_ago) = std::time::Instant::now().checked_sub(Duration::from_secs(361)) else {
-            return;
-        };
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(361);
         f.e.closed.get_mut(&addr).unwrap().1 = long_ago;
         let gone = fake(&sp, &addr.to_string(), S2, &[]);
         f.e.run(EnforceJob::Reassert);
         assert!(!gone.exists());
         assert_eq!(filed(&f), [1, 1, 0]);
         assert_eq!(f.e.plan("AEG-next").unwrap().1, addr);
+    }
+
+    #[test]
+    fn filing_keeps_what_it_filed_when_a_later_session_fails() {
+        let (mut f, sp) = hp_spool("file-ioerr");
+        let fake = crate::spool::tests::fake;
+        observe(&mut f, &[10]);
+        let addr = f.e.observing[&f.id].addr.to_string();
+        let first = "1761696000000-00000001";
+        fake(&sp, &addr, first, &[]);
+        let later = fake(&sp, &addr, "1761696000000-00000002", &[b"p"]);
+        // The incident's payloads/ can't be made: the later one fails.
+        std::fs::write(f.dir.join(&f.id).join("payloads"), b"").unwrap();
+        f.e.run(EnforceJob::Reassert);
+        let tl = f.e.store.timeline(&IncidentId(f.id.clone())).unwrap();
+        let ev = tl
+            .iter()
+            .find_map(|l| l.get("honeypot_session"))
+            .expect("the first session's line");
+        assert_eq!(ev["session"], first);
+        assert_eq!(filed(&f), [1, 0, 0]);
+        assert!(later.join("session.json").exists());
+    }
+
+    /// An action recorded `ago` seconds back.
+    fn rec_at(kind: &str, detail: &str, ago: u64) -> ActionRecord {
+        let mut a = act(kind, None, vec![], Ok(None));
+        a.detail = Some(detail.into());
+        a.ts = rfc3339(now_ns() - ago * 1_000_000_000);
+        a
+    }
+
+    #[test]
+    fn a_restart_keeps_an_address_in_its_grace() {
+        let addr: std::net::Ipv4Addr = "127.77.0.1".parse().unwrap();
+        for (ago, kept) in [(10, true), (1000, false)] {
+            let mut f = hp(&format!("hp-regrace-{ago}"), ok);
+            let acts = vec![
+                rec_at("honeypot_open", "127.77.0.1", ago + 100),
+                rec_at("honeypot_close", "observation window ended", ago),
+            ];
+            let iid = IncidentId(f.id.clone());
+            f.e.store.add_actions(&iid, acts, None).unwrap();
+            // A new aegisd.
+            f.e.close_observing();
+            assert_eq!(f.e.closed.contains_key(&addr), kept, "{ago}");
+            assert_eq!(f.e.plan("AEG-next").unwrap().1 != addr, kept, "{ago}");
+        }
+    }
+
+    #[test]
+    fn a_close_recorded_in_the_future_is_held_no_longer_than_its_grace() {
+        let mut f = hp("hp-regrace-future", ok);
+        let mut close = rec_at("honeypot_close", "observation window ended", 0);
+        close.ts = rfc3339(now_ns() + 3600 * 1_000_000_000);
+        let acts = vec![rec_at("honeypot_open", "127.77.0.1", 100), close];
+        f.e.store
+            .add_actions(&IncidentId(f.id.clone()), acts, None)
+            .unwrap();
+        f.e.close_observing();
+        let t = f.e.closed[&"127.77.0.1".parse().unwrap()].1;
+        assert!(t <= std::time::SystemTime::now());
+    }
+
+    #[test]
+    fn the_slice_rule_comes_back_while_an_address_is_in_grace() {
+        let mut f = hp("hp-slice-grace", ok);
+        observe(&mut f, &[10]);
+        if let Some(h) = f.e.honeypot.lock().unwrap().as_mut() {
+            h.window = Duration::ZERO;
+        }
+        f.e.run(EnforceJob::Reassert);
+        assert!(!f.e.closed.is_empty() && f.e.observing.is_empty());
+        // Someone deletes it while nothing is observed.
+        let l = f.e.nft.list().unwrap().unwrap();
+        let h = Nft::rules_for_test(&l)
+            .into_iter()
+            .find(|(_, line, _)| line.contains(SLICE_RULE))
+            .unwrap()
+            .2;
+        f.e.nft.remove("out", h).unwrap();
+        assert!(!shaped().iter().any(|r| r.1 == SLICE_RULE));
+        f.e.run(EnforceJob::Reassert);
+        assert!(shaped().iter().any(|r| r.1 == SLICE_RULE));
+    }
+
+    #[test]
+    fn a_copy_a_crash_left_is_removed() {
+        let (mut f, _sp) = hp_spool("file-tidy");
+        let hp = f.dir.join(&f.id).join("honeypot");
+        let left = hp.join(".1761696000000-0badf00d");
+        let plant = || {
+            std::fs::create_dir_all(&left).unwrap();
+            std::fs::write(left.join("stream.pcap"), b"x").unwrap();
+        };
+        let kept = hp.join("1761696000000-00000009");
+        std::fs::create_dir_all(&kept).unwrap();
+        // At start, for every incident.
+        plant();
+        f.e.close_observing();
+        assert!(!left.exists());
+        // On a tick, for each incident filed into.
+        observe(&mut f, &[10]);
+        plant();
+        f.e.run(EnforceJob::Reassert);
+        assert!(!left.exists());
+        assert!(kept.exists());
+    }
+
+    /// The first rule in `out` a packet from `cg` to `addr:port` meets,
+    /// read from the fake table in order; "policy accept" if none.
+    fn first_out(cg: &str, addr: &str, port: u16) -> String {
+        shaped()
+            .into_iter()
+            .filter(|r| r.0 == "out")
+            .map(|r| r.1)
+            .find(|t| {
+                if let Some(c) = t.strip_prefix("drop ") {
+                    return c == cg;
+                }
+                // Every scope tested is in the quarantine slice.
+                let mine = !t.contains("level 2 !=")
+                    && (!t.contains("cgroupv2") || t.contains(&format!("\"{cg}\"")));
+                let to = t.contains(&format!("ip daddr {addr} "))
+                    || t.contains("ip daddr 127.77.0.0/16");
+                let p = !t.contains("dport") || t.contains(&format!("dport {port} "));
+                mine && to && p
+            })
+            .unwrap_or_else(|| "policy accept".into())
+    }
+
+    #[test]
+    fn only_an_observed_tree_reaches_a_honeypot_address() {
+        let mut f = hp("hp-reach", ok);
+        observe(&mut f, &[10]);
+        let cg = Nft::scope_cgroup(QUARANTINE_SLICE, &q_unit(&f.id));
+        // Its accept comes before any drop.
+        assert!(first_out(&cg, "127.77.0.1", 2580).ends_with("accept"));
+        // Another tree in the slice, a released one say, is dropped.
+        let other = Nft::scope_cgroup(QUARANTINE_SLICE, "aegis-incident-x-q.scope");
+        assert_eq!(first_out(&other, "127.77.0.1", 2580), SLICE_RULE);
+        let id = f.id.clone();
+        run_reply(&mut f.e, |reply| EnforceJob::Release { id, reply }).unwrap();
+        assert_eq!(first_out(&cg, "127.77.0.1", 2580), SLICE_RULE);
+    }
+
+    #[test]
+    fn drop_mode_adds_no_honeypot_rule() {
+        let mut f = fx("drop-nft", ok);
+        observe(&mut f, &[10]);
+        f.e.run(EnforceJob::Reassert);
+        let c = take();
+        assert!(!c.is_empty());
+        assert!(!c
+            .iter()
+            .flatten()
+            .any(|a| a.contains("127.77") || a.as_str() == crate::enforce::nft::NAT));
     }
 
     #[test]
@@ -3469,7 +3630,7 @@ mod tests {
         // Even with an address on record from before a reload to drop.
         f.e.closed.insert(
             "127.77.0.1".parse().unwrap(),
-            (f.id.clone(), std::time::Instant::now()),
+            (f.id.clone(), std::time::SystemTime::now()),
         );
         f.e.run(EnforceJob::Reassert);
         assert!(s.join("session.json").exists());
@@ -3540,7 +3701,7 @@ mod tests {
                 ("out".into(), format!("socket cgroupv2 level 3 {q} ip daddr 127.77.0.1 udp dport 2553 counter accept")),
                 ("out".into(), format!("socket cgroupv2 level 3 {q} ip daddr 127.77.0.1 tcp dport 2580 counter accept")),
                 ("out".into(), format!("drop {cg}")),
-                ("out".into(), "ip daddr 127.77.0.0/16 socket cgroupv2 level 2 != \"aegis.slice/aegis-quarantine.slice\" counter drop".into()),
+                ("out".into(), "ip daddr 127.77.0.0/16 counter drop".into()),
                 ("nat_out".into(), format!("socket cgroupv2 level 3 {q} meta l4proto tcp counter dnat ip to 127.77.0.1:2580")),
                 ("nat_out".into(), format!("socket cgroupv2 level 3 {q} udp dport 53 counter dnat ip to 127.77.0.1:2553")),
             ]
@@ -3727,7 +3888,7 @@ mod tests {
         let c = take();
         assert_eq!(c[0][1], "freeze", "frozen before the holds are walked");
         assert!(c.iter().any(|a| a[0] == "unguard"));
-        assert!(shaped().iter().all(|r| r.1.contains("level 2 !=")));
+        assert!(shaped().iter().all(|r| r.1 == SLICE_RULE));
         assert_eq!(summary(&f).as_deref(), Some("released"));
         assert!(f.e.observing.is_empty());
 
@@ -3762,7 +3923,7 @@ mod tests {
             .map(|a| a[5].as_str())
             .collect();
         assert_eq!(deletes, ["out", "out", "out", "nat_out", "nat_out"]);
-        assert!(shaped().iter().all(|r| r.1.contains("level 2 !=")));
+        assert!(shaped().iter().all(|r| r.1 == SLICE_RULE));
         assert_eq!(f.e.holds.held(), 0);
         assert_eq!(summary(&f).as_deref(), Some("killed"));
         assert_eq!(last_act(&f).detail.as_deref(), Some("killed"));

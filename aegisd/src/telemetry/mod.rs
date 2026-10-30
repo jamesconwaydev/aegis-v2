@@ -215,6 +215,41 @@ pub fn rfc3339(ts_ns: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
+/// Seconds since the epoch of an `rfc3339` timestamp.
+pub fn unix_secs(ts: &str) -> Option<u64> {
+    let b = ts.as_bytes();
+    let shape = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'Z'),
+    ];
+    if b.len() != 20 || shape.iter().any(|&(i, c)| b[i] != c) {
+        return None;
+    }
+    let n = |i: usize, w: usize| -> Option<u64> {
+        let s = &ts[i..i + w];
+        s.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| s.parse().ok())?
+    };
+    let (y, mo, d) = (n(0, 4)?, n(5, 2)?, n(8, 2)?);
+    let (h, mi, s) = (n(11, 2)?, n(14, 2)?, n(17, 2)?);
+    if y < 1970 || !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60
+    {
+        return None;
+    }
+    // Civil date to days, after Howard Hinnant, as `civil` inverted.
+    let y = if mo <= 2 { y - 1 } else { y };
+    let (era, yoe) = (y / 400, y % 400);
+    let doy = (153 * ((mo + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146_097 + doe).checked_sub(719_468)?;
+    Some(days * 86400 + h * 3600 + mi * 60 + s)
+}
+
 /// (year, month, day, hour, minute, second) in UTC.
 pub fn civil(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     // Days to civil date, after Howard Hinnant.
@@ -260,5 +295,21 @@ mod tests {
         assert_eq!(unb64(&b64(b"\xff\x00a\n")), b"\xff\x00a\n");
         assert_eq!(rfc3339(1_781_775_000_000_000_000), "2026-06-18T09:30:00Z");
         assert_eq!(rfc3339(951_782_400_000_000_000), "2000-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_reads_back() {
+        assert_eq!(unix_secs("2026-06-18T09:30:00Z"), Some(1_781_775_000));
+        for s in [0, 951_782_400, 1_781_775_000, 4_102_444_799] {
+            assert_eq!(unix_secs(&rfc3339(s * 1_000_000_000)), Some(s), "{s}");
+        }
+        for bad in [
+            "",
+            "2026-06-18",
+            "2026-13-01T00:00:00Z",
+            "x026-06-18T09:30:00Z",
+        ] {
+            assert_eq!(unix_secs(bad), None, "{bad}");
+        }
     }
 }

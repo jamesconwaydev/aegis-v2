@@ -75,11 +75,19 @@ pub struct Swept {
     pub why: Option<String>,
     /// Unfinished session dirs deleted.
     pub stale: u64,
+    /// An error on the incident side that stopped the walk early.
+    pub io: Option<io::Error>,
 }
+
+/// Where the sessions on an address go: the incident's id, its
+/// directory, and when its observation of the address opened (Unix ms).
+pub type Find<'a> = &'a dyn Fn(Ipv4Addr) -> Option<(String, PathBuf, u64)>;
 
 /// Why a session wasn't filed.
 enum Skip {
     Unmatched,
+    /// Filed on an earlier tick, whose delete from the spool failed.
+    Filed,
     /// The spool's fault: the session is deleted.
     Bad(String),
     /// Ours (the incident side): the session stays for the next tick.
@@ -251,7 +259,27 @@ fn names(dir: &File) -> io::Result<Vec<CString>> {
             }
         }
         libc::closedir(d);
+        // Oldest session first: ids start with their time.
+        out.sort_unstable();
         Ok(out)
+    }
+}
+
+/// Says which side of the walk an error came from.
+fn tag(what: &str, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{what}: {e}"))
+}
+
+/// Removes what a crash mid-copy left in an incident's `honeypot/`:
+/// the hidden directories filing copies into before the rename.
+pub fn tidy(inc_dir: &Path) {
+    let Ok(rd) = fs::read_dir(inc_dir.join("honeypot")) else {
+        return;
+    };
+    for e in rd.flatten() {
+        if e.file_name().as_encoded_bytes().starts_with(b".") {
+            let _ = fs::remove_dir_all(e.path());
+        }
     }
 }
 
@@ -302,11 +330,7 @@ fn copy(src: &mut File, to: &Path, max: u64) -> Result<(u64, String), Skip> {
 /// deletes unfinished sessions older than `lim.stale`. A missing spool
 /// is nothing to do. One owned by root is refused: its owner is taken
 /// to be the honeypot user, and root's files are never fair game.
-pub fn sweep(
-    spool: &Path,
-    lim: Limits,
-    find: &dyn Fn(Ipv4Addr) -> Option<(String, PathBuf)>,
-) -> io::Result<Swept> {
+pub fn sweep(spool: &Path, lim: Limits, find: Find) -> io::Result<Swept> {
     let root = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -336,8 +360,16 @@ pub fn sweep(
             break;
         }
         match addr_name(&n) {
-            Some(a) => w.addr(&root, &n, a, find)?,
-            None => w.remove(&root, &n, 0),
+            Some(a) => {
+                // What was filed before it still counts.
+                if let Err(e) = w.addr(&root, &n, a, find) {
+                    w.out.io = Some(e);
+                    break;
+                }
+            }
+            None => {
+                w.remove(&root, &n, 0);
+            }
         }
     }
     Ok(w.out)
@@ -360,9 +392,11 @@ impl Walk {
     fn busy(&mut self) -> bool {
         self.visits += 1;
         // Room to delete a whole session after filing it.
+        // One more session may copy up to its cap; the first always may.
+        let cap = self.lim.max_session_bytes.saturating_add(PCAP_FIXED);
         self.visits > MAX_VISITS
             || self.sessions >= MAX_SESSIONS
-            || self.bytes >= MAX_BYTES
+            || (self.bytes > 0 && self.bytes.saturating_add(cap) > MAX_BYTES)
             || self.left < MAX_PAYLOADS + 8
     }
 
@@ -374,36 +408,35 @@ impl Walk {
 
     /// Deletes `name` in `dir`: itself if it isn't a directory (a link
     /// is removed, never followed), else its tree, if the honeypot user
-    /// owns each directory in it.
-    fn remove(&mut self, dir: &File, name: &CStr, depth: u32) {
+    /// owns each directory in it. True once it is gone.
+    fn remove(&mut self, dir: &File, name: &CStr, depth: u32) -> bool {
         if self.left == 0 {
-            return;
+            return false;
         }
         self.left -= 1;
-        if unlinkat(dir, name, 0).is_ok() || depth >= MAX_DEPTH {
-            return;
+        if unlinkat(dir, name, 0).is_ok() {
+            return true;
         }
-        let Some(d) = self.dir(dir, name) else { return };
+        if depth >= MAX_DEPTH {
+            return false;
+        }
+        let Some(d) = self.dir(dir, name) else {
+            return false;
+        };
         for n in names(&d).unwrap_or_default() {
             self.remove(&d, &n, depth + 1);
         }
-        let _ = unlinkat(dir, name, libc::AT_REMOVEDIR);
+        unlinkat(dir, name, libc::AT_REMOVEDIR).is_ok()
     }
 
     /// `spool/<a>/`: finished sessions in `done/`, unfinished ones
     /// beside it.
-    fn addr(
-        &mut self,
-        root: &File,
-        name: &CStr,
-        a: Ipv4Addr,
-        find: &dyn Fn(Ipv4Addr) -> Option<(String, PathBuf)>,
-    ) -> io::Result<()> {
+    fn addr(&mut self, root: &File, name: &CStr, a: Ipv4Addr, find: Find) -> io::Result<()> {
         let Some(d) = self.dir(root, name) else {
             self.remove(root, name, 0);
             return Ok(());
         };
-        for n in names(&d)? {
+        for n in names(&d).map_err(|e| tag("listing the spool", e))? {
             if self.busy() {
                 break;
             }
@@ -412,13 +445,15 @@ impl Walk {
                     self.remove(&d, &n, 0);
                     continue;
                 };
-                for s in names(&done)? {
+                for s in names(&done).map_err(|e| tag("listing the spool", e))? {
                     if self.busy() {
                         break;
                     }
                     match s.to_str().ok().filter(|s| session_id(s)) {
                         Some(id) => self.session(&done, &s, id, a, find)?,
-                        None => self.remove(&done, &s, 0),
+                        None => {
+                            self.remove(&done, &s, 0);
+                        }
                     }
                 }
             } else if n.to_str().is_ok_and(session_id) {
@@ -433,7 +468,8 @@ impl Walk {
     /// An unfinished session: deleted once it is too old to be live.
     fn stale(&mut self, dir: &File, name: &CStr) {
         let Some(d) = self.dir(dir, name) else {
-            return self.remove(dir, name, 0);
+            self.remove(dir, name, 0);
+            return;
         };
         let old = d.metadata().and_then(|m| m.modified()).is_ok_and(|t| {
             self.now
@@ -453,20 +489,33 @@ impl Walk {
         name: &CStr,
         id: &str,
         a: Ipv4Addr,
-        find: &dyn Fn(Ipv4Addr) -> Option<(String, PathBuf)>,
+        find: Find,
     ) -> io::Result<()> {
         self.sessions += 1;
-        match self.file(done, name, id, a, find) {
-            Ok(filed) => self.out.filed.push(filed),
-            Err(Skip::Unmatched) => self.out.unmatched += 1,
+        let filed = match self.file(done, name, id, a, find) {
+            Ok(filed) => {
+                self.out.filed.push(filed);
+                true
+            }
+            Err(Skip::Filed) => false,
+            Err(Skip::Unmatched) => {
+                self.out.unmatched += 1;
+                false
+            }
             Err(Skip::Bad(why)) => {
                 self.out.rejected += 1;
                 self.out.why.get_or_insert(format!("{a}/done/{id}: {why}"));
+                false
             }
             // Left in place for the next tick; the sweep stops here.
-            Err(Skip::Io(e)) => return Err(e),
+            Err(Skip::Io(e)) => return Err(tag("filing into the incident", e)),
+        };
+        // Said once, when filed: later ticks find it filed and try again.
+        if !self.remove(done, name, 0) && filed {
+            eprintln!(
+                "aegisd: honeypot spool: {a}/done/{id} filed, but not deleted from the spool"
+            );
         }
-        self.remove(done, name, 0);
         Ok(())
     }
 
@@ -503,9 +552,9 @@ impl Walk {
         name: &CStr,
         id: &str,
         a: Ipv4Addr,
-        find: &dyn Fn(Ipv4Addr) -> Option<(String, PathBuf)>,
+        find: Find,
     ) -> Result<(String, Session), Skip> {
-        let (inc, inc_dir) = find(a).ok_or(Skip::Unmatched)?;
+        let (inc, inc_dir, opened_ms) = find(a).ok_or(Skip::Unmatched)?;
         let d = match open_dir(done, name) {
             Ok(d) if d.metadata().is_ok_and(|m| m.uid() == self.uid) => d,
             Ok(_) => return bad("not the honeypot's directory"),
@@ -521,11 +570,17 @@ impl Walk {
         if s.id != id || s.addr != a {
             return bad("session.json is for another session");
         }
+        // From before this incident had the address: not its session.
+        // The open is recorded in whole seconds, once the holds are
+        // open: a first session can start a moment before it.
+        if s.started_ms < opened_ms.saturating_sub(5000) {
+            return bad("started before the incident's observation opened");
+        }
         let cap = self.lim.max_session_bytes.saturating_add(PCAP_FIXED);
         let hp = inc_dir.join("honeypot");
         let dest = hp.join(id);
         if dest.exists() {
-            return bad("already filed");
+            return Err(Skip::Filed);
         }
         private_dir(&hp)?;
         let tmp = hp.join(format!(".{id}"));
@@ -645,9 +700,35 @@ pub(crate) mod tests {
         fn sweep(&self) -> io::Result<Swept> {
             let inc = self.inc();
             sweep(&self.spool(), LIM, &|a: Ipv4Addr| {
-                (a.to_string() == ADDR).then(|| (INC.to_string(), inc.clone()))
+                (a.to_string() == ADDR).then(|| (INC.to_string(), inc.clone(), 0))
             })
         }
+        /// `sweep`, failing instead of hanging if an open blocks.
+        fn sweep_within(&self, secs: u64) -> io::Result<Swept> {
+            let (spool, inc) = (self.spool(), self.inc());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let r = sweep(&spool, LIM, &|a: Ipv4Addr| {
+                    (a.to_string() == ADDR).then(|| (INC.to_string(), inc.clone(), 0))
+                });
+                let _ = tx.send(r);
+            });
+            rx.recv_timeout(Duration::from_secs(secs))
+                .expect("the sweep hung")
+        }
+    }
+
+    fn fifo(p: &Path) {
+        let c = CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        own(p);
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 
     const LIM: Limits = Limits {
@@ -684,7 +765,7 @@ pub(crate) mod tests {
         serde_json::to_vec(&json!({
             "id": id, "protocol": "http", "addr": addr,
             "src": "10.0.0.2:40000", "dst": "1.2.3.4:80",
-            "started_ms": 1, "ended_ms": 2, "bytes_in": 3, "bytes_out": 4,
+            "started_ms": now_ms(), "ended_ms": now_ms(), "bytes_in": 3, "bytes_out": 4,
             "truncated": false, "timed_out": false, "payloads": payloads,
             "dns_name": "c2.example\u{1b}[31m", "queries": [], "sni": null, "ja4": null,
             "requests": [], "credentials": [{"user": "root", "password": "hunter2",
@@ -815,6 +896,10 @@ pub(crate) mod tests {
             ("a payload doesn't match its hash", |_, d| {
                 write(&d.join(sha(b"x")), b"y");
             }),
+            ("a payload is a FIFO", |_, d| {
+                fs::remove_file(d.join(sha(b"x"))).unwrap();
+                fifo(&d.join(sha(b"x")));
+            }),
             ("a payload is missing", |_, d| {
                 fs::remove_file(d.join(sha(b"x"))).unwrap();
             }),
@@ -838,7 +923,8 @@ pub(crate) mod tests {
                 .flatten()
                 .map(|e| e.path())
                 .collect();
-            let r = t.sweep().unwrap();
+            // Under a timeout: an open that blocks on a FIFO fails, not hangs.
+            let r = t.sweep_within(10).unwrap();
             assert_eq!((r.filed.len(), r.rejected), (0, 1), "{what}: {r:?}");
             assert!(
                 fs::symlink_metadata(&d).is_err(),
@@ -864,9 +950,9 @@ pub(crate) mod tests {
         if !root() {
             return eprintln!("skipped: needs root to chown");
         }
-        for f in ["session.json", "stream.pcap", ""] {
+        for f in ["session.json", "stream.pcap", &sha(b"x"), ""] {
             let t = T::new("owner");
-            let d = t.session(ADDR, ID, &[]);
+            let d = t.session(ADDR, ID, &[b"x"]);
             lchown(d.join(f), Some(HP + 1), None).unwrap();
             let r = t.sweep().unwrap();
             assert_eq!((r.filed.len(), r.rejected), (0, 1), "{f}: {r:?}");
@@ -999,13 +1085,107 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_session_filed_twice_is_refused_the_second_time() {
+    fn a_session_already_filed_is_deleted_quietly() {
         let t = T::new("twice");
         t.session(ADDR, ID, &[]);
         assert_eq!(t.sweep().unwrap().filed.len(), 1);
-        t.session(ADDR, ID, &[]);
+        // As after a spool delete that failed once it was filed.
+        let d = t.session(ADDR, ID, &[]);
         let r = t.sweep().unwrap();
-        assert_eq!((r.filed.len(), r.rejected), (0, 1));
+        assert_eq!((r.filed.len(), r.rejected, r.unmatched), (0, 0, 0), "{r:?}");
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn a_session_started_before_its_observation_is_refused() {
+        let t = T::new("early");
+        let d = t.session(ADDR, ID, &[]);
+        let inc = t.inc();
+        let r = sweep(&t.spool(), LIM, &|_| {
+            Some((INC.to_string(), inc.clone(), now_ms() + 60_000))
+        })
+        .unwrap();
+        assert_eq!((r.filed.len(), r.rejected), (0, 1), "{r:?}");
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn a_session_just_before_the_recorded_open_is_filed() {
+        let t = T::new("justbefore");
+        t.session(ADDR, ID, &[]);
+        let inc = t.inc();
+        // The open is recorded after the holds open, in whole seconds.
+        let r = sweep(&t.spool(), LIM, &|_| {
+            Some((INC.to_string(), inc.clone(), now_ms() + 1000))
+        })
+        .unwrap();
+        assert_eq!(r.filed.len(), 1, "{r:?}");
+    }
+
+    #[test]
+    fn an_incident_side_error_stops_the_tick_but_keeps_what_was_filed() {
+        let t = T::new("ioerr");
+        let first = "1761696000000-00000001";
+        let second = "1761696000000-00000002";
+        t.session(ADDR, first, &[]);
+        let d = t.session(ADDR, second, &[b"x"]);
+        // payloads/ can't be made: the second session can't be filed.
+        fs::write(t.inc().join("payloads"), b"").unwrap();
+        let r = t.sweep().unwrap();
+        assert_eq!(r.filed.len(), 1, "{r:?}");
+        assert_eq!(r.filed[0].1.id, first);
+        assert!(r.io.is_some());
+        // Left for the next tick, and nothing half-made beside it.
+        assert!(d.join("session.json").exists());
+        let names: Vec<_> = fs::read_dir(t.inc().join("honeypot"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, [first]);
+    }
+
+    #[test]
+    fn a_tick_copies_a_bounded_number_of_bytes() {
+        let t = T::new("bytes");
+        let lim = Limits {
+            max_session_bytes: MAX_BYTES - (1 << 20),
+            ..LIM
+        };
+        for i in 1..=2 {
+            let d = t.session(ADDR, &format!("1761696000000-0000000{i}"), &[]);
+            write(&d.join("stream.pcap"), &vec![0; 1 << 20]);
+        }
+        let inc = t.inc();
+        let find = |_| Some((INC.to_string(), inc.clone(), 0));
+        // After one 1 MiB session another full one would pass the bound.
+        assert_eq!(sweep(&t.spool(), lim, &find).unwrap().filed.len(), 1);
+        assert_eq!(sweep(&t.spool(), lim, &find).unwrap().filed.len(), 1);
+    }
+
+    #[test]
+    fn a_tick_deletes_a_bounded_number_of_entries() {
+        let t = T::new("unlinks");
+        for j in 0..5 {
+            let d = t.mkdir(&format!("junk{j}"));
+            for i in 0..1000 {
+                write(&d.join(i.to_string()), b"");
+            }
+        }
+        t.sweep().unwrap();
+        assert!(fs::read_dir(t.spool()).unwrap().count() > 0);
+        t.sweep().unwrap();
+        assert_eq!(fs::read_dir(t.spool()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn junk_is_deleted_only_so_deep() {
+        let t = T::new("depth");
+        t.mkdir("shallow/a/b/c");
+        let deep = t.mkdir("deep/a/b/c/d");
+        t.sweep().unwrap();
+        assert!(!t.spool().join("shallow").exists());
+        assert!(deep.exists());
     }
 
     #[test]

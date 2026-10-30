@@ -12,9 +12,7 @@ pub const NFT_PATHS: [&str; 2] = ["/usr/sbin/nft", "/usr/bin/nft"];
 
 /// The chain that sends an observed tree's traffic to the honeypot.
 pub const NAT: &str = "nat_out";
-/// The quarantine slice as nft matches it, and the addresses honeypot
-/// incidents take.
-const SLICE: &str = "aegis.slice/aegis-quarantine.slice";
+/// The addresses honeypot incidents take.
 const NET: &str = "127.77.0.0/16";
 
 pub struct Nft {
@@ -65,16 +63,21 @@ impl Nft {
         Ok(())
     }
 
-    /// Whether `listing` has the slice-wide rule `ensure_nat` adds.
+    /// Whether `listing` has the rule `ensure_nat` adds.
     pub fn has_local_rule(listing: &str) -> bool {
-        listing.contains(&format!("level 2 != \"{SLICE}\""))
+        Self::rules(listing)
+            .any(|(c, l, _)| c == "out" && l.contains(&format!("ip daddr {NET} counter")))
     }
 
     /// Honeypot mode's part of the table: the `nat_out` chain, and one
-    /// rule that drops anything sent to an incident address from outside
-    /// the quarantine slice, so local users can't reach a tree's
-    /// honeypot sessions. That rule is added only if missing: nft shows
-    /// the slice by a bare id once it is gone, and then it is replaced.
+    /// rule at the end of `out` that drops anything sent to an incident
+    /// address. Only an observed scope gets through, by the accepts
+    /// `redirect` puts at the head of `out`: its packets are already
+    /// DNATed when the filter hook sees them. So neither a local user
+    /// nor a released tree, still in the quarantine slice, can reach a
+    /// honeypot session and have it filed. The rule is added only if
+    /// missing; the older form, which let the whole slice through, is
+    /// replaced.
     pub fn ensure_nat(&self) -> Result<()> {
         self.nft(&[
             "add",
@@ -88,16 +91,16 @@ impl Nft {
         if Self::has_local_rule(&l) {
             return Ok(());
         }
+        // Added before the old one goes, so a failure leaves a drop.
+        self.nft(&[
+            "add", "rule", "inet", "aegis", "out", "ip", "daddr", NET, "counter", "drop",
+        ])?;
         for (c, line, h) in Self::rules(&l) {
             if line.contains(&format!("ip daddr {NET} socket cgroupv2 level 2 != ")) {
                 self.remove(c, h)?;
             }
         }
-        self.nft(&[
-            "add", "rule", "inet", "aegis", "out", "ip", "daddr", NET, "socket", "cgroupv2",
-            "level", "2", "!=", SLICE, "counter", "drop",
-        ])
-        .map(drop)
+        Ok(())
     }
 
     /// Sends what the cgroup sends to the honeypot at `addr`: TCP to
@@ -222,6 +225,13 @@ impl Nft {
             let h = l.rsplit_once("# handle ")?.1.trim().parse().ok()?;
             Some((chain, l, h))
         })
+    }
+
+    #[cfg(test)]
+    pub fn rules_for_test(listing: &str) -> Vec<(String, String, u64)> {
+        Self::rules(listing)
+            .map(|(c, l, h)| (c.to_string(), l.to_string(), h))
+            .collect()
     }
 
     /// Whether `listing` still has rule `h`.
@@ -359,7 +369,7 @@ mod tests {
                  \t\ttype filter hook output priority filter; policy accept;\n\
                  \t\tsocket cgroupv2 level 3 \"a/b.scope\" ip daddr 127.77.0.1 tcp dport 2580 counter packets 0 bytes 0 accept # handle 9\n\
                  \t\tsocket cgroupv2 level 3 \"a/b.scope\" counter packets 0 bytes 0 drop # handle 4\n\
-                 \t\tip daddr 127.77.0.0/16 socket cgroupv2 level 2 != \"aegis.slice/aegis-quarantine.slice\" counter packets 0 bytes 0 drop # handle 6\n\
+                 \t\tip daddr 127.77.0.0/16 counter packets 0 bytes 0 drop # handle 6\n\
                  \t}\n\
                  \tchain nat_out { # handle 2\n\
                  \t\tsocket cgroupv2 level 3 \"a/b.scope\" meta l4proto tcp counter packets 0 bytes 0 dnat ip to 127.77.0.1:2580 # handle 11\n\
@@ -399,6 +409,45 @@ mod tests {
                 format!("{pre} add rule inet aegis nat_out socket cgroupv2 level 3 c udp dport 53 counter dnat ip to 127.77.0.2:2553"),
             ]
         );
+    }
+
+    #[test]
+    fn ensure_nat_replaces_the_old_slice_rule() {
+        thread_local! { static ARGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; }
+        thread_local! { static LIST: std::cell::RefCell<&'static str> = const { std::cell::RefCell::new("") }; }
+        fn rec(_: &str, a: &[String]) -> Result<String> {
+            ARGS.with(|x| x.borrow_mut().push(a.join(" ")));
+            Ok(if a[0] == "-a" {
+                LIST.with(|l| *l.borrow())
+            } else {
+                ""
+            }
+            .into())
+        }
+        // What a v0.3 host before this change has: everyone outside the
+        // slice dropped, everyone in it let through.
+        let old = "table inet aegis { # handle 5\n\tchain out { # handle 1\n\
+                   \t\tip daddr 127.77.0.0/16 socket cgroupv2 level 2 != \"aegis.slice/aegis-quarantine.slice\" counter packets 0 bytes 0 drop # handle 6\n\
+                   \t}\n}\n";
+        let new = "table inet aegis { # handle 5\n\tchain out { # handle 1\n\
+                   \t\tip daddr 127.77.0.0/16 counter packets 3 bytes 180 drop # handle 8\n\
+                   \t}\n}\n";
+        assert!(!Nft::has_local_rule(old));
+        assert!(Nft::has_local_rule(new));
+        LIST.with(|l| *l.borrow_mut() = old);
+        Nft::with(rec).ensure_nat().unwrap();
+        let a = ARGS.with(|x| x.take());
+        assert_eq!(a[1], "-a list table inet aegis");
+        // The new rule goes in first: never a moment with neither.
+        assert_eq!(
+            a[2],
+            "add rule inet aegis out ip daddr 127.77.0.0/16 counter drop"
+        );
+        assert_eq!(a[3], "delete rule inet aegis out handle 6");
+        assert_eq!(a.len(), 4);
+        LIST.with(|l| *l.borrow_mut() = new);
+        Nft::with(rec).ensure_nat().unwrap();
+        assert_eq!(ARGS.with(|x| x.take()).len(), 2, "already there");
     }
 
     #[test]
