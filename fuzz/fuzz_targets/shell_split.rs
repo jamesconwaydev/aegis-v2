@@ -2,7 +2,7 @@
 //! The honeypot's fake shell: a typed line into the splitter, then run.
 #![no_main]
 
-use aegis_honeypot::shell::{run, split, Host, MAX_OUT};
+use aegis_honeypot::shell::{prompt, run, split, Host, HOME, MAX_OUT};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -22,7 +22,11 @@ fuzz_target!(|data: &[u8]| {
         arch: "x86_64".into(),
     };
     let mut seen = Vec::new();
-    let r = run(&line, &host, |c| seen.push(c.to_string()));
+    let mut cwd = String::from(HOME);
+    let r = run(&line, &host, &mut cwd, |c| seen.push(c.to_string()));
+    // cd keeps the directory within PATH_MAX, and absolute.
+    assert!(cwd.starts_with('/') && cwd.len() <= 4096, "{cwd:?}");
+    let _ = prompt(&host, &cwd);
     assert!(r.out.len() <= MAX_OUT);
     // Run sees the same commands, stopping early only at an exit.
     let want: Vec<&str> = cmds.iter().map(|(c, _)| *c).collect();

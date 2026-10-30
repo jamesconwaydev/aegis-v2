@@ -14,7 +14,8 @@ fn feed(pieces: &[&[u8]]) -> Seen {
     let mut ok = true;
     for piece in pieces {
         let r = p.feed(piece, &mut out, &mut |e| match e {
-            Event::Start(n) => {
+            Event::Start(n, size) => {
+                assert!(size.is_some());
                 assert!(!n.is_empty() && n.len() < MAX_LINE);
                 files.push((n.to_vec(), Vec::new(), false));
             }

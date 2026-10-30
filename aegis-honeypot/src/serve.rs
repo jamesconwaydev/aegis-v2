@@ -99,6 +99,8 @@ pub struct Server {
     /// HTTPS, with a leaf from the host's CA for each name asked.
     pub tls: Arc<ServerConfig>,
     pub ssh: Ssh,
+    /// SSH sessions' own count, within TCP's; see `ssh::slots`.
+    pub ssh_slots: Slots,
 }
 
 impl Server {
@@ -207,6 +209,14 @@ async fn run(
             by_bytes(&first[..n])
         }
     };
+    // Held until russh's task for the connection has ended.
+    let _ssh = match protocol {
+        Protocol::Ssh => match srv.ssh_slots.take(addr) {
+            Some(s) => Some(s),
+            None => return Ok(()),
+        },
+        _ => None,
+    };
     let opened = Session::open(
         &srv.spool,
         srv.max_bytes,
@@ -304,6 +314,7 @@ pub(crate) mod tests {
             names: RefCell::default(),
             tls,
             ssh: crate::ssh::tests::ssh(name),
+            ssh_slots: crate::ssh::slots(),
         });
         (srv, ca)
     }
@@ -507,6 +518,23 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn ssh_past_its_own_cap_is_refused_while_http_is_served() {
+        let srv = server("hsshcap", 1000, Duration::from_secs(5));
+        let held: Vec<_> = std::iter::from_fn(|| srv.ssh_slots.take(INCIDENT)).collect();
+        assert_eq!(held.len(), 8);
+        let (c, io) = pair(INCIDENT).await;
+        bounded(&srv, async {
+            handle(srv.clone(), io, Some(Protocol::Ssh)).await.unwrap();
+            eof(c).await;
+        })
+        .await;
+        let done = srv.spool.join("127.77.0.1/done");
+        assert!(std::fs::read_dir(&done).map_or(true, |mut d| d.next().is_none()));
+        let rec = one(&srv, Some(Protocol::Http), |c| async move { drop(c) }).await;
+        assert_eq!(rec.protocol, Protocol::Http);
+    }
+
+    #[tokio::test]
     async fn a_full_disk_gets_no_session() {
         let mut s = Rc::into_inner(server("hdisk", 1000, Duration::from_secs(5))).unwrap();
         s.floor = Floor {
@@ -538,6 +566,7 @@ pub(crate) mod tests {
             names: RefCell::default(),
             tls: crate::ca::tests::tls("hreserve").0,
             ssh: crate::ssh::tests::ssh("hreserve"),
+            ssh_slots: crate::ssh::slots(),
         });
         let other = srv.slots.take(Ipv4Addr::new(127, 77, 0, 9)).unwrap();
         refused(&srv, INCIDENT).await;

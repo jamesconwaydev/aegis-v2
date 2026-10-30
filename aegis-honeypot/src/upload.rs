@@ -5,10 +5,11 @@
 //! what arrived, nothing the client claims sizes an allocation, and a
 //! name is only ever handed on as bytes, never used as a path.
 
-/// What a client did with a file. Data comes at the offset it gives.
+/// What a client did with a file: its name and, for scp, the size it
+/// claims. Data comes at the offset it gives.
 #[derive(Debug, PartialEq)]
 pub enum Event<'a> {
-    Start(&'a [u8]),
+    Start(&'a [u8], Option<u64>),
     Data(u64, &'a [u8]),
     End,
 }
@@ -22,6 +23,9 @@ pub const MAX_LINE: usize = 1024;
 /// The longest SFTP packet held. OpenSSH's clients write 32 KiB at a
 /// time unless the server offers more.
 pub const MAX_PACKET: usize = 64 * 1024;
+/// The most one read's replies may come to; a client sending a flood
+/// of tiny requests gets the channel closed instead.
+pub const MAX_REPLY: usize = 64 * 1024;
 
 /// scp's sink side: control lines, then each file's bytes.
 #[derive(Default)]
@@ -93,7 +97,7 @@ impl Scp {
                 match self.line.first() {
                     Some(b'C') => {
                         let (size, name) = file_line(&self.line).ok_or(Bad)?;
-                        f(Event::Start(name));
+                        f(Event::Start(name, Some(size)));
                         out.push(0);
                         self.at = 0;
                         if size == 0 {
@@ -136,6 +140,7 @@ const FXF_WRITE: u32 = 2;
 const OK: u32 = 0;
 const PERMISSION_DENIED: u32 = 3;
 const HANDLE: &[u8] = b"1";
+const PATH_MAX: usize = 4096;
 
 /// Reads a packet's fields, each checked against what's left.
 struct R<'a>(&'a [u8]);
@@ -196,29 +201,62 @@ fn status(out: &mut Vec<u8>, id: u32, code: u32) {
     );
 }
 
+/// The whole length of the packet starting `b`, once its length is in.
+fn whole(b: &[u8]) -> Result<Option<usize>, Bad> {
+    let Some(&[a, b2, c, d]) = b.get(..4) else {
+        return Ok(None);
+    };
+    let len = u32::from_be_bytes([a, b2, c, d]) as usize;
+    if len == 0 || len > MAX_PACKET {
+        return Err(Bad);
+    }
+    Ok(Some(4 + len))
+}
+
 impl Sftp {
-    /// Takes the next of the client's bytes. Replies go to `out`.
+    /// Takes the next of the client's bytes. Replies go to `out`; past
+    /// `MAX_REPLY` of them, Bad.
     pub fn feed(
         &mut self,
-        data: &[u8],
+        mut data: &[u8],
         out: &mut Vec<u8>,
         f: &mut impl FnMut(Event<'_>),
     ) -> Result<(), Bad> {
-        // Never more than one packet and one read held.
-        self.buf.extend_from_slice(data);
-        let mut at = 0;
-        while let Some(len) = self.buf.get(at..at + 4) {
-            let len = u32::from_be_bytes([len[0], len[1], len[2], len[3]]) as usize;
-            if len == 0 || len > MAX_PACKET {
-                return Err(Bad);
+        let cap = out.len() + MAX_REPLY;
+        // A packet begun in an earlier read: only the rest of it is
+        // copied.
+        while !self.buf.is_empty() {
+            let want = whole(&self.buf)?.unwrap_or(4);
+            if self.buf.len() == want {
+                packet(&self.buf[4..], &mut self.open, out, f)?;
+                self.buf = Vec::new();
+                break;
             }
-            let Some(p) = self.buf.get(at + 4..at + 4 + len) else {
+            if data.is_empty() {
+                return Ok(());
+            }
+            let n = (want - self.buf.len()).min(data.len());
+            // Exactly: doubling would hold up to twice a packet.
+            self.buf.reserve_exact(want - self.buf.len());
+            self.buf.extend_from_slice(&data[..n]);
+            data = &data[n..];
+        }
+        // Whole packets straight from the read.
+        while let Some(n) = whole(data)? {
+            let Some(p) = data.get(4..n) else {
                 break;
             };
+            if out.len() > cap {
+                return Err(Bad);
+            }
             packet(p, &mut self.open, out, f)?;
-            at += 4 + len;
+            data = &data[n..];
         }
-        self.buf.drain(..at);
+        if out.len() > cap {
+            return Err(Bad);
+        }
+        // At most the start of one packet.
+        self.buf.extend_from_slice(data);
         Ok(())
     }
 }
@@ -246,7 +284,7 @@ fn packet(
                 status(out, id, PERMISSION_DENIED);
             } else {
                 *open = true;
-                f(Event::Start(name));
+                f(Event::Start(name, None));
                 reply(out, &[&[HANDLE_REPLY], &id.to_be_bytes(), &string(HANDLE)]);
             }
         }
@@ -270,6 +308,8 @@ fn packet(
         }
         // sftp(1) asks where it is before anything else, and quits
         // without an answer.
+        // Longer than PATH_MAX: refused, not echoed back twice.
+        REALPATH if r.0.len() > 4 + PATH_MAX => status(out, id, PERMISSION_DENIED),
         REALPATH => {
             let path = match r.string()? {
                 b"" | b"." => b"/root".to_vec(),
@@ -308,7 +348,7 @@ pub(crate) mod tests {
 
     pub fn own(e: Event<'_>) -> Ev {
         match e {
-            Event::Start(n) => Ev::Start(n.to_vec()),
+            Event::Start(n, _) => Ev::Start(n.to_vec()),
             Event::Data(o, d) => Ev::Data(o, d.to_vec()),
             Event::End => Ev::End,
         }
@@ -515,6 +555,39 @@ pub(crate) mod tests {
             .feed(&pkt(1, &id(6)), &mut o, &mut |_| {})
             .unwrap();
         assert_eq!(o, [0, 0, 0, 5, 2, 0, 0, 0, 3]);
+    }
+
+    #[test]
+    fn sftp_holds_no_more_than_one_packet() {
+        // Five whole packets and the head of a sixth in one read, as a
+        // client may send them.
+        let one = pkt(200, &[id(1), vec![0; 60_000]].concat());
+        let last = pkt(200, &[id(2), vec![0; MAX_PACKET - 5]].concat());
+        let input = [one.repeat(5), last[..9].to_vec()].concat();
+        let (mut p, mut out) = (Sftp::default(), Vec::new());
+        p.feed(&input, &mut out, &mut |_| {}).unwrap();
+        assert_eq!(replies(&out).len(), 5);
+        assert_eq!(p.buf.len(), 9);
+        assert!(p.buf.capacity() <= MAX_PACKET + 4, "{}", p.buf.capacity());
+        p.feed(&last[9..1000], &mut out, &mut |_| {}).unwrap();
+        assert!(p.buf.capacity() <= MAX_PACKET + 4, "{}", p.buf.capacity());
+        p.feed(&last[1000..], &mut out, &mut |_| {}).unwrap();
+        assert_eq!(replies(&out).len(), 6);
+        // Drained, it gives its memory back.
+        assert_eq!(p.buf.capacity(), 0);
+    }
+
+    #[test]
+    fn sftp_replies_to_one_read_are_capped() {
+        // 9 bytes in, 38 out, for as long as a 256 KiB read lasts.
+        let input = pkt(200, &id(1)).repeat(256 * 1024 / 9);
+        let (mut p, mut out) = (Sftp::default(), Vec::new());
+        assert_eq!(p.feed(&input, &mut out, &mut |_| {}), Err(Bad));
+        assert!(out.len() <= MAX_REPLY + 64, "{}", out.len());
+        // A path no file system takes is refused, not echoed twice.
+        let (r, rs, _) = sftp(&pkt(16, &[id(1), s(&[b'a'; 5000])].concat()));
+        assert_eq!(r, Ok(()));
+        assert_eq!(rs, [(101, 1, status(3))]);
     }
 
     #[test]

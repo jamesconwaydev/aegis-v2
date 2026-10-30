@@ -335,6 +335,19 @@ impl Session {
         self.cap - self.used
     }
 
+    /// Sets aside up to `n` of the room for a payload still arriving, so
+    /// recording its own bytes on the wire can't use up the room it will
+    /// need. Returns what was set aside; `release` it before `payload`.
+    pub fn hold(&mut self, n: u64) -> u64 {
+        let n = n.min(self.room());
+        self.used += n;
+        n
+    }
+
+    pub fn release(&mut self, n: u64) {
+        self.used -= n;
+    }
+
     /// Keeps `data` as a payload file named by its SHA-256, once, and
     /// charges it to the cap. None, and `truncated`, when it doesn't fit
     /// or the session already holds `MAX_PAYLOADS`. Protocol handlers

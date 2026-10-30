@@ -22,11 +22,11 @@ use russh::server::{self, Auth, Msg, PublicKeyOffer, VerifiedPublicKey};
 use russh::{kex, Channel, ChannelId, MethodKind, MethodSet, Preferred, SshId};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::time::{error::Elapsed, timeout};
+use tokio::time::{error::Elapsed, timeout, timeout_at};
 
 use crate::ca;
 use crate::hello;
-use crate::session::{random, Held, Session, MAX_HELD};
+use crate::session::{random, Held, Session, Slots, MAX_HELD};
 use crate::shell::{self, Host};
 use crate::upload::{Event, Scp, Sftp};
 
@@ -46,6 +46,18 @@ const MAX_FIELD: usize = 256;
 const MAX_COMMAND: usize = 1024;
 /// The most of an uploaded file's name recorded.
 const MAX_NAME: usize = 255;
+
+/// How long russh's task gets to end once its socket is shut, so its
+/// handler can file a half-sent upload before the session closes.
+const GRACE: Duration = Duration::from_secs(2);
+
+/// Open SSH sessions per incident address, and in all, within TCP's
+/// own caps. An SSH session can hold a few hundred KiB (russh's 256 KiB
+/// packet buffer, one held upload), so fewer of them may be open at
+/// once than other connections.
+pub fn slots() -> Slots {
+    Slots::new(8, 64)
+}
 
 /// The session, shared by the socket wrapper and the handler russh
 /// runs on a task of its own. Taken back when the connection ends;
@@ -153,6 +165,7 @@ impl Ssh {
         io: TcpStream,
         max_time: Duration,
     ) -> (Session, Result<Result<()>, Elapsed>) {
+        let addr = s.rec.addr;
         let sh: Shared = Arc::new(Mutex::new(Some(s)));
         let r = match dup(io) {
             Ok((peer, io)) => {
@@ -167,15 +180,30 @@ impl Ssh {
                     tries: 0,
                     chans: HashMap::new(),
                 };
-                let r = timeout(max_time, async {
-                    server::run_stream(self.config.clone(), wire, client)
-                        .await?
-                        .await
-                })
-                .await;
-                // russh runs the connection on a task of its own, which
-                // dropping its future doesn't stop; this wakes it to an
-                // error wherever it waits.
+                let end = tokio::time::Instant::now() + max_time;
+                let started =
+                    timeout_at(end, server::run_stream(self.config.clone(), wire, client)).await;
+                let r = match started {
+                    Ok(Ok(mut running)) => {
+                        let r = timeout_at(end, &mut running).await;
+                        // russh runs the connection on a task of its own,
+                        // which dropping its future doesn't stop; this
+                        // wakes it to an error wherever it waits, and
+                        // the wait lets its handler file what it holds.
+                        let _ = peer.shutdown(Shutdown::Both);
+                        if r.is_err() && timeout(GRACE, running).await.is_err() {
+                            // Its fd stays open past the slot until it ends.
+                            eprintln!(
+                                "aegis-honeypot: an SSH session for {addr} is still running \
+                                 {}s after its socket was shut",
+                                GRACE.as_secs()
+                            );
+                        }
+                        r
+                    }
+                    Ok(Err(e)) => Ok(Err(e)),
+                    Err(e) => Err(e),
+                };
                 let _ = peer.shutdown(Shutdown::Both);
                 r
             }
@@ -214,7 +242,14 @@ impl AsyncRead for Wire {
         ready!(Pin::new(&mut me.io).poll_read(cx, buf))?;
         let got = &buf.filled()[start..];
         if !got.is_empty() {
-            me.full = !with(&me.s, |s| s.record(true, got))?;
+            let (more, kept) = with(&me.s, |s| {
+                let before = s.rec.bytes_in;
+                let more = s.record(true, got)?;
+                Ok((more, s.rec.bytes_in - before))
+            })?;
+            me.full = !more;
+            // What the cap left out isn't recorded, so it isn't acted on.
+            buf.set_filled(start + usize::try_from(kept).unwrap_or(0));
         }
         Poll::Ready(Ok(()))
     }
@@ -245,6 +280,8 @@ impl AsyncWrite for Wire {
 struct File {
     name: String,
     held: Held,
+    /// Room set aside in the session for `held`.
+    room: u64,
     /// Where the next bytes go if they come in order.
     next: u64,
 }
@@ -266,6 +303,8 @@ struct Chan {
     /// The last byte typed was CR, so an LF after it is the same Enter.
     cr: bool,
     file: Option<File>,
+    /// Where `cd` has taken the shell.
+    cwd: String,
 }
 
 struct Client {
@@ -298,6 +337,7 @@ fn finish(file: &mut Option<File>, sh: &Shared) -> io::Result<()> {
         return Ok(());
     };
     with(sh, |s| {
+        s.release(f.room);
         // Nothing kept of something sent is no payload, not an empty one.
         let payload = if f.held.cut && f.held.data.is_empty() {
             None
@@ -317,13 +357,20 @@ fn finish(file: &mut Option<File>, sh: &Shared) -> io::Result<()> {
 /// session may hold.
 fn on_file(file: &mut Option<File>, sh: &Shared, busy: bool, e: Event<'_>) -> io::Result<()> {
     match e {
-        Event::Start(name) => {
+        Event::Start(name, size) => {
             finish(file, sh)?;
-            let (name, room) = with(sh, |s| Ok((note(s, name, MAX_NAME), s.room())))?;
-            let limit = usize::try_from(room).unwrap_or(MAX_HELD).min(MAX_HELD);
+            // scp says how big the file is: a small one holds only
+            // that. The claim bounds the reservation, never allocates.
+            let want = match (busy, size) {
+                (true, _) => 0,
+                (false, Some(n)) => n.min(MAX_HELD as u64),
+                (false, None) => MAX_HELD as u64,
+            };
+            let (name, room) = with(sh, |s| Ok((note(s, name, MAX_NAME), s.hold(want))))?;
             *file = Some(File {
                 name,
-                held: Held::new(if busy { 0 } else { limit }),
+                room,
+                held: Held::new(usize::try_from(room).unwrap_or(0)),
                 next: 0,
             });
         }
@@ -345,10 +392,10 @@ fn on_file(file: &mut Option<File>, sh: &Shared, busy: bool, e: Event<'_>) -> io
 }
 
 /// Runs a line, recording each command in it.
-fn run(sh: &Shared, host: &Host, line: &[u8]) -> io::Result<shell::Ran> {
+fn run(sh: &Shared, host: &Host, cwd: &mut String, line: &[u8]) -> io::Result<shell::Ran> {
     let line = with(sh, |s| Ok(note(s, line, MAX_LINE)))?;
     let mut res = Ok(());
-    let ran = shell::run(&line, host, |cmd| {
+    let ran = shell::run(&line, host, cwd, |cmd: &str| {
         if res.is_ok() {
             res = with(sh, |s| {
                 let c = note(s, cmd.as_bytes(), MAX_COMMAND);
@@ -361,10 +408,6 @@ fn run(sh: &Shared, host: &Host, line: &[u8]) -> io::Result<shell::Ran> {
 }
 
 impl Client {
-    fn prompt(&self) -> Vec<u8> {
-        format!("root@{}:~# ", self.host.name).into_bytes()
-    }
-
     /// Any login is let in, after a pause like a real check's.
     async fn login(
         &mut self,
@@ -384,7 +427,8 @@ impl Client {
             let c = Credential {
                 user: note(s, user.as_bytes(), MAX_FIELD),
                 password: password.map(|p| note(s, p.as_bytes(), MAX_FIELD)),
-                key,
+                // The algorithm's name is the client's to choose.
+                key: key.map(|k| note(s, k.as_bytes(), MAX_FIELD)),
             };
             s.credential(c);
             Ok(())
@@ -395,10 +439,10 @@ impl Client {
     /// Keys typed into the shell: echoed when there's a terminal, run at
     /// Enter.
     fn typed(&mut self, ch: ChannelId, data: &[u8], ss: &mut server::Session) -> Result<()> {
-        let prompt = self.prompt();
         let Some(c) = self.chans.get_mut(&ch) else {
             return Ok(());
         };
+        let host = &self.host;
         let mut out = Vec::new();
         // Each Enter prints, so a flood of them would print far more than
         // it sent; what's past the cap is dropped.
@@ -415,7 +459,7 @@ impl Client {
                     if c.pty {
                         put(&mut out, b"\r\n");
                     }
-                    let ran = run(&self.s, &self.host, &std::mem::take(&mut c.line))?;
+                    let ran = run(&self.s, host, &mut c.cwd, &std::mem::take(&mut c.line))?;
                     if c.pty {
                         put(&mut out, ran.out.replace('\n', "\r\n").as_bytes());
                     } else {
@@ -426,7 +470,7 @@ impl Client {
                         send(ss, ch, out)?;
                         return exit(ss, ch, 0);
                     }
-                    put(&mut out, &prompt);
+                    put(&mut out, shell::prompt(host, &c.cwd).as_bytes());
                 }
                 0x7f | 0x08 => {
                     if c.line.pop().is_some() && c.pty {
@@ -436,7 +480,7 @@ impl Client {
                 0x03 => {
                     c.line.clear();
                     put(&mut out, b"^C\r\n");
-                    put(&mut out, &prompt);
+                    put(&mut out, shell::prompt(host, &c.cwd).as_bytes());
                 }
                 0x04 if c.line.is_empty() => {
                     c.kind = Kind::Idle;
@@ -459,6 +503,20 @@ impl Client {
             }
         }
         send(ss, ch, out)
+    }
+}
+
+/// However the connection ends (byte cap, time cap, a dropped socket),
+/// a file part-way up is still filed.
+impl Drop for Client {
+    fn drop(&mut self) {
+        for c in self.chans.values_mut() {
+            if let Err(e) = finish(&mut c.file, &self.s) {
+                if e.kind() != ErrorKind::BrokenPipe {
+                    eprintln!("aegis-honeypot: keeping an upload: {e}");
+                }
+            }
+        }
     }
 }
 
@@ -518,13 +576,28 @@ impl server::Handler for Client {
         Ok(())
     }
 
+    /// No X11: russh's default leaves a client that asked waiting.
+    async fn x11_request(
+        &mut self,
+        ch: ChannelId,
+        _: bool,
+        _: &str,
+        _: &str,
+        _: u32,
+        ss: &mut server::Session,
+    ) -> Result<()> {
+        ss.channel_failure(ch)?;
+        Ok(())
+    }
+
     async fn shell_request(&mut self, ch: ChannelId, ss: &mut server::Session) -> Result<()> {
         let Some(c) = self.chans.get_mut(&ch) else {
             return Ok(());
         };
         c.kind = Kind::Shell;
+        c.cwd = shell::HOME.into();
         ss.channel_success(ch)?;
-        send(ss, ch, self.prompt())
+        send(ss, ch, shell::prompt(&self.host, &c.cwd).into_bytes())
     }
 
     async fn exec_request(
@@ -549,7 +622,7 @@ impl server::Handler for Client {
             c.kind = Kind::Scp(Scp::default());
             return send(ss, ch, vec![0]);
         }
-        let ran = run(&self.s, &self.host, data)?;
+        let ran = run(&self.s, &self.host, &mut shell::HOME.into(), data)?;
         send(ss, ch, ran.out.into_bytes())?;
         exit(ss, ch, ran.status)
     }
@@ -560,8 +633,10 @@ impl server::Handler for Client {
         name: &str,
         ss: &mut server::Session,
     ) -> Result<()> {
+        // One at a time, as one upload is held at a time.
+        let busy = self.chans.values().any(|c| matches!(c.kind, Kind::Sftp(_)));
         match self.chans.get_mut(&ch) {
-            Some(c) if name == "sftp" => {
+            Some(c) if name == "sftp" && !busy => {
                 c.kind = Kind::Sftp(Sftp::default());
                 ss.channel_success(ch)?;
             }
@@ -725,6 +800,16 @@ pub(crate) mod tests {
             .collect()
     }
 
+    fn conn() -> crate::session::Conn {
+        crate::session::Conn {
+            protocol: Protocol::Ssh,
+            transport: crate::session::Transport::Tcp,
+            addr: std::net::Ipv4Addr::new(127, 77, 0, 1),
+            src: "10.0.0.2:40000".parse().unwrap(),
+            dst: "1.2.3.4:22".parse().unwrap(),
+        }
+    }
+
     fn root() -> Credential {
         Credential {
             user: "root".into(),
@@ -782,7 +867,7 @@ pub(crate) mod tests {
                 .unwrap();
             let (out, status) = drain(&mut ch).await;
             assert!(
-                out.starts_with("root@web1:~# whoami\r\nroot\r\nroot@web1:~# "),
+                out.starts_with("[root@web1 ~]# whoami\r\nroot\r\n[root@web1 ~]# "),
                 "{out:?}"
             );
             assert!(
@@ -952,20 +1037,9 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn logins_past_the_limit_end_the_connection() {
         let sp = crate::session::tests::spool("sshtries");
-        let s = Session::open(
-            &sp,
-            1 << 20,
-            crate::session::tests::NO_FLOOR,
-            crate::session::Conn {
-                protocol: Protocol::Ssh,
-                transport: crate::session::Transport::Tcp,
-                addr: std::net::Ipv4Addr::new(127, 77, 0, 1),
-                src: "10.0.0.2:40000".parse().unwrap(),
-                dst: "1.2.3.4:22".parse().unwrap(),
-            },
-        )
-        .unwrap()
-        .unwrap();
+        let s = Session::open(&sp, 1 << 20, crate::session::tests::NO_FLOOR, conn())
+            .unwrap()
+            .unwrap();
         let sh: Shared = Arc::new(Mutex::new(Some(s)));
         let mut c = Client {
             s: sh.clone(),
@@ -975,13 +1049,45 @@ pub(crate) mod tests {
         };
         // Keys offered count too, though a probe isn't a failed login.
         for i in 0..MAX_TRIES {
-            let key = (i % 2 == 0).then(|| "ssh-ed25519 SHA256:x".to_string());
+            // A client names the algorithm, and may put anything in it.
+            let key = (i % 2 == 0).then(|| "ssh-\x1b[2Jx SHA256:x".to_string());
             assert!(matches!(c.login("root", None, key).await, Ok(Auth::Accept)));
         }
         assert!(c.login("root", Some("x"), None).await.is_err());
         let s = lock(&sh).take().unwrap();
         assert_eq!(s.rec.credentials.len(), MAX_TRIES);
+        assert_eq!(
+            s.rec.credentials[0].key.as_deref(),
+            Some("ssh-\u{fffd}[2Jx SHA256:x")
+        );
         s.close().unwrap();
+        std::fs::remove_dir_all(sp).unwrap();
+    }
+
+    #[test]
+    fn an_scp_file_holds_only_the_room_it_declares() {
+        let sp = crate::session::tests::spool("sshhold");
+        let s = Session::open(&sp, 1 << 20, crate::session::tests::NO_FLOOR, conn())
+            .unwrap()
+            .unwrap();
+        let before = s.room();
+        let sh: Shared = Arc::new(Mutex::new(Some(s)));
+        let mut file = None;
+        on_file(&mut file, &sh, false, Event::Start(b"x", Some(5))).unwrap();
+        assert_eq!(before - lock(&sh).as_ref().unwrap().room(), 5);
+        // More than declared is still cut, not kept.
+        on_file(&mut file, &sh, false, Event::Data(0, b"hello!")).unwrap();
+        on_file(&mut file, &sh, false, Event::End).unwrap();
+        let s = lock(&sh).take().unwrap();
+        assert!(s.rec.truncated);
+        assert_eq!(s.rec.uploads[0].payload, Some(sha(b"hello")));
+        // A huge claim reserves no more than an upload may hold.
+        let sh: Shared = Arc::new(Mutex::new(Some(s)));
+        let before = lock(&sh).as_ref().unwrap().room();
+        on_file(&mut file, &sh, false, Event::Start(b"y", Some(u64::MAX))).unwrap();
+        assert_eq!(before - lock(&sh).as_ref().unwrap().room(), MAX_HELD as u64);
+        drop(file);
+        lock(&sh).take().unwrap().close().unwrap();
         std::fs::remove_dir_all(sp).unwrap();
     }
 
@@ -1065,8 +1171,8 @@ pub(crate) mod tests {
             let h = login(c).await;
             let mut ch = h.channel_open_session().await.unwrap();
             ch.request_shell(true).await.unwrap();
-            assert_eq!(next(&mut ch).await, b"root@web1:~# ");
-            // Each Enter alone prints a prompt, 13 bytes for 1: past the
+            assert_eq!(next(&mut ch).await, b"[root@web1 ~]# ");
+            // Each Enter alone prints a prompt, 15 bytes for 1: past the
             // cap on what one packet may print, the rest is dropped.
             ch.data(&[b'\n'; 3000][..]).await.unwrap();
             ch.data(&b"exit\n"[..]).await.unwrap();
@@ -1094,6 +1200,141 @@ pub(crate) mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn an_upload_the_byte_cap_cuts_is_still_recorded() {
+        let big = vec![7u8; 1 << 20];
+        let rec = session("cutup", 600 << 10, |c| async move {
+            let h = login(c).await;
+            let mut ch = h.channel_open_session().await.unwrap();
+            ch.exec(true, "scp -t .").await.unwrap();
+            assert_eq!(next(&mut ch).await, [0]);
+            ch.data(&b"C0644 1048576 big\n"[..]).await.unwrap();
+            assert_eq!(next(&mut ch).await, [0]);
+            // The cap closes the connection part-way.
+            let _ = ch.data(&big[..]).await;
+            drain(&mut ch).await;
+        })
+        .await;
+        assert!(rec.truncated);
+        assert_eq!(
+            rec.uploads,
+            [Upload {
+                name: "big".into(),
+                payload: Some(sha(&[7u8; MAX_HELD])),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_the_client_drops_is_still_recorded() {
+        let rec = session("dropup", 4 << 20, |c| async move {
+            let h = login(c).await;
+            let mut ch = h.channel_open_session().await.unwrap();
+            ch.exec(true, "scp -t .").await.unwrap();
+            assert_eq!(next(&mut ch).await, [0]);
+            ch.data(&b"C0644 1000 half\nhello"[..]).await.unwrap();
+            assert_eq!(next(&mut ch).await, [0]);
+            // Gone, with no EOF or close on the channel.
+            drop(ch);
+            drop(h);
+        })
+        .await;
+        assert_eq!(
+            rec.uploads,
+            [Upload {
+                name: "half".into(),
+                payload: Some(sha(b"hello")),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_sftp_channel_is_refused() {
+        session("sftp2", 1 << 20, |c| async move {
+            let h = login(c).await;
+            let a = h.channel_open_session().await.unwrap();
+            a.request_subsystem(true, "sftp").await.unwrap();
+            let mut b = h.channel_open_session().await.unwrap();
+            b.request_subsystem(true, "sftp").await.unwrap();
+            loop {
+                match b.wait().await {
+                    Some(ChannelMsg::Failure) => break,
+                    Some(ChannelMsg::Success) | None => panic!("a second sftp"),
+                    Some(_) => {}
+                }
+            }
+            bye(h).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_and_agents_are_refused() {
+        session("fwd", 1 << 20, |c| async move {
+            let h = login(c).await;
+            assert!(h
+                .channel_open_direct_tcpip("10.0.0.9", 22, "127.0.0.1", 5000)
+                .await
+                .is_err());
+            assert!(h.tcpip_forward("0.0.0.0", 8080).await.is_err());
+            assert!(h
+                .channel_open_direct_streamlocal("/run/docker.sock")
+                .await
+                .is_err());
+            assert!(h.streamlocal_forward("/tmp/s").await.is_err());
+            let mut ch = h.channel_open_session().await.unwrap();
+            ch.request_x11(true, false, "MIT-MAGIC-COOKIE-1", "00", 0)
+                .await
+                .unwrap();
+            ch.agent_forward(true).await.unwrap();
+            let mut failed = 0;
+            while failed < 2 {
+                match ch.wait().await {
+                    Some(ChannelMsg::Failure) => failed += 1,
+                    Some(ChannelMsg::Success) | None => panic!("granted"),
+                    Some(_) => {}
+                }
+            }
+            bye(h).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_read_that_crosses_the_cap_hands_on_only_what_was_recorded() {
+        let sp = crate::session::tests::spool("sshwire");
+        let (mut c, io) = crate::serve::tests::pair(crate::serve::tests::INCIDENT).await;
+        let s = Session::open(
+            &sp,
+            100 + 2 * crate::pcap::SEGMENT_COST,
+            crate::session::tests::NO_FLOOR,
+            conn(),
+        )
+        .unwrap()
+        .unwrap();
+        let sh: Shared = Arc::new(Mutex::new(Some(s)));
+        let mut w = Wire {
+            io,
+            s: sh.clone(),
+            full: false,
+        };
+        c.write_all(&[1; 300]).await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = w.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        let s = lock(&sh).take().unwrap();
+        assert!(s.rec.truncated);
+        assert_eq!(got.len() as u64, s.rec.bytes_in);
+        s.close().unwrap();
+        std::fs::remove_dir_all(sp).unwrap();
+    }
+
     #[test]
     fn the_host_key_is_made_once_and_kept() {
         let d = dir("hostkey");
@@ -1115,8 +1356,32 @@ pub(crate) mod tests {
     fn a_host_key_that_wont_parse_stops_the_start() {
         let d = dir("badkey");
         let p = d.join(HOST_KEY);
-        for junk in [&b"not a key"[..], b"", b"\xff\xfe"] {
-            std::fs::write(&p, junk).unwrap();
+        use russh::keys::ssh_key::private::{RsaKeypair, RsaPrivateKey};
+        use russh::keys::ssh_key::public::RsaPublicKey;
+        use russh::keys::ssh_key::{Cipher, Kdf, Mpint};
+        let ed = PrivateKey::from(Ed25519Keypair::from_seed(&[3; 32]));
+        let kdf = Kdf::Bcrypt {
+            salt: vec![0; 16],
+            rounds: 1,
+        };
+        let encrypted = ed.encrypt_with(Cipher::Aes256Ctr, kdf, 0, "pw").unwrap();
+        // Toy numbers: only the algorithm is looked at.
+        let m = |b: &[u8]| Mpint::from_positive_bytes(b);
+        let rsa = RsaKeypair::new(
+            RsaPublicKey::new(m(&[1, 0, 1]), m(&[0xc5; 256])).unwrap(),
+            RsaPrivateKey::new(m(&[3]), m(&[5]), m(&[7]), m(&[11])).unwrap(),
+        )
+        .unwrap();
+        let rsa = PrivateKey::from(rsa);
+        let pem = |k: &PrivateKey| k.to_openssh(LineEnding::LF).unwrap().as_bytes().to_vec();
+        for junk in [
+            b"not a key".to_vec(),
+            vec![],
+            b"\xff\xfe".to_vec(),
+            pem(&encrypted),
+            pem(&rsa),
+        ] {
+            std::fs::write(&p, &junk).unwrap();
             let e = format!("{:#}", host_key(&d).unwrap_err());
             assert!(e.contains(HOST_KEY), "{e}");
             assert_eq!(std::fs::read(&p).unwrap(), junk);

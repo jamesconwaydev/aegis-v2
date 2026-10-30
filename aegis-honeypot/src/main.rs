@@ -228,6 +228,7 @@ fn run() -> Result<()> {
         names: Default::default(),
         tls,
         ssh,
+        ssh_slots: ssh::slots(),
     });
 
     let rt = tokio::runtime::Builder::new_current_thread()

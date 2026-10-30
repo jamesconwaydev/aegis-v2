@@ -2,7 +2,7 @@
 //! The honeypot's SFTP: a client's bytes, whole and in two pieces.
 #![no_main]
 
-use aegis_honeypot::upload::{Event, Sftp, MAX_PACKET};
+use aegis_honeypot::upload::{Event, Sftp, MAX_REPLY};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Debug, PartialEq)]
@@ -18,7 +18,10 @@ fn feed(pieces: &[&[u8]]) -> (Vec<u8>, bool, Vec<Ev>) {
     for piece in pieces {
         let r = p.feed(piece, &mut out, &mut |e| {
             evs.push(match e {
-                Event::Start(n) => Ev::Start(n.to_vec()),
+                Event::Start(n, size) => {
+                    assert_eq!(size, None);
+                    Ev::Start(n.to_vec())
+                }
                 Event::Data(at, d) => Ev::Data(at, d.to_vec()),
                 Event::End => Ev::End,
             })
@@ -33,11 +36,14 @@ fn feed(pieces: &[&[u8]]) -> (Vec<u8>, bool, Vec<Ev>) {
 
 fuzz_target!(|data: &[u8]| {
     let whole = feed(&[data]);
-    // Replies are whole packets. The biggest is a path echoed twice.
+    // One read's replies stop at the cap, give or take the last one,
+    // which at most echoes a 4 KiB path twice.
+    assert!(whole.0.len() <= MAX_REPLY + 9 * 1024, "{}", whole.0.len());
+    // Replies are whole packets.
     let mut out = &whole.0[..];
     while let Some(len) = out.get(..4) {
         let len = u32::from_be_bytes(len.try_into().unwrap()) as usize;
-        assert!((5..=2 * MAX_PACKET + 64).contains(&len), "{len}");
+        assert!((5..=9 * 1024).contains(&len), "{len}");
         out = &out[4 + len..];
     }
     assert!(out.is_empty());
