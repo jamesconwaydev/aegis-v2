@@ -13,7 +13,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/jamesconwaydev/aegis-v2"
 
 [workspace.dependencies]
-aya = { version = "0.14.0", default-features = false }
+aya = { version = "0.16.0", default-features = false }
 aya-build = { version = "0.2.0", default-features = false }
 aya-ebpf = { version = "0.2.1", default-features = false }
 
